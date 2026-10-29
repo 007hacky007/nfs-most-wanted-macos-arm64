@@ -1,0 +1,25 @@
+# Requires an existing alias. Verify the resulting screen; timing is not an acceptance assertion.
+60 RETURN down
+65 RETURN up
+180 RETURN down
+185 RETURN up
+300 RETURN down
+305 RETURN up
+420 RETURN down
+425 RETURN up
+540 RETURN down
+545 RETURN up
+660 RETURN down
+665 RETURN up
+780 RETURN down
+785 RETURN up
+900 RETURN down
+905 RETURN up
+1020 RETURN down
+1025 RETURN up
+1140 RETURN down
+1145 RETURN up
+1260 RETURN down
+1265 RETURN up
+1500 RETURN down
+1512 RETURN up

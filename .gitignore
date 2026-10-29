@@ -1,0 +1,17 @@
+.DS_Store
+game_backup/
+game/
+gen/
+out/
+.venv/
+__pycache__/
+*.pyc
+.superpowers/
+vendor/
+work/
+/.agents/
+/.codex/
+/.aws/
+/.env
+/.env.*
+!/.env.example
