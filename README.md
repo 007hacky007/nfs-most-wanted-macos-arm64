@@ -1,4 +1,4 @@
-# Most Wanted for Apple Silicon
+# NFSMW for Apple Silicon
 
 Build a local macOS version of Need for Speed Most Wanted (2005) from your own
 Windows game copy. **This repository contains no EA game code or game assets.**
@@ -48,10 +48,14 @@ installers are read as data and are never executed. The initial download
 includes the 3.34 GB HQ package; the launcher lets you choose whether to use
 its visual assets or full mod behavior. Verified downloads are cached.
 
-When the build finishes, open **`out/Most Wanted.app`**. Your verified game copy
+When the build finishes, open **`out/NFSMW.app`**. Your verified game copy
 is bundled inside the app, so you can move it to Applications. Choose a
 resolution and game mode, then click Play. Your source copy is preserved.
 A failed build preserves the previous app; diagnostic logs remain under `out/`.
+
+Packaging extracts the original Windows icon from your verified `speed.exe`
+and converts it to the macOS app icon. The icon is generated locally from your
+game copy; no original game icon is included in this repository.
 
 ## Supported game copy
 

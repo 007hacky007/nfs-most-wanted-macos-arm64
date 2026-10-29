@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build Most Wanted.app from your extracted game folder or ISO / BIN/CUE discs."""
+"""Build NFSMW.app from your extracted game folder or ISO / BIN/CUE discs."""
 import argparse
 import os
 from pathlib import Path
