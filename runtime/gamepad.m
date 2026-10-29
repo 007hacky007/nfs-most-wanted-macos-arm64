@@ -35,6 +35,7 @@ static os_unfair_lock g_lk = OS_UNFAIR_LOCK_INIT;
 static PadState g_real;              /* active controller, raw values */
 static PadState g_syn;               /* the input script's controller */
 static int      g_log = 0;
+static float    g_stick_deadzone[2] = {-1.f,-1.f};
 
 static GCController   *g_active;     /* main thread only */
 static unsigned        g_gen;        /* bumped under g_lk when g_active changes */
@@ -171,15 +172,32 @@ static float trig_dz(float v, float dz){
     return v >= 1.f ? 1.f : (v - dz) / (1.f - dz);
 }
 
+void gamepad_set_stick_deadzones(float left,float right){
+    float values[2]={left,right};
+    for(unsigned i=0;i<2;i++)
+        values[i]=!isfinite(values[i])||values[i]<0.f ? -1.f : fminf(values[i],1.f);
+    os_unfair_lock_lock(&g_lk);
+    memcpy(g_stick_deadzone,values,sizeof values);
+    os_unfair_lock_unlock(&g_lk);
+}
+
+static void selected_stick_dz(float *x,float *y,float selected,float radial){
+    if(selected<0.f){stick_dz(x,y,radial);return;}
+    if(fabsf(*x)<=selected)*x=0.f;
+    if(fabsf(*y)<=selected)*y=0.f;
+}
+
 int gamepad_read(PadState *s){
     static float dz = -1.f, tdz = -1.f;
     if (dz < 0.f){ dz = envf("NFSU2_PAD_DEADZONE", 0.08f, 0.f, 0.9f);
                    tdz = envf("NFSU2_PAD_TRIGGER_DEADZONE", 0.02f, 0.f, 0.9f); }
+    float selected[2];
     os_unfair_lock_lock(&g_lk);
     *s = g_syn.connected ? g_syn : g_real;      /* the script's pad wins while connected */
+    memcpy(selected,g_stick_deadzone,sizeof selected);
     os_unfair_lock_unlock(&g_lk);
-    if (!s->wheel) stick_dz(&s->axis[PAD_AXIS_LX], &s->axis[PAD_AXIS_LY], dz);   /* a (script's) wheel: none */
-    stick_dz(&s->axis[PAD_AXIS_RX], &s->axis[PAD_AXIS_RY], dz);
+    if (!s->wheel) selected_stick_dz(&s->axis[PAD_AXIS_LX], &s->axis[PAD_AXIS_LY], selected[0],dz);
+    selected_stick_dz(&s->axis[PAD_AXIS_RX], &s->axis[PAD_AXIS_RY], selected[1],dz);
     s->axis[PAD_AXIS_LT] = trig_dz(s->axis[PAD_AXIS_LT], tdz);
     s->axis[PAD_AXIS_RT] = trig_dz(s->axis[PAD_AXIS_RT], tdz);
     return s->connected;

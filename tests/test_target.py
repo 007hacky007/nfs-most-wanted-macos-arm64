@@ -2,6 +2,7 @@ from pathlib import Path
 import struct
 from types import SimpleNamespace
 import unittest
+import tempfile
 from unittest.mock import patch
 
 from tools.target import recover_relocations, check_module_range
@@ -16,6 +17,14 @@ def fake_pe(blob):
 
 
 class TargetTests(unittest.TestCase):
+    def test_unknown_runtime_image_is_rejected_before_generation(self):
+        from tools.target import select_image
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp)
+            (game / 'speed.exe').write_bytes(b'unsupported executable')
+            with self.assertRaisesRegex(ValueError, 'unsupported'):
+                select_image(game)
+
     def test_whitespace_relocation_section(self):
         blob = struct.pack('<IIHH', 0x1000, 12, 0x3010, 0)
         self.assertEqual(recover_relocations(fake_pe(blob)), [0x401010])

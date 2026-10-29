@@ -1,6 +1,8 @@
 .DS_Store
 game_backup/
+game_backup2/
 game/
+game_iso/
 gen/
 out/
 .venv/

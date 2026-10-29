@@ -40,8 +40,9 @@ enum { O_NOP=0, O_MOV, O_ADD, O_SUB, O_MAD, O_MUL, O_RCP, O_RSQ, O_DP3, O_DP4,
        O_BREAKC, O_MOVA, O_DEFB, O_DEFI,
        /* --- pixel shader instructions (D3D numbering) --- */
        O_TEXCOORD=64, O_TEXKILL=65, O_TEX=66,   /* ps_1_x tex / ps_2_0 texld */
+       O_TEXREG2AR=69, O_TEXREG2GB=70, O_PHASE=0xFFFD,
        O_EXPP=78, O_LOGP=79, O_CND=80, O_DEF=81,
-       O_CMP=88, O_DP2ADD=90, O_TEXLDD=95, O_TEXLDL=97,
+       O_CMP=88, O_DP2ADD=90, O_DSX=91, O_DSY=92, O_TEXLDD=95, O_TEXLDL=97,
        O_END=0xFFFF };
 
 typedef struct {
@@ -55,6 +56,7 @@ typedef struct {
     int      match;         /* if->else|endif, rep->endrep, loop->endloop */
     int      match2;        /* else->endif */
     unsigned cmp;           /* ifc/breakc comparison code */
+    unsigned usage;         /* declaration semantic and index */
     /* --- pre-decoded operand plan (for speed) ---------------------------
      * src_read/dst_write decoded the token again for every VERTEX: bit
      * extraction, a reg_ptr call, a swizzle loop, a switch, a memcpy.  Yet
@@ -84,6 +86,7 @@ struct VSProg {
     unsigned  unknown;
 };
 
+static int sm3_valid(const VSProg *p);
 static int is_param(uint32_t t){ return (t & 0x80000000u) != 0; }
 
 /* ---- compilation ---- */
@@ -112,8 +115,10 @@ VSProg *vs_compile(const uint32_t *tok, size_t max_dw){
         if (op == O_END) break;
         if (op == 0xFFFEu){                       /* comment */
             unsigned len = (t & 0x7FFF0000u) >> 16;
+            if (len > max_dw-i-1){ vs_free(p); return 0; }
             i += 1 + len; continue;
         }
+        if (PRED(t)){ vs_free(p); return 0; }
         if (p->n == cap){
             cap *= 2; VSIns *ni = realloc(p->ins, cap * sizeof(VSIns));
             if (!ni){ vs_free(p); return 0; }
@@ -126,6 +131,7 @@ VSProg *vs_compile(const uint32_t *tok, size_t max_dw){
         ix->cmp = (t >> 16) & 0x7u;               /* for ifc/breakc */
 
         unsigned len = ILEN(t);
+        if (len > max_dw-i-1){ vs_free(p); return 0; }
         size_t body = i + 1;                      /* first operand token */
         size_t next;
 
@@ -149,6 +155,7 @@ VSProg *vs_compile(const uint32_t *tok, size_t max_dw){
         } else if (op == O_DCL){
             if (body + 1 >= max_dw){ p->unknown++; break; }
             uint32_t ut = tok[body];
+            ix->usage = ut;
             ix->dst = tok[body+1]; ix->has_dst = 1;
             next = body + 2;
             if (RT(ix->dst) == R_INPUT){
@@ -171,7 +178,6 @@ VSProg *vs_compile(const uint32_t *tok, size_t max_dw){
         } else {
             /* scan operands by bit31; trust the SM2+ length field when present */
             size_t j = body;
-            if (PRED(t)) { /* predicate register comes last; skipped below */ }
             size_t limit = len ? (body + len) : max_dw;
             if (limit > max_dw) limit = max_dw;
             int first = 1;
@@ -202,24 +208,31 @@ VSProg *vs_compile(const uint32_t *tok, size_t max_dw){
         p->n++;
     }
 
-    /* flow-control matching */
+    /* Reject malformed nesting instead of generating unbalanced MSL. */
     int stack[64]; int sp = 0;
     for (unsigned k = 0; k < p->n; k++){
-        unsigned op = p->ins[k].op;
+        VSIns *x = &p->ins[k]; unsigned op = x->op;
         if (op == O_IF || op == O_IFC || op == O_REP || op == O_LOOP){
-            if (sp < 64) stack[sp++] = (int)k;
+            if (sp == 64){ vs_free(p); return 0; }
+            stack[sp++] = (int)k;
         } else if (op == O_ELSE){
-            if (sp > 0) p->ins[stack[sp-1]].match = (int)k;   /* if -> else */
-            if (sp < 64) stack[sp-1] = (int)k;                /* else -> endif */
-        } else if (op == O_ENDIF || op == O_ENDREP || op == O_ENDLOOP){
-            if (sp > 0){ int o = stack[--sp];
-                if (p->ins[o].op == O_ELSE) p->ins[o].match = (int)k;
-                else if (p->ins[o].match < 0) p->ins[o].match = (int)k;
-                else p->ins[o].match2 = (int)k;
-                p->ins[k].match = o;
+            if (!sp || (p->ins[stack[sp-1]].op != O_IF && p->ins[stack[sp-1]].op != O_IFC)){
+                vs_free(p); return 0;
             }
+            p->ins[stack[sp-1]].match = (int)k;
+            stack[sp-1] = (int)k;
+        } else if (op == O_ENDIF || op == O_ENDREP || op == O_ENDLOOP){
+            if (!sp){ vs_free(p); return 0; }
+            int start = stack[--sp]; unsigned open = p->ins[start].op;
+            if ((op == O_ENDIF && open != O_IF && open != O_IFC && open != O_ELSE) ||
+                (op == O_ENDREP && open != O_REP) || (op == O_ENDLOOP && open != O_LOOP)){
+                vs_free(p); return 0;
+            }
+            p->ins[start].match = (int)k;
+            x->match = start;
         }
     }
+    if (sp || i >= max_dw || OPC(tok[i]) != O_END){ vs_free(p); return 0; }
     /* Compute the highest temp register number once here, so only the
      * registers in use need clearing per vertex. */
     for (unsigned q = 0; q < p->n; q++){
@@ -288,6 +301,7 @@ typedef struct {
     const VSProg  *p;
     const VSConst *k;
     float r[32][4];
+    float output[12][4];
     const float (*v)[4];
     int   a0[4];
     int   aL, aLstep, loopreg;
@@ -311,6 +325,13 @@ static const float *reg_ptr(Exec *e, int type, int num, float tmp[4]){
         if (e->p->defmask[n >> 5] & (1u << (n & 31))) return e->p->def[n];
         return e->k->f[n];
     }
+    case R_CONSTBOOL:
+        if(num>=0 && num<16){
+            int32_t value=e->k->b[num];
+            for(unsigned q=0;q<e->p->n;q++)if(e->p->ins[q].op==O_DEFB && RN(e->p->ins[q].dst)==num)memcpy(&value,e->p->ins[q].imm,4);
+            for(int c=0;c<4;c++)tmp[c]=value!=0;return tmp;
+        }
+        return ZERO4;
     case R_CONSTINT:
         if (num >= 0 && num < 16){
             tmp[0]=(float)e->k->i[num][0]; tmp[1]=(float)e->k->i[num][1];
@@ -377,7 +398,9 @@ static void dst_write(Exec *e, unsigned tok, const float val[4]){
                     else if (num == 2){ if (mask & 1) e->o->psize = v[0]; return; }
                     break;
     case R_ATTROUT: if (num >= 0 && num < 2) d = e->o->col[num]; break;
-    case R_OUTPUT:  if (num >= 0 && num < 8) d = e->o->tex[num]; break;
+    case R_OUTPUT:  if (e->p->version >= 0x0300){
+                        if (num < 12) d = e->output[num];
+                    } else if (num >= 0 && num < 8) d = e->o->tex[num]; break;
     case R_ADDR:    for (int i=0;i<4;i++) if (mask & (1u<<i))
                         e->a0[i] = (int)lrintf(v[i]);
                     return;
@@ -399,13 +422,14 @@ static int cmp_ok(unsigned c, float a, float b){
 }
 
 int vs_run(const VSProg *p, const VSConst *k, const float v[16][4], VSOut *o){
-    if (!p || !k || !o) return 0;
+    if (!p || !k || !o || !sm3_valid(p)) return 0;
     /* Clearing the 512-byte r[32][4] PER VERTEX measured as the most
      * expensive part (~45% of the time in vs_run).  Zero only the
      * registers the program actually uses. */
     Exec e;
     { int mr = p->maxreg; if (mr < 0) mr = -1; if (mr > 31) mr = 31;
       if (mr >= 0) memset(e.r, 0, (size_t)(mr+1) * sizeof e.r[0]); }
+    if(p->version>=0x0300)memset(e.output, 0, sizeof e.output);
     e.a0[0]=e.a0[1]=e.a0[2]=e.a0[3]=0;
     e.aL=0; e.aLstep=0; e.loopreg=0;
     e.p = p; e.k = k; e.v = v; e.o = o;
@@ -418,7 +442,7 @@ int vs_run(const VSProg *p, const VSConst *k, const float v[16][4], VSOut *o){
 
     unsigned steps = 0;
     for (unsigned pc = 0; pc < p->n; pc++){
-        if (++steps > 200000u) break;
+        if (++steps > 200000u) return 0;
         const VSIns *x = &p->ins[pc];
         float s[4][4];
 #define DSTW(_x,_d) do{ if ((_x)->fdst) memcpy(e.r[(_x)->d_num],(_d),16); \
@@ -465,7 +489,8 @@ int vs_run(const VSProg *p, const VSConst *k, const float v[16][4], VSOut *o){
         case O_FRC: for(int i=0;i<4;i++) d[i]=s[0][i]-floorf(s[0][i]); DSTW(x,d); break;
         case O_ABS: for(int i=0;i<4;i++) d[i]=fabsf(s[0][i]); DSTW(x,d); break;
         case O_SGN: for(int i=0;i<4;i++) d[i]=(s[0][i]>0.f)-(s[0][i]<0.f); DSTW(x,d); break;
-        case O_LRP: for(int i=0;i<4;i++) d[i]=s[1][i]+s[0][i]*(s[2][i]-s[1][i]); DSTW(x,d); break;
+        case O_LRP: for(int i=0;i<4;i++) d[i]=p->version>=0x0300 ? s[0][i]*s[1][i]+(1.f-s[0][i])*s[2][i] : s[1][i]+s[0][i]*(s[2][i]-s[1][i]); DSTW(x,d); break;
+        case O_CMP: for(int i=0;i<4;i++)d[i]=s[0][i]>=0.f?s[1][i]:s[2][i];DSTW(x,d);break;
         case O_RCP: { float r=safe_rcp(s[0][0]); d[0]=d[1]=d[2]=d[3]=r; DSTW(x,d); } break;
         case O_RSQ: { float r=safe_rsq(s[0][0]); d[0]=d[1]=d[2]=d[3]=r; DSTW(x,d); } break;
         case O_DP3: { float r=s[0][0]*s[1][0]+s[0][1]*s[1][1]+s[0][2]*s[1][2];
@@ -566,7 +591,19 @@ int vs_run(const VSProg *p, const VSConst *k, const float v[16][4], VSOut *o){
             if (target >= 0 && rsp < 16){ retstack[rsp++] = (int)pc; pc = (unsigned)target; }
         } break;
         case O_RET: if (rsp > 0) pc = (unsigned)retstack[--rsp]; else pc = p->n; break;
-        default: break;
+        default: if(p->version>=0x0300)return 0;break;
+        }
+    }
+    if (p->version >= 0x0300){
+        for (unsigned q=0; q<p->n; q++){
+            const VSIns *x=&p->ins[q];
+            if (x->op != O_DCL || RT(x->dst) != R_OUTPUT) continue;
+            int n=RN(x->dst), usage=x->usage&31u, index=(x->usage>>16)&15u;
+            float *d = usage==0 && index==0 ? o->pos :
+                       usage==5 && index<8 ? o->tex[index] :
+                       usage==10 && index<6 ? o->col[index] : NULL;
+            if (!d || n>=12) return 0;
+            for(int c=0;c<4;c++) if(WMASK(x->dst)&(1u<<c)) d[c]=e.output[n][c];
         }
     }
     return 1;
@@ -668,12 +705,19 @@ static void msl_reg(char *o, size_t cap, const VSProg *p, unsigned tok, unsigned
     int ty = RT(tok), n = RN(tok);
     int vs = VSMODE();
     switch (ty){
-    case R_TEMP:     snprintf(o, cap, "r[%d]", n & (vs ? 31 : 15)); break;
-    case R_INPUT:    snprintf(o, cap, "v[%d]", n & (vs ? 15 : 1));  break;
+    case R_TEMP:     snprintf(o, cap, "r[%d]", n); break;
+    case R_INPUT:    snprintf(o, cap, "v[%d]", n);  break;
     case R_ADDR:     if (vs) snprintf(o, cap, "float4(a0)");
-                     else    snprintf(o, cap, "t[%d]", n & 3);      break;
+                     else    snprintf(o, cap, "t[%d]", p->version >= 0x0200 ? n : n & 3);      break;
+    case R_CONSTBOOL: {
+        for(unsigned q=0;q<p->n;q++)if(p->ins[q].op==O_DEFB && RN(p->ins[q].dst)==n){
+            uint32_t value;memcpy(&value,p->ins[q].imm,4);snprintf(o,cap,"float4(%s)",value?"1.0":"0.0");return;
+        }
+        snprintf(o,cap,"float4(%s.b[%d].%c)",g_cbuf,n/4,"xyzw"[n%4]);break;
+    }
     case R_LOOP:     snprintf(o, cap, "float4(float(aL))");         break;
-    case R_COLOROUT: snprintf(o, cap, "oC");           break;
+    case R_COLOROUT: if(n) snprintf(o, cap, "oC%d", n);
+                     else snprintf(o, cap, "oC"); break;
     case R_CONSTINT: if (n >= 0 && n < 16)
                          snprintf(o, cap, "float4(%d.0,%d.0,%d.0,%d.0)",
                                   p->defi[n][0], p->defi[n][1],
@@ -700,7 +744,7 @@ static void msl_reg(char *o, size_t cap, const VSProg *p, unsigned tok, unsigned
             snprintf(o, cap, "float4(%g,%g,%g,%g)", (double)p->def[idx][0],
                      (double)p->def[idx][1], (double)p->def[idx][2],
                      (double)p->def[idx][3]);
-        else snprintf(o, cap, "%s.c[%d]", g_cbuf, (idx & (vs ? 255 : 31)));
+        else snprintf(o, cap, "%s.c[%d]", g_cbuf, idx);
         break; }
     default: snprintf(o, cap, "float4(0.0)"); break;
     }
@@ -790,15 +834,94 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
 int ps_to_msl_ex(const VSProg *p, int id, char *out, size_t cap, unsigned cubemask){
     return ps_to_msl_ex2(p, id, out, cap, cubemask, -1);
 }
+/* SM3 has generic registers. Reject anything outside the implemented ABI. */
+static int sm3_valid(const VSProg *p){
+    if (p->version < 0x0300) return 1;
+    if (p->version != 0x0300 || p->unknown) return 0;
+    unsigned inputs=0,outputs=0;
+    for(unsigned q=0;q<p->n;q++)if(p->ins[q].op==O_DCL){
+        unsigned tok=p->ins[q].dst;int type=RT(tok),n=RN(tok);
+        if(n>=16)return 0;
+        if(type==R_INPUT)inputs|=1u<<n;if(type==R_OUTPUT)outputs|=1u<<n;
+    }
+    for(unsigned q=0;q<p->n;q++){
+        const VSIns *x=&p->ins[q];
+        if (x->op==O_DCL){
+            int ty=RT(x->dst), n=RN(x->dst), u=x->usage&31u, ix=(x->usage>>16)&15u;
+            if(ty==R_SAMPLER){ if(!p->is_ps || n>=16 || (p->smptype[n]!=2 && p->smptype[n]!=3 && p->smptype[n]!=4)) return 0; }
+            else if(ty==R_INPUT || (!p->is_ps && ty==R_OUTPUT)){
+                if(n >= (ty==R_OUTPUT ? 12 : 16)) return 0;
+                if((p->is_ps || ty==R_OUTPUT) && !((u==5 && ix<8) || (u==10 && ix<6) || (!p->is_ps && u==0 && ix==0))) return 0;
+            } else return 0;
+            continue;
+        }
+        if(x->op==O_DEF || x->op==O_DEFI || x->op==O_DEFB){
+            int type=RT(x->dst),n=RN(x->dst);
+            if((x->op==O_DEF && (type!=R_CONST || n>=(p->is_ps?224:256))) ||
+               (x->op==O_DEFI && (type!=R_CONSTINT || n>=16)) || (x->op==O_DEFB && (type!=R_CONSTBOOL || n>=16)))return 0;
+            continue;
+        }
+        unsigned sources;
+        switch(x->op){
+        case O_NOP:case O_ELSE:case O_ENDIF:sources=0;break;
+        case O_TEXKILL:sources=0;break;
+        case O_MOV:case O_RCP:case O_RSQ:case O_EXP:case O_LOG:case O_LIT:case O_FRC:
+        case O_ABS:case O_NRM:case O_SINCOS:case O_MOVA:case O_DSX:case O_DSY:case O_IF:sources=1;break;
+        case O_ADD:case O_SUB:case O_MUL:case O_DP3:case O_DP4:case O_MIN:case O_MAX:case O_SLT:case O_SGE:
+        case O_DST:case O_M4x4:case O_M4x3:case O_M3x4:case O_M3x3:case O_M3x2:
+        case O_POW:case O_CRS:case O_IFC:case O_TEX:case O_TEXLDL:sources=2;break;
+        case O_MAD:case O_LRP:case O_CMP:case O_DP2ADD:sources=3;break;
+        case O_TEXLDD:sources=4;break;
+        default:return 0;
+        }
+        if(x->nsrc!=sources)return 0;
+        if(x->has_dst){
+            int ty=RT(x->dst), n=RN(x->dst);
+            if(RELADDR(x->dst))return 0;
+            if(ty==R_TEMP){if(n>=32)return 0;}
+            else if(p->is_ps){if(ty!=R_COLOROUT || n>=4)return 0;}
+            else if(!((ty==R_OUTPUT && n<12 && (outputs&(1u<<n))) || (ty==R_ADDR && n==0)))return 0;
+        }
+        for(unsigned t=0;t<x->nsrc;t++){
+            unsigned tok=x->src[t];int ty=RT(tok),n=RN(tok),mod=SMOD(tok);
+            if(mod>12 || mod==9 || mod==10)return 0;
+            if(RELADDR(tok) && (p->is_ps || ty!=R_CONST))return 0;
+            if(ty==R_TEMP){if(n>=32)return 0;}
+            else if(ty==R_INPUT){if(n>=16 || !(inputs&(1u<<n)))return 0;}
+            else if(ty==R_CONST){if(n>=(p->is_ps?224:256))return 0;}
+            else if(ty==R_CONSTINT || ty==R_CONSTBOOL){
+                if(n>=16)return 0;
+                if(ty==R_CONSTINT){int found=0;for(unsigned z=0;z<p->n;z++)if(p->ins[z].op==O_DEFI && RN(p->ins[z].dst)==n)found=1;if(!found)return 0;}
+            }
+            else if(ty==R_SAMPLER){if(!p->is_ps || n>=16 || !p->smptype[n])return 0;}
+            else if(!(ty==R_ADDR && !p->is_ps && n==0))return 0;
+        }
+    }
+    return 1;
+}
+
 int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubemask, int reflk){
-    if (!p || !out || cap < 512) return 0;
+    if (!p || !out || cap < 512 || !sm3_valid(p)) return 0;
+    unsigned outputs=ps_color_output_mask(p);
+    if(!outputs || (outputs!=1 && reflk>=0))return 0;
+    int mrt=outputs!=1;
+    int stages = p->version >= 0x0200 ? 16 : 4;
+    if(p->version >= 0x0200) for(int k=0;k<16;k++) if(p->smptype[k]==3) cubemask |= 1u<<k;
 #if !NFS_ENHANCED
     if (reflk >= 0) return 0;
 #endif
-    g_cbuf = "P";                       /* pixel: P.c[0..31] */
+    g_cbuf = "P";                       /* pixel: P.c[0..223] */
     size_t o = 0;
     #define EMIT(...) do{ int _w = snprintf(out+o, cap-o, __VA_ARGS__); \
                           if (_w < 0 || (size_t)_w >= cap-o) return 0; o += (size_t)_w; }while(0)
+
+    char result_type[40];
+    if(mrt){
+        snprintf(result_type,sizeof result_type,"PSMRT_%d",id);
+        EMIT("struct %s {\n",result_type);
+        for(unsigned k=0;k<4;k++)if(outputs&(1u<<k))EMIT("  float4 c%u [[color(%u)]];\n",k,k);
+        EMIT("};\n");
+    }else snprintf(result_type,sizeof result_type,"%s",NFS_ENHANCED?"PSOut":"float4");
 
     { int anycube = 0;
       for (int q = 0; q < 4; q++) if (p->smptype[q] == 3) anycube = 1;
@@ -807,26 +930,40 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
                   id, p->smptype[0], p->smptype[1], p->smptype[2], p->smptype[3],
                   anycube ? "   <- HAS A CUBE" : "");
       } }
-    EMIT("fragment %s ps_%d(VOut i [[stage_in]],\n", NFS_ENHANCED ? "PSOut" : "float4", id);
-    for (int k = 0; k < 4; k++)
+    if(p->version>=0x0300){
+        EMIT("struct PSIn_%d { float4 pos [[position]];\n",id);
+        for(int usage=10;usage>=5;usage-=5){
+            int count=usage==10?6:8;
+            for(int index=0;index<count;index++){
+                int centroid=0;
+                for(unsigned q=0;q<p->n;q++){
+                    const VSIns*x=&p->ins[q];
+                    if(x->op==O_DCL && RT(x->dst)==R_INPUT && (x->usage&31u)==(unsigned)usage && ((x->usage>>16)&15u)==(unsigned)index && (x->dst&0x00200000u))centroid=1;
+                }
+                EMIT("  float4 %s%d%s;\n",usage==10?"col":"uv",index,centroid?" [[centroid_perspective]]":"");
+            }
+        }
+        EMIT("  float fog; };\n");
+        EMIT("fragment %s ps_%d(PSIn_%d i [[stage_in]],\n",result_type,id,id);
+    } else EMIT("fragment %s ps_%d(VOut i [[stage_in]],\n", result_type, id);
+    for (int k = 0; k < stages; k++)
         EMIT("    %s<float> s%d [[texture(%d)]],\n",
-             ((cubemask >> k) & 1u) ? "texturecube" : "texture2d", k, k);
+             p->version>=0x0200 && p->smptype[k]==4 ? "texture3d" : ((cubemask >> k) & 1u) ? "texturecube" : "texture2d", k, k);
     /* ONE SAMPLER PER STAGE.  All four textures used to share one "sm",
      * so stage 0's address mode applied to the others too.  The road's
      * diffuse texture wants WRAP; the headlight texture and the falloff
      * ramp want CLAMP.  With WRAP the headlight cone repeated along the
      * WHOLE road and the ground glowed blown-out from end to end. */
-    EMIT("    sampler sm0 [[sampler(0)]], sampler sm1 [[sampler(1)]],\n");
-    EMIT("    sampler sm2 [[sampler(2)]], sampler sm3 [[sampler(3)]],\n");
+    for(int k=0;k<stages;k++) EMIT("    sampler sm%d [[sampler(%d)]],\n", k,k);
     EMIT("    constant PSPar &P [[buffer(0)]]) {\n");
-    EMIT("  float4 r[16]; for (int q=0;q<16;q++) r[q]=float4(0.0);\n");
-    EMIT("  float4 t[4]; for (int q=0;q<4;q++) t[q]=float4(0.0);\n");
+    EMIT("  float4 r[32]; for (int q=0;q<32;q++) r[q]=float4(0.0);\n");
+    EMIT("  float4 t[%d]; for (int q=0;q<%d;q++) t[q]=float4(0.0);\n",p->version>=0x0200?8:4,p->version>=0x0200?8:4);
     /* ps_2_0 declares texture inputs without a texcoord instruction. */
     if (p->version >= 0x0200) {
         for (unsigned q = 0; q < p->n; q++) {
             const VSIns *x = &p->ins[q];
             if (x->op == O_DCL && RT(x->dst) == R_ADDR) {
-                unsigned k = RN(x->dst) & 3u;
+                unsigned k=RN(x->dst);if(k>=8)return 0;
                 EMIT("  t[%u] = i.uv%u;\n", k, k);
             }
         }
@@ -834,9 +971,18 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
     /* D3D9 clamps diffuse/specular inputs before ps_1_x and ps_2_0 run. */
     if (p->version < 0x0300)
         EMIT("  float4 v[2] = { saturate(i.col0), saturate(i.col1) };\n");
-    else
-        EMIT("  float4 v[2] = { i.col0, i.col1 };\n");
+    else {
+        EMIT("  float4 v[16]; for(int q=0;q<16;q++) v[q]=float4(0.0);\n");
+        for(unsigned q=0;q<p->n;q++){
+            const VSIns*x=&p->ins[q];
+            if(x->op!=O_DCL || RT(x->dst)!=R_INPUT)continue;
+            char mask[8]; msl_mask_swz(mask,sizeof mask,x->dst);
+            EMIT("  v[%d]%s = i.%s%d%s;\n", RN(x->dst),mask,
+                 (x->usage&31u)==5 ? "uv":"col", (x->usage>>16)&15u,mask);
+        }
+    }
     EMIT("  float4 oC = float4(0.0);\n");
+    for(unsigned k=1;k<4;k++)if(outputs&(1u<<k))EMIT("  float4 oC%u = float4(0.0);\n",k);
     /* The stage -> coordinate set mapping changes with D3DTSS_TEXCOORDINDEX
      * (in a trace of 422 thousand calls stages 1 and 2 use coordinate 0) and
      * D3DTTFF_PROJECTED needs a divide.  Both are in P.proj: idx + 16*mode. */
@@ -898,13 +1044,13 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
     int hdblur = 0;
 #endif
     /* Per-stage sampling: uv2 is used for 2D, uv3 for cube. */
-    for (int k = 0; k < 4; k++){
+    for (int k = 0; k < stages; k++){
         if (hdblur && !((cubemask >> k) & 1u))
             EMIT("#define SMP%d(uv2, uv3) (P.pad0 > 0.0 ? s%d.sample(sm%d, uv2, level(P.pad1)) : s%d.sample(sm%d, uv2))\n",
                  k, k, k, k, k);
         else
             EMIT("#define SMP%d(uv2, uv3) s%d.sample(sm%d, %s)\n",
-                 k, k, k, ((cubemask >> k) & 1u) ? "uv3" : "uv2");
+                 k, k, k, ((cubemask >> k) & 1u) || (p->version>=0x0200 && p->smptype[k]==4) ? "uv3" : "uv2");
     }
     EMIT("#define TPICK(k) i.uv##k\n");
     EMIT("#define TCRD(k) tc##k\n");
@@ -931,6 +1077,17 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
         case O_NOP: case O_DCL: case O_DEF: case O_DEFI: case O_DEFB:
         case O_LABEL: case O_END:
             continue;
+        case O_PHASE:
+            if(p->version!=0x0104)return 0;
+            /* A phase boundary schedules dependent reads; RGB values persist. */
+            continue;
+        case O_TEXREG2AR: case O_TEXREG2GB: {
+            int stage=RN(x->dst);
+            if(p->version>=0x0104 || RT(x->dst)!=R_ADDR || stage>=4 || x->nsrc!=1)return 0;
+            snprintf(ex,sizeof ex,"SMP%d((%s).%s, (%s).xyz)",stage,s0,
+                     x->op==O_TEXREG2AR?"wx":"yz",s0);
+            break;
+        }
         case O_TEX: case O_TEXLDD: case O_TEXLDL: {
             /* ps_1_x : "tex tN"            -> tN = sample(sN, uvN)
              * ps_1_4 : "texld rN, tM"      -> rN = sample(sN, uvM)
@@ -946,9 +1103,24 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
              * as the other instructions (mask/saturate/shift included). */
             int dn = RN(x->dst) & 3;
             if (x->nsrc >= 2){                     /* ps_2_0 */
-                int smp = RN(x->src[1]) & 3;
+                int smp = RN(x->src[1]);
                 char cs[160]; msl_src(cs, sizeof cs, p, x->src[0], x->rel[0]);
-                snprintf(ex, sizeof ex, "SMP%d((%s).xy, (%s).xyz)", smp, cs, cs);
+                if(p->version>=0x0300){
+                    const char *dimension=(p->smptype[smp]>=3 || (cubemask&(1u<<smp)))?"xyz":"xy";
+                    if(x->op==O_TEXLDL)
+                        snprintf(ex,sizeof ex,"s%d.sample(sm%d,(%s).%s,level((%s).w))",smp,smp,cs,dimension,cs);
+                    else if(x->op==O_TEXLDD){
+                        if(p->smptype[smp]!=2)return 0;
+                        char dx[160],dy[160];msl_src(dx,sizeof dx,p,x->src[2],x->rel[2]);msl_src(dy,sizeof dy,p,x->src[3],x->rel[3]);
+                        snprintf(ex,sizeof ex,"s%d.sample(sm%d,(%s).xy,gradient2d((%s).xy,(%s).xy))",smp,smp,cs,dx,dy);
+                    } else if(x->cmp==1)
+                        snprintf(ex,sizeof ex,"s%d.sample(sm%d,(%s).%s / (%s).w)",smp,smp,cs,dimension,cs);
+                    else if(x->cmp==2)
+                        snprintf(ex,sizeof ex,"s%d.sample(sm%d,(%s).%s,bias((%s).w))",smp,smp,cs,dimension,cs);
+                    else if(x->cmp==0)
+                        snprintf(ex,sizeof ex,"SMP%d((%s).xy, (%s).xyz)",smp,cs,cs);
+                    else return 0;
+                } else snprintf(ex, sizeof ex, "SMP%d((%s).xy, (%s).xyz)", smp, cs, cs);
             } else if (x->nsrc == 1 && RT(x->src[0]) == R_ADDR){
                 /* ps_1_4: source tM is a texture COORDINATE, not a sample VALUE */
                 snprintf(ex, sizeof ex, "SMP%d(TCRD(%d), TPICK(%d).xyz)",
@@ -972,8 +1144,20 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
             EMIT("  t[%d] = TPICK(%d);\n", dn, dn);
             continue; }
         case O_TEXKILL:
+            msl_reg(s0,sizeof s0,p,x->dst,0);
             EMIT("  if (any((%s).xyz < 0.0)) discard_fragment();\n", s0);
             continue;
+        case O_IF:
+            EMIT("  if ((%s).x != 0.0) {\n",s0);continue;
+        case O_IFC: {
+            static const char *cmp[]={NULL,">","==",">=","<","!=","<="};
+            if(x->cmp<1 || x->cmp>6)return 0;
+            EMIT("  if ((%s).x %s (%s).x) {\n",s0,cmp[x->cmp],s1);continue;
+        }
+        case O_ELSE: EMIT("  } else {\n");continue;
+        case O_ENDIF: EMIT("  }\n");continue;
+        case O_DSX: snprintf(ex,sizeof ex,"dfdx(%s)",s0);break;
+        case O_DSY: snprintf(ex,sizeof ex,"dfdy(%s)",s0);break;
         case O_MOV:    snprintf(ex, sizeof ex, "%s", s0); break;
         case O_ADD:    snprintf(ex, sizeof ex, "(%s) + (%s)", s0, s1); break;
         case O_SUB:    snprintf(ex, sizeof ex, "(%s) - (%s)", s0, s1); break;
@@ -1005,7 +1189,7 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
         case O_LOG: snprintf(ex, sizeof ex,
                        "float4((%s).x == 0.0 ? -3.4e38 : log2(abs((%s).x)))", s0, s0); break;
         default:
-            continue;                       /* unsupported: skip */
+            return 0;                       /* never skip shader behavior */
         }
         if (!x->has_dst) continue;
         { char mz[8]; msl_mask_swz(mz, sizeof mz, x->dst);
@@ -1020,8 +1204,13 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
     EMIT("  if (res.a < P.aref) discard_fragment();\n");
     EMIT("#undef TSEL\n#undef TPICK\n#undef TCRD\n");
     /* D3D9 fog: C = f*Cs + (1-f)*Cfog, RGB only.  P.fog.a = FOGENABLE. */
-    EMIT("  res.rgb = mix(P.fog.rgb, res.rgb, mix(1.0, saturate(i.fog), P.fog.a));\n");
-    if (reflk >= 0){
+    if(p->version < 0x0300) EMIT("  res.rgb = mix(P.fog.rgb, res.rgb, mix(1.0, saturate(i.fog), P.fog.a));\n");
+    if(mrt){
+        EMIT("  %s mrt_out;\n",result_type);
+        if(outputs&1u)EMIT("  mrt_out.c0 = res;\n");
+        for(unsigned k=1;k<4;k++)if(outputs&(1u<<k))EMIT("  mrt_out.c%u = oC%u;\n",k,k);
+        EMIT("  return mrt_out;\n}\n");
+    } else if (reflk >= 0){
         if (!hd_seen) return 0;             /* stage in another form: no variant */
         int cls = ((cubemask >> reflk) & 1u) ? 2 : 1;
         EMIT("  hd_o[hd_ev] = res;\n  }\n");
@@ -1057,11 +1246,22 @@ int ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubem
 }
 
 /* Does the shader write oC0 (ps_2_0) or r0 (ps_1_x)? */
+int ps_sampler_type(const VSProg *p,unsigned stage){return p && stage<16 ? p->smptype[stage] : 0;}
 int ps_uses_colorout(const VSProg *p){
     if (!p) return 0;
     for (unsigned q = 0; q < p->n; q++)
         if (p->ins[q].has_dst && RT(p->ins[q].dst) == R_COLOROUT) return 1;
     return 0;
+}
+unsigned ps_color_output_mask(const VSProg *p){
+    if(!p || !p->is_ps)return 0;
+    if(p->version<0x0200)return 1;
+    unsigned mask=0;
+    for(unsigned q=0;q<p->n;q++)if(p->ins[q].has_dst && RT(p->ins[q].dst)==R_COLOROUT){
+        unsigned index=RN(p->ins[q].dst);if(index>=4)return 0;
+        mask|=1u<<index;
+    }
+    return mask?mask:1;
 }
 
 /* ====================================================================
@@ -1121,7 +1321,7 @@ static int vs_dst_msl(char *o, size_t cap, unsigned tok){
                     if (n==1){ snprintf(o,cap,"oFog"); return 1; }
                     snprintf(o,cap,"dummy"); return 1;
     case R_ATTROUT: snprintf(o,cap,"oD[%d]", n & 1); return 1;
-    case R_OUTPUT:  snprintf(o,cap,"oT[%d]", n & 3); return 1;
+    case R_OUTPUT:  snprintf(o,cap,"oT[%d]", n); return 1;
     default:        snprintf(o,cap,"dummy"); return 1;
     }
 }
@@ -1193,7 +1393,14 @@ static void pos_cregs(const VSProg *p, int reg[4]){
             for (int c = 0; c < 4; c++) if (m & (1u << c)) tsrc[RN(x->dst)][c] = (int16_t)k;
             continue;
         }
-        if (RT(x->dst) != R_RASTOUT || RN(x->dst) != 0) continue;   /* not oPos */
+        int position=RT(x->dst)==R_RASTOUT && RN(x->dst)==0;
+        if(p->version>=0x0300 && RT(x->dst)==R_OUTPUT){
+            for(unsigned z=0;z<p->n;z++){
+                const VSIns*d=&p->ins[z];
+                if(d->op==O_DCL && RT(d->dst)==R_OUTPUT && RN(d->dst)==RN(x->dst) && (d->usage&0x000f001fu)==0)position=1;
+            }
+        }
+        if(!position)continue;
         if (x->op == O_M4x4 || x->op == O_M4x3){
             if (x->nsrc >= 2 && RT(x->src[1]) == R_CONST && !RELADDR(x->src[1])){
                 cx = RN(x->src[1]); cy = cx + 1; cw = cx + 3; }
@@ -1287,7 +1494,7 @@ int vs_writes_fog(const VSProg *p){
 }
 
 int vs_to_msl(const VSProg *p, int id, const int decl[16][2], char *out, size_t cap){
-    if (!p || !out || cap < 1024) return 0;
+    if (!p || !out || cap < 1024 || !sm3_valid(p)) return 0;
     g_cbuf = "K";                       /* vertex: K.c[0..255] */
     size_t o = 0;
     #define VEMIT(...) do{ int _w = snprintf(out+o, cap-o, __VA_ARGS__); \
@@ -1313,7 +1520,8 @@ int vs_to_msl(const VSProg *p, int id, const int decl[16][2], char *out, size_t 
     /* oFog defaults to 1.0 = NO FOG; the right behaviour if the shader does not write it. */
     VEMIT("  float4 oFog=float4(1.0);\n");
     VEMIT("  float4 oD[2]  = { float4(1.0), float4(0.0) };\n");
-    VEMIT("  float4 oT[4]  = { float4(0.0), float4(0.0), float4(0.0), float4(0.0) };\n");
+    VEMIT("  float4 oT[8]; for(int q=0;q<8;q++) oT[q]=float4(0.0);\n");
+    if(p->version>=0x0300) VEMIT("  float4 o[12]; for(int q=0;q<12;q++) o[q]=float4(0.0);\n");
     VEMIT("  int4 a0 = int4(0); int aL = 0;\n");
 
     /* Read the input registers from the declaration */
@@ -1331,7 +1539,8 @@ int vs_to_msl(const VSProg *p, int id, const int decl[16][2], char *out, size_t 
         const VSIns *x = &p->ins[q];
         char d[96], s0[160], s1[160], s2b[160], ex[512], fit[560];
         int nc = 4;
-        if (x->has_dst){ vs_dst_msl(d, sizeof d, x->dst);
+        if (x->has_dst){ if(p->version>=0x0300 && RT(x->dst)==R_OUTPUT) snprintf(d,sizeof d,"o[%d]",RN(x->dst));
+                         else vs_dst_msl(d, sizeof d, x->dst);
                          unsigned m = WMASK(x->dst);
                          if (m && m != 0xFu){
                              char sw[8]; int k=0; sw[k++]='.';
@@ -1347,6 +1556,7 @@ int vs_to_msl(const VSProg *p, int id, const int decl[16][2], char *out, size_t 
         switch (x->op){
         case O_NOP: case O_DCL: case O_DEF: case O_DEFI: case O_DEFB:
         case O_LABEL: case O_END: continue;
+        case O_CMP: snprintf(ex,sizeof ex,"select((%s),(%s),(%s)>=0.0)",s2b,s1,s0);break;
         case O_MOV:  snprintf(ex,sizeof ex,"%s", s0); break;
         case O_ADD:  snprintf(ex,sizeof ex,"(%s) + (%s)", s0, s1); break;
         case O_SUB:  snprintf(ex,sizeof ex,"(%s) - (%s)", s0, s1); break;
@@ -1428,13 +1638,27 @@ int vs_to_msl(const VSProg *p, int id, const int decl[16][2], char *out, size_t 
 
     size_t body_b = o;
     VEMIT("  VOut O;\n");
-    VEMIT("  O.pos = oPos;\n");
-    VEMIT("  O.col0 = oD[0]; O.col1 = oD[1];\n");
-    /* D3DTSS_TEXCOORDINDEX: stage k reads oT[sel].  The selection is made HERE
-     * so the coordinate stays a pure interpolant in the pixel shader. */
-    VEMIT("  O.uv0 = oT[(K.tsel      ) & 3u]; O.uv1 = oT[(K.tsel >>  8) & 3u];\n");
-    VEMIT("  O.uv2 = oT[(K.tsel >> 16) & 3u]; O.uv3 = oT[(K.tsel >> 24) & 3u];\n");
-    VEMIT("  O.fog = oFog.x;\n");
+    if(p->version>=0x0300){
+        VEMIT("  O.pos = float4(0.0,0.0,0.0,1.0); O.fog = 1.0;\n");
+        for(int k=0;k<6;k++) VEMIT("  O.col%d = float4(0.0);\n",k);
+        for(int k=0;k<8;k++) VEMIT("  O.uv%d = float4(0.0);\n",k);
+        for(unsigned q=0;q<p->n;q++){
+            const VSIns*x=&p->ins[q];
+            if(x->op!=O_DCL || RT(x->dst)!=R_OUTPUT)continue;
+            int u=x->usage&31u,ix=(x->usage>>16)&15u;char field[16],mask[8];
+            if(u==0)snprintf(field,sizeof field,"pos");
+            else snprintf(field,sizeof field,"%s%d",u==5?"uv":"col",ix);
+            msl_mask_swz(mask,sizeof mask,x->dst);
+            VEMIT("  O.%s%s = o[%d]%s;\n",field,mask,RN(x->dst),mask);
+        }
+    } else {
+        VEMIT("  O.pos = oPos;\n");
+        VEMIT("  O.col0 = oD[0]; O.col1 = oD[1];\n");
+        VEMIT("  O.uv0 = oT[(K.tsel      ) & 3u]; O.uv1 = oT[(K.tsel >>  8) & 3u];\n");
+        VEMIT("  O.uv2 = oT[(K.tsel >> 16) & 3u]; O.uv3 = oT[(K.tsel >> 24) & 3u];\n");
+        VEMIT("  O.uv4=oT[4]; O.uv5=oT[5]; O.uv6=oT[6]; O.uv7=oT[7];\n");
+        VEMIT("  O.fog = oFog.x;\n");
+    }
     VEMIT("  (void)dummy; (void)a0; (void)aL;\n");
     VEMIT("#undef LDF\n#undef LDB\n#undef LDS\n#undef LDU\n");
     VEMIT("  return O;\n}\n");

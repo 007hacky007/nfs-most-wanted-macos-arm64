@@ -17,6 +17,7 @@ void kbd_set_key(int src, unsigned dik, int down);       /* any thread */
 void kbd_release_source(int src);                        /* every key of src up */
 void kbd_state(uint8_t *dst, unsigned n);                /* 0x80 = down */
 int  kbd_key_down(unsigned dik);
+uint64_t kbd_key_presses(unsigned dik); /* combined-source up-to-down transitions */
 
 typedef struct { uint8_t dik, down; uint32_t ms, seq; } KbdEv;
 uint32_t kbd_ev_head(void);                  /* sequence number of the next event */

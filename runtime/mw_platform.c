@@ -1,11 +1,30 @@
 /* Optional NFSU2 integrations are absent until verified for this game. */
 #include "cpu.h"
+#include "widescreen.h"
 #include <stdio.h>
 #include <stdint.h>
 
 int g_dx_in_pass, g_fxtr, g_efx_stat, g_prof_on;
 uint32_t g_last_fn;
-void guest_hook(CPU *c,uint32_t ip){ (void)c; fprintf(stderr,"Unregistered guest hook %08x\n",ip); __builtin_trap(); }
+int mw_unlimiter_hook(CPU *,uint32_t);
+int mw_texwizard_hook(CPU *,uint32_t);
+int mw_hdcontent_hook(CPU *,uint32_t);
+int mw_hdscaling_hook(CPU *,uint32_t);
+int mw_motionblur_hook(CPU *,uint32_t);
+int mw_fixes_hook(CPU *,uint32_t);
+int mw_fixes_branch(CPU *,uint32_t);
+int mw_fe_shadows_hook(CPU *,uint32_t),mw_fe_shadows_branch(CPU *,uint32_t);
+int mw_hud_adapter_hook(CPU *,uint32_t),mw_hud_adapter_branch(CPU *,uint32_t);
+int mw_hdreflections_hook(CPU *,uint32_t),mw_hdreflections_branch(CPU *,uint32_t);
+void guest_hook(CPU *c,uint32_t ip){ if(mw_hdreflections_hook(c,ip)||mw_hud_adapter_hook(c,ip)||mw_fe_shadows_hook(c,ip)||mw_fixes_hook(c,ip)||mw_motionblur_hook(c,ip)||mw_hdscaling_hook(c,ip)||mw_hdcontent_hook(c,ip)||ws_hook(c,ip)||mw_unlimiter_hook(c,ip)||mw_texwizard_hook(c,ip))return; fprintf(stderr,"Unregistered guest hook %08x\n",ip); __builtin_trap(); }
+int guest_branch(CPU *c,uint32_t ip){
+    int result=mw_hdreflections_branch(c,ip);if(result>=0)return result;
+    result=mw_hud_adapter_branch(c,ip);if(result>=0)return result;
+    result=mw_fe_shadows_branch(c,ip);if(result>=0)return result;
+    result=mw_fixes_branch(c,ip);if(result>=0)return result;
+    result=ws_branch(c,ip);if(result>=0)return result;
+    fprintf(stderr,"Unregistered native branch %08x\n",ip);__builtin_trap();
+}
 void autotest_note_trap(uint32_t a,const char *n){ (void)a;(void)n; }
 void autotest_note_unimpl(const char *d,const char *n,uint32_t a){ (void)d;(void)n;(void)a; }
 void overrides_report(void){}
@@ -15,16 +34,6 @@ int fxtr_now(void){ return 0; }
 void cov_reset(void){}
 void cov_report(const char *s){ (void)s; }
 void genexec_report(void){}
-void ws_set_mapping(float k){ (void)k; }
-float ws_persp_x(void){ return 1.f; }
-float ws_persp_y(void){ return 1.f; }
-float ws_ui_x(void){ return 1.f; }
-float ws_ui_y(void){ return 1.f; }
-double ws_render_factor(void){ return 1.; }
-double ws_max_pixels(void){ return 9e6; }
-int ws_fill_target(void){ return 0; }
-int ws_take_border_quad(void){ return 0; }
-void ws_report(void){}
 int hfr_mailbox(void){ return 0; }
 int hfr_uncapped(void){ return 0; }
 void hfr_note_vsync(double a,double b){ (void)a;(void)b; }

@@ -1,5 +1,13 @@
 #include "cpu.h"
 #include "target.h"
+#include "module.h"
+#if NFS_HQ_MODULES
+#include "hq_plugin.h"
+#include "hq_image.h"
+#include "hq_capture.h"
+#include "hq_prepare.h"
+#endif
+#include "widescreen.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -21,6 +29,7 @@ void fileio_set_root(const char *), fileio_set_write_root(const char *), fileio_
 void lifecycle_guest_exited(int), metal_early_init(void), metal_run_main_loop(void);
 static CPU cpu;
 static int kernel_probe;
+static int module_prepare;
 static int enum_keyboards;
 static void enum_probe(CPU *c){
     POP32(c->eip);uint32_t instance=MR32(c->esp);
@@ -45,6 +54,18 @@ static void test_kernel(CPU *c){
     MR32(c->esp+4)=0;
     assert(win32_ext_call(c,"WaitForSingleObject",&result)&&result==0x102);
     assert(win32_ext_call(c,"CloseHandle",&result));
+    uint32_t memory=c->esp+2048;
+    memset(g_mem+memory,0xa5,72);MR32(memory)=64;MR32(c->esp)=memory;
+    assert(win32_ext_call(c,"GlobalMemoryStatusEx",&result)&&result);
+    assert(MR32(memory)==64&&MR32(memory+4)<=100);
+    assert(MR64(memory+8)>0&&MR64(memory+16)<=MR64(memory+8));
+    assert(MR64(memory+24)>0&&MR64(memory+32)<=MR64(memory+24));
+    assert(MR64(memory+40)==0x80000000ull&&MR64(memory+48)<=MR64(memory+40));
+    assert(MR64(memory+56)==0&&MR64(memory+64)==0xa5a5a5a5a5a5a5a5ull);
+    MR32(memory)=63;
+    assert(win32_ext_call(c,"GlobalMemoryStatusEx",&result)&&!result);
+    assert(MR32(memory)==63);
+    MR32(c->esp)=0;assert(win32_ext_call(c,"GlobalMemoryStatusEx",&result)&&!result);
     uint32_t system=c->esp+96,file=c->esp+128;
     memset(g_mem+system,0,16);MR16(system)=1970;MR16(system+2)=1;MR16(system+6)=1;
     MR32(c->esp)=system;MR32(c->esp+4)=file;
@@ -78,11 +99,12 @@ static void test_kernel(CPU *c){
     uint32_t readstate[]={keyboard,256,out+512};
     assert(!call_guest(c,MR32(MR32(keyboard)+36),3,readstate));assert(MR8(out+512+0xcb)==0x80);
     kbd_set_key(1,0xcb,0);
-    puts("Kernel timer: relative deadline, auto-reset and timeout passed");
+    puts("Kernel timers, memory status and input checks passed");
 }
 
 static void report(void){
     dispatch_report(); win32_report(); com_report();
+    void mw_texwizard_report(void);mw_texwizard_report();
 }
 
 static void timed_out(int sig){
@@ -91,7 +113,7 @@ static void timed_out(int sig){
     guest_backtrace(&cpu,24); report(); _exit(124);
 }
 
-static int check_exe(const char *path){
+int hq_image_hash(const char *path,const char *expected){
     FILE *f = fopen(path,"rb");
     if (!f) { perror("speed.exe"); return 0; }
     CC_SHA256_CTX ctx; CC_SHA256_Init(&ctx);
@@ -99,8 +121,12 @@ static int check_exe(const char *path){
     while ((n=fread(data,1,sizeof data,f))) CC_SHA256_Update(&ctx,data,(CC_LONG)n);
     int ok=!ferror(f); fclose(f); CC_SHA256_Final(digest,&ctx);
     char hex[65]; for (int i=0;i<32;i++) snprintf(hex+2*i,3,"%02x",digest[i]);
-    return ok && !strcmp(hex,MW_EXE_SHA);
+    return ok && !strcmp(hex,expected);
 }
+
+#define BASE_IMAGE_SHA "80774c2e5d619b4f120b48d4462896fd504c263399d203a238769cffde1d253c"
+#define OFFICIAL_IMAGE_SHA "e8019e0d7b706beba5ec648a50108a9a13346695eba9ebe58b6d796260d3c4eb"
+static int native_image(const char *path){return hq_image_hash(path,BASE_IMAGE_SHA);}
 
 static void *run_game(void *unused){
     (void)unused;
@@ -110,6 +136,20 @@ static void *run_game(void *unused){
         g_exit_armed=1;
         guest_lock(c);
         if(kernel_probe){ test_kernel(c);g_exit_armed=0;guest_unlock();return NULL; }
+#if NFS_HQ_MODULES
+        { const char *mode=getenv("NFSMW_MODE");
+          if(mode&&!strcmp(mode,"full")&&!hq_plugin_prepare(c,NULL)){
+              g_exit_code=2;g_exit_armed=0;guest_unlock();lifecycle_guest_exited(2);return NULL;
+          } }
+        if(module_prepare){
+            if(module_prepare==2&&!hq_prepare_run(c)){
+                g_exit_code=2;g_exit_armed=0;guest_unlock();lifecycle_guest_exited(2);return NULL;
+            }
+            hq_capture(c,"modules",0);
+            fprintf(stderr,"HQ module preparation finished before game entry\n");
+            g_exit_armed=0;guest_unlock();lifecycle_guest_exited(0);return NULL;
+        }
+#endif
         PUSH32(0xdeadc0deu);
         fprintf(stderr,"Executing Most Wanted entry %08x as native ARM64\n",MW_ENTRY);
         dispatch_indirect(c,MW_ENTRY);
@@ -125,24 +165,59 @@ static void *run_game(void *unused){
 }
 
 int main(int argc,char **argv){
+    module_prepare=argc>1&&!strcmp(argv[1],"--prepare-hq-modules");
+    if(argc>1&&!strcmp(argv[1],"--prepare-hq-runtime"))module_prepare=2;
+    if(module_prepare){
+#if NFS_HQ_MODULES
+        const char *captures=getenv("NFSMW_HQ_CAPTURE_DIR");struct stat info;
+        if(argc!=3||!captures||stat(captures,&info)||!S_ISDIR(info.st_mode)||access(captures,W_OK|X_OK)){
+            fprintf(stderr,"Usage: NFSMW_HQ_CAPTURE_DIR=existing-folder %s --prepare-hq-modules game/speed.exe\n",argv[0]);return 2;
+        }
+        setenv("NFSMW_MODE","full",1);
+#else
+        fprintf(stderr,"HQ module preparation requires a build with --hq\n");return 2;
+#endif
+    }
     kernel_probe=argc>1&&!strcmp(argv[1],"--test-kernel");
-    char exe[4096],saves[4096],registry[4096];
+    char exe[4096],image[4096],saves[4096],registry[4096];
     int app_prepare(const char *,char *,size_t,char *,size_t,char *,size_t);
     void app_show_error(const char *);
-    int paths=app_prepare(argc>1&&!kernel_probe?argv[1]:NULL,exe,sizeof exe,saves,sizeof saves,registry,sizeof registry);
+    int paths=app_prepare(module_prepare?argv[2]:argc>1&&!kernel_probe?argv[1]:NULL,exe,sizeof exe,saves,sizeof saves,registry,sizeof registry);
     if(paths==0)return 0;
     if(paths<0){app_show_error("Cannot create the save or log directory.");return 2;}
+    { const char *mode=getenv("NFSMW_MODE");int app_full_hq_supported(void);
+      int experimental=0;
+#if NFS_HQ_MODULES
+      const char *setting=getenv("NFSMW_EXPERIMENTAL_FULL");experimental=setting&&!strcmp(setting,"1");
+#endif
+      if(mode&&!strcmp(mode,"full")&&!app_full_hq_supported()&&!experimental&&!module_prepare){
+          app_show_error("HQ full mod is unavailable in this build. Its native renderer and code mods are still being ported.");return 2;
+      } }
     int automation_load(const char *);
     if(!automation_load(getenv("NFSMW_INPUT_SCRIPT"))){fprintf(stderr,"Invalid input script\n");return 2;}
     int automation_open_commands(const char *);
     if(!automation_open_commands(getenv("NFSMW_COMMANDS"))){fprintf(stderr,"Cannot open command file\n");return 2;}
-    if (!check_exe(exe)){app_show_error("Unsupported speed.exe. Select the installed PC v1.3 game folder used for this build.");return 2;}
+#if NFS_HQ_MODULES
+    {const char *mode=getenv("NFSMW_MODE");
+     if(!hq_image_select(exe,image,sizeof image,mode&&!strcmp(mode,"full"))){
+         app_show_error("Unsupported game data or missing verified runtime image.");return 2;
+     }}
+#else
+    snprintf(image,sizeof image,"%s",exe);
+    if(!native_image(exe)){
+        int app_runtime_image(const char *,char *,size_t);
+        if(!hq_image_hash(exe,OFFICIAL_IMAGE_SHA)||!app_runtime_image(exe,image,sizeof image)||!native_image(image)){
+            app_show_error("Unsupported game image. Install the supplied ISO discs and patches, then select that installation.");return 2;
+        }
+        fprintf(stderr,"Using the verified native runtime image with official 1.3 game files\n");
+    }
+#endif
     mkdir("out",0755);
     setenv("NFSU2_REGFILE",registry,1);
     setenv("NFSU2_SAVEDIR",saves,1);
     setenv("NFSU2_NET","off",1); setenv("NFSU2_ONLINE","0",1);
     mem_init(); mem_fault_handler_install();
-    if (mem_load_pe(exe)) return 2;
+    if (mem_load_pe(image)) return 2;
     const uint32_t teb=0x00c00000u, peb=0x00c10000u, lo=0x7f000000u, hi=0x7ff00000u;
     mem_commit(teb,0x20000); mem_commit(lo,hi-lo);
     MR32(teb)=0xffffffffu; MR32(teb+4)=hi; MR32(teb+8)=lo;
@@ -152,8 +227,49 @@ int main(int argc,char **argv){
     cpu.esp=hi-0x1000; cpu.fcw=0x027f; cpu.fs_base=teb; cpu.gs_base=teb;
     extern CPU *g_cur_cpu; g_cur_cpu=&cpu;
     fileio_set_root(exe); fileio_set_write_root(saves); fileio_set_readonly_root(1);
+    { char directory[4096];snprintf(directory,sizeof directory,"%s",exe);
+      char *slash=strrchr(directory,'/');if(slash)*slash=0;else strcpy(directory,".");
+      void ws_configure(const char *);ws_configure(directory); }
     dispatch_init(); win32_init();
+#if NFS_HQ_MODULES
+    {void hq_game_register(void);hq_game_register();}
+#endif
+    if(!ws_patch_init()){
+        app_show_error("Widescreen patch settings are invalid or unsupported.");return 2;
+    }
+    { void mw_unlimiter_init(int);const char *mode=getenv("NFSMW_MODE");
+#if NFS_HQ_MODULES
+      hq_plugin_init_unlimiter(mode&&!strcmp(mode,"full"));
+#else
+      mw_unlimiter_init(mode&&!strcmp(mode,"full"));
+#endif
+      void mw_hdscaling_init(int);mw_hdscaling_init(mode&&!strcmp(mode,"full"));
+      int mw_motionblur_init(int);
+      if(!mw_motionblur_init(mode&&!strcmp(mode,"full"))){
+          app_show_error("HQ motion blur settings are invalid.");return 2;
+      }
+      int mw_fixes_init(int);
+      if(!mw_fixes_init(mode&&!strcmp(mode,"full"))){
+          app_show_error("HQ stability patch settings are invalid or unsupported.");return 2;
+      }
+      int mw_fe_shadows_init(int),mw_hud_adapter_init(int);
+      if(!mw_fe_shadows_init(mode&&!strcmp(mode,"full"))){
+          app_show_error("HQ frontend shadow settings are invalid or unsupported.");return 2;
+      }
+      if(!mw_hud_adapter_init(mode&&!strcmp(mode,"full"))){
+          app_show_error("HQ HUD initialization failed.");return 2;
+      }
+      int mw_hdreflections_init(int);
+      if(!mw_hdreflections_init(mode&&!strcmp(mode,"full"))){
+          app_show_error("HQ reflection settings are invalid or unsupported.");return 2;
+      }
+      void mw_hdcontent_init(int);mw_hdcontent_init(mode&&(!strcmp(mode,"visuals")||!strcmp(mode,"full")));
+      int mw_texwizard_init(int);
+      if(!mw_texwizard_init(mode&&(!strcmp(mode,"visuals")||!strcmp(mode,"full")))){
+          app_show_error("HQ texture data is missing or invalid. Reinstall the HQ assets.");return 2;
+      } }
     signal(SIGALRM,timed_out);
+    if(module_prepare)unsetenv("WINDOW");
     alarm(getenv("ALARM")?(unsigned)atoi(getenv("ALARM")):30);
     if (getenv("WINDOW")){
         int metal_available(void);

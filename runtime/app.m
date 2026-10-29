@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #include <stdio.h>
 #include <unistd.h>
+NSString *launcher_choose_game(void);
 
 static BOOL bundled(void){return [[[NSBundle mainBundle].bundlePath pathExtension] isEqualToString:@"app"];}
 
@@ -22,16 +23,8 @@ int app_prepare(const char *argument,char *exe,size_t exe_size,char *save,size_t
         }
         NSString *game=argument?[NSString stringWithUTF8String:argument]:nil;
         if(!game&&bundled()){
-            [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-            NSOpenPanel *panel=[NSOpenPanel openPanel];panel.canChooseFiles=NO;panel.canChooseDirectories=YES;
-            panel.allowsMultipleSelection=NO;panel.message=@"Select the folder containing your Most Wanted game files.";
-            panel.prompt=@"Play";
-            NSString *previous=[[NSUserDefaults standardUserDefaults] stringForKey:@"GameFolder"];
-            if(previous)panel.directoryURL=[NSURL fileURLWithPath:previous isDirectory:YES];
-            [NSApp activateIgnoringOtherApps:YES];
-            if([panel runModal]!=NSModalResponseOK)return 0;
-            NSString *folder=panel.URL.path;
-            [[NSUserDefaults standardUserDefaults] setObject:folder forKey:@"GameFolder"];
+            NSString *folder=launcher_choose_game();
+            if(!folder)return 0;
             game=[folder stringByAppendingPathComponent:@"speed.exe"];
         }
         if(!game)game=@"game/speed.exe";
@@ -39,6 +32,9 @@ int app_prepare(const char *argument,char *exe,size_t exe_size,char *save,size_t
         NSString *state=bundled()?[NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,NSUserDomainMask,YES).firstObject stringByAppendingPathComponent:@"NFSMW"]:files.currentDirectoryPath;
         const char *custom=getenv("NFSMW_SAVEDIR");
         NSString *saves=custom?[NSString stringWithUTF8String:custom]:[state stringByAppendingPathComponent:bundled()?@"Saves":@"out/profile"];
+        const char *mode=getenv("NFSMW_MODE");
+        if(!custom&&mode&&(!strcmp(mode,"visuals")||!strcmp(mode,"full")))
+            saves=[saves stringByAppendingPathComponent:!strcmp(mode,"visuals")?@"HQVisuals":@"HQFull"];
         if(![saves isAbsolutePath])saves=[files.currentDirectoryPath stringByAppendingPathComponent:saves];
         NSError *error=nil;
         if(![files createDirectoryAtPath:saves withIntermediateDirectories:YES attributes:nil error:&error])return -1;
@@ -54,5 +50,17 @@ int app_prepare(const char *argument,char *exe,size_t exe_size,char *save,size_t
         int s=snprintf(save,save_size,"%s",saves.fileSystemRepresentation);
         int r=snprintf(registry,registry_size,"%s",[saves stringByAppendingPathComponent:@"registry"].fileSystemRepresentation);
         return n>=0&&(size_t)n<exe_size&&s>=0&&(size_t)s<save_size&&r>=0&&(size_t)r<registry_size?1:-1;
+    }
+}
+
+int app_runtime_image(const char *game,char *image,size_t image_size){
+    @autoreleasepool{
+        NSString *folder=[[NSString stringWithUTF8String:game] stringByDeletingLastPathComponent];
+        NSString *candidate=[folder stringByAppendingPathComponent:@".nfsmw/runtime.exe"];
+        if(![NSFileManager.defaultManager fileExistsAtPath:candidate])
+            candidate=[NSBundle.mainBundle pathForResource:@"runtime-image" ofType:@"exe"];
+        if(!candidate)return 0;
+        int n=snprintf(image,image_size,"%s",candidate.fileSystemRepresentation);
+        return n>=0&&(size_t)n<image_size;
     }
 }

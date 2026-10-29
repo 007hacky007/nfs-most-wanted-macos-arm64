@@ -149,8 +149,9 @@ static _Atomic long     g_frames_drawn  = 0;
 static _Atomic long     g_tris_drawn    = 0;
 static _Atomic long     g_tex_created   = 0, g_tex_uploaded = 0;
 static _Atomic int      g_should_quit   = 0;
+static void readback_cancel_pending(void);
 /* autotest.c: NFSU2_QUIT_FRAMES / script "quit" -> main loop exits cleanly */
-void metal_request_quit(void){ atomic_store(&g_should_quit, 1); }
+void metal_request_quit(void){ atomic_store(&g_should_quit, 1); readback_cancel_pending(); }
 
 /* --- mouse state: the front end is navigated with the mouse (DIMOUSESTATE2)
  * DirectInput wants relative motion; we also keep the absolute position for
@@ -339,23 +340,25 @@ typedef TVert MVert;   /* clip space + two colours + 4x4 texture coordinates */
  * vsemu.c FOLDED higher indices with 'idx & 7': a shader reading constant
  * c8 saw c0.  Post-processing (bloom threshold, blur tap weights) uses
  * exactly that range. */
-#define PSC_N 32
+#define PSC_N 224
 typedef struct { unsigned first, count, tex, target, clear_argb, is_clear;
+                 unsigned mrt[3], mrt_write;
                  unsigned blend; float alpha_ref; unsigned depth;
+                 float depth_bias,slope_bias; unsigned fixed_function;
                  unsigned tex1, tex2, tex3; int ps;
                  /* ps constants are in the frame's pool (g_pscb[b][psci]); c0 also
                   * here (the HD ray-tracing material reads only that) */
                  unsigned psci; float c0[4];
                  int vsid; unsigned rawoff, koff; float proj[4];
-                 unsigned smp[4];
-                 unsigned is_blit, blit_src; unsigned bcol; unsigned cull;
+                 unsigned smp[16]; unsigned stage_tex[16];
+                 unsigned is_blit, blit_src; unsigned ws_gamma,ws_border; unsigned bcol; unsigned cull;
                  float fogv[4];
                  unsigned clr_flags; float clr_z; unsigned ksz;
                  /* indexed draw (see PERSISTENT VERTEX / INDEX POOL): if ix_isz is 2/4,
                   * rawoff is the offset of vertex 0 in the pool, ix_ib the offset of
                   * the first index; count is the index count.  gh: geometry id
                   * (0 = hash of the contents). */
-                 unsigned ix_isz, ix_ib; int ix_base; unsigned long long gh; } MDraw;
+                 unsigned ix_isz, ix_ib; int ix_base; unsigned long long gh; uint64_t query_mask; } MDraw;
 
 #define MAXV  (256*1024)
 #define MAXD  (16*1024)
@@ -548,14 +551,40 @@ static _Atomic unsigned long long g_pass_n = 0, g_draw_n = 0;
 #define TGT_ID(t)   ((t) & 0xFFFFu)
 #define TGT_FACE(t) (((t) >> 16) & 7u)          /* 0 = no face */
 static unsigned g_cur_target = 0;          /* the guest's active render target */
+static unsigned g_cur_mrt[3], g_cur_mrt_write = 0xfffu;
+static int color_targets_equal(const MDraw *a,const MDraw *b){
+    return a->target==b->target && !memcmp(a->mrt,b->mrt,sizeof a->mrt);
+}
+static int color_has_mrt(const MDraw *d){return d->mrt[0] || d->mrt[1] || d->mrt[2];}
+static uint64_t color_write_key(unsigned masks){
+    return ((uint64_t)(masks&15u)<<44)|((uint64_t)((masks>>4)&15u)<<54)|((uint64_t)((masks>>8)&15u)<<58);
+}
+void metal_set_color_write(unsigned slot,unsigned mask){
+    if(slot<1 || slot>3)return;
+    unsigned shift=(slot-1)*4;
+    g_cur_mrt_write=(g_cur_mrt_write&~(15u<<shift))|((mask&15u)<<shift);
+}
 static unsigned g_cur_blend  = 0;
 static unsigned g_cur_bcol   = 0xFFFFFFFFu;   /* D3DRS_BLENDFACTOR (ARGB) */
 static unsigned g_cur_cull   = 3u;            /* D3DRS_CULLMODE: 1=NONE 2=CW 3=CCW */
 static unsigned g_cur_depth  = 1u << 8; /* bit0=test, bit1=write, bit2-4=func,
                                           * bit8+ = bound Z surface (DEPTH_ZID) */
 static unsigned g_cur_dmode  = 0;
+static float g_cur_depth_bias,g_cur_slope_bias;
+void metal_set_depth_bias(float constant,float slope){
+    g_cur_depth_bias=isfinite(constant)?constant:0;g_cur_slope_bias=isfinite(slope)?slope:0;
+}
+void metal_apply_depth_bias(id<MTLRenderCommandEncoder> encoder,float constant,float slope){
+    /* Metal's constant is in depth-format ULPs. D3D9's is a normalized
+     * offset, supplied by the depth-output fragment variant after clipping. */
+    [encoder setDepthBias:0 slopeScale:slope clamp:0];
+    [encoder setFragmentBytes:&constant length:sizeof constant atIndex:1];
+}
 static unsigned g_cur_zid    = 1;       /* 1 = the device's implicit Z surface */
 static unsigned g_cur_tex1 = 0, g_cur_tex2 = 0, g_cur_tex3 = 0;
+static unsigned g_cur_stage_tex[16];
+static int32_t g_cur_psbool[16];
+static unsigned g_cur_fixed_function;
 static int      g_cur_ps = 0;              /* active pixel shader */
 static float    g_cur_psc[PSC_N][4];       /* ps constants c0..c(PSC_N-1) */
 /* Per-frame ps constant pool.  Every draw record used to carry all 32
@@ -563,37 +592,52 @@ static float    g_cur_psc[PSC_N][4];       /* ps constants c0..c(PSC_N-1) */
  * encoding, ~2 KB per draw.  Measured: 92% of draws use the SAME constants
  * as the previous one (the game writes up to c3).  Now constants are added
  * to the pool only when they change, and the record carries the index. */
-static float    (*g_pscb[2])[PSC_N][4];
+typedef struct {float c[PSC_N][4]; int32_t b[16];} PSConstants;
+static PSConstants *g_pscb[2];
 static unsigned g_pscn[2], g_psc_last[2], g_psc_lastver[2];
 static unsigned g_psc_ver = 1;              /* bumped whenever g_cur_psc changes */
 static unsigned psc_put(int b){              /* under g_qlock */
     if (g_pscn[b] && g_psc_lastver[b] == g_psc_ver) return g_psc_last[b];
     if (g_pscn[b] >= MAXD) return g_psc_last[b];
-    memcpy(g_pscb[b][g_pscn[b]], g_cur_psc, sizeof g_cur_psc);
+    memcpy(g_pscb[b][g_pscn[b]].c, g_cur_psc, sizeof g_cur_psc);
+    memcpy(g_pscb[b][g_pscn[b]].b, g_cur_psbool, sizeof g_cur_psbool);
     g_psc_last[b] = g_pscn[b]++; g_psc_lastver[b] = g_psc_ver;
     return g_psc_last[b];
 }
 /* Per-stage projection mode: 0 = none, 3 = xy/z, 4 = xy/w.
  * D3DTSS_TEXTURETRANSFORMFLAGS | D3DTTFF_PROJECTED. */
 static float    g_cur_proj[4];
-static unsigned g_cur_smp[4] = {0,0,0,0};
+static unsigned g_cur_smp[16];
 /* The game's D3DSAMP_* state.  There used to be ONE global sampler
  * (linear/linear/mip-linear, no anisotropy).  The game actually asks for
  * MINFILTER=ANISOTROPIC + MAXANISOTROPY=16; with isotropic trilinear the
  * derivative estimate jumps at triangle EDGES, a mip one level too coarse
  * is picked and a 1-pixel line appears along the edges + diagonal of every
  * quad (most visible on lettering).                                     */
-void metal_set_samplers(const unsigned k[4]){
-    for (int i = 0; i < 4; i++) g_cur_smp[i] = k[i];
+void metal_set_samplers(const unsigned k[16]){
+    for (int i = 0; i < 16; i++) g_cur_smp[i] = k[i];
 }
 #if NFS_ENHANCED
-#define MAXPS 2560          /* + reflection variants: ps + PSREFL*(1+stage) */
+#define MAXPS METAL_PS_ENHANCED_CAPACITY
 #else
-#define MAXPS 512
+#define MAXPS METAL_PS_CAPACITY
 #endif
-#define PSCUBE 256          /* cube variant: psid + PSCUBE */
-#define PSREFL 512          /* (HD) reflection separation variant */
+#define PSCUBE METAL_PS_CUBE_OFFSET
+#define PSREFL METAL_PS_REFLECTION_OFFSET
+static unsigned g_ps_model[MAXPS];
+static unsigned g_ps_outputs[MAXPS];
+void metal_set_ps_outputs(int psid,unsigned mask){
+    if(psid>0 && psid<MAXPS)g_ps_outputs[psid]=mask&15u;
+}
+static int g_ps_sampler_type[MAXPS][16];
+void metal_set_ps_model(int psid,unsigned version,const int types[16]){
+    if(psid<=0 || psid>=MAXPS)return;
+    g_ps_model[psid]=version;
+    memcpy(g_ps_sampler_type[psid],types,sizeof g_ps_sampler_type[psid]);
+}
 static id<MTLFunction> g_psfn[MAXPS];      /* ps compiled from the translation */
+static id<MTLFunction> g_psfn_depth[MAXPS];
+static NSString *g_ps_source[MAXPS];
 /* v12na: a version of the same ps WITHOUT the alpha test (discard).  On
  * Apple TBDR GPUs a shader containing discard turns off hidden surface
  * removal (HSR); draws with the alpha test off (alpha_ref <= 0) use this
@@ -626,7 +670,7 @@ static id<MTLTexture> g_ztex[MAXZ];
 static unsigned char  g_zpend[MAXZ];        /* clear on the next pass */
 static float          g_zpend_v[MAXZ];
 static _Atomic unsigned long long g_z_mismatch = 0, g_z_null = 0;
-static _Atomic unsigned char g_zforget[MAXZ];  /* guest re-created it: drop the texture */
+static _Atomic unsigned char g_zforget[MAXZ];  /* 1: drop image, 2: new texture alias */
 /* Released at a device Reset: D3D9 has the game release every depth surface
  * it created before Reset, and the game creates new ones (new ids) after it.
  * A dead id's texture used to stay until com.c's id counter wrapped round to
@@ -636,8 +680,21 @@ static _Atomic unsigned char g_zforget[MAXZ];  /* guest re-created it: drop the 
 static _Atomic unsigned char g_zdead[MAXZ];
 static _Atomic long g_zsweep_at = 0;
 static unsigned long g_z_swept = 0;
+static pthread_mutex_t g_zlock=PTHREAD_MUTEX_INITIALIZER;
+static void z_publish_texture(unsigned zid,id<MTLTexture> texture){
+    pthread_mutex_lock(&g_zlock);
+    g_ztex[zid]=texture;
+    atomic_store(&g_zdead[zid],0);
+    atomic_store(&g_zforget[zid],2);
+    pthread_mutex_unlock(&g_zlock);
+}
 void metal_z_forget(unsigned zid){
-    if (zid < MAXZ){ atomic_store(&g_zdead[zid], 0); atomic_store(&g_zforget[zid], 1); } }
+    if (zid < MAXZ){
+        pthread_mutex_lock(&g_zlock);
+        atomic_store(&g_zdead[zid], 0); atomic_store(&g_zforget[zid], 1);
+        pthread_mutex_unlock(&g_zlock);
+    }
+}
 static id<MTLDepthStencilState> g_dss[64];
 static float    g_cur_aref   = 0.f;
 /* D3DRS_FOGENABLE(28) + D3DRS_FOGCOLOR(34).  Fog was NEVER applied: the
@@ -664,6 +721,33 @@ static _Atomic long    g_frames_replaced = 0;   /* mailbox (framerate.c hfr_mail
  * draws into the same buffer the frame would be cut short or new draws
  * would be drawn with old vertex data. */
 static int g_enc_rb = -1;
+typedef struct {
+    id<MTLTexture> texture;
+    id<MTLBuffer> staging;
+    NSUInteger stride,row_bytes,height;
+    int done,success;
+} MReadback;
+static MReadback *g_readback[2];
+static unsigned char g_chunk_final[2]={1,1},g_chunk_keep[2];
+static int g_record_split;
+static int g_encoding_partial;
+static int metal_submit(int final,MReadback *request);
+static void readback_cancel_pending(void){
+    pthread_mutex_lock(&g_qlock);
+    for(unsigned b=0;b<2;b++)if(g_readback[b]){
+        g_readback[b]->done=1;g_readback[b]->success=0;g_readback[b]=NULL;
+    }
+    pthread_cond_broadcast(&g_qcond);
+    pthread_mutex_unlock(&g_qlock);
+}
+#include "metal_query.inc"
+static void frame_retry_drawable(void){
+    /* nextDrawable can temporarily fail. Keep the queued frame selectable
+     * instead of stranding queries after the main loop consumed its signal. */
+    pthread_mutex_lock(&g_qlock);
+    if(g_ready>=0)atomic_store(&g_frame_pending,1);
+    pthread_mutex_unlock(&g_qlock);
+}
 static _Atomic unsigned long g_cb_err = 0;         /* frame that ended with a GPU error */
 static _Atomic unsigned long g_enc_late = 0;       /* encoding still running when 60 ms ran out */
 static long g_enc_late_f[8];                       /* frame numbers of the first few */
@@ -890,7 +974,31 @@ static id<MTLSamplerState>        g_samp;
 static uint8_t g_tex_cube[MAXTEX];          /* 1 = MTLTextureTypeCube */
 static unsigned g_tex_lvlmask[MAXTEX];
 static id<MTLTexture> g_tex[MAXTEX];
+static unsigned char g_tex_zid[MAXTEX];     /* INTZ texture and depth surface share one image */
 static unsigned       g_texn = 1;            /* 0 = "no texture" (white) */
+static struct {
+    id<CAMetalDrawable> drawable;
+    unsigned char touched[MAXTEX+1];
+    int active,screen_touched,hd_post,scene_open,gb_first,refl_drawn;
+    unsigned scene_zid;
+    uint64_t gpu_ns,encode_ns;
+    unsigned draws,verts,resource_count;
+    unsigned char resources[(MAXTEX+7)/8];
+} g_logical_frame;
+static int readback_fail_queued(void){
+    pthread_mutex_lock(&g_qlock);
+    int b=g_ready;MReadback *request=b<0?NULL:g_readback[b];
+    if(request){g_readback[b]=NULL;g_enc_rb=b;}
+    pthread_mutex_unlock(&g_qlock);
+    if(!request)return 0;
+    MQSubmission *queries=mq_capture(b);mq_complete(queries,NULL,0);
+    g_logical_frame.active=0;g_logical_frame.drawable=nil;
+    pthread_mutex_lock(&g_qlock);
+    g_ready=g_enc_rb=-1;request->success=0;request->done=1;
+    pthread_cond_broadcast(&g_qcond);
+    pthread_mutex_unlock(&g_qlock);
+    return 1;
+}
 /* --- releasing render targets at Reset -----------------------------------
  * In D3D9 the game must release ALL D3DPOOL_DEFAULT resources (render
  * targets included) before Reset, otherwise Reset fails.  We never released
@@ -915,7 +1023,7 @@ static void freed_use(unsigned id_, int as_tgt){
                 as_tgt ? "TARGET" : "texture", id_, g_freed_w[id_], g_freed_h[id_],
                 g_tex_cube[id_] ? " (cube)" : ""); }
 }
-static id<MTLTexture> g_white;
+static id<MTLTexture> g_white, g_white_cube, g_white_volume;
 
 /* --- texture lifetime (v12na, long sessions) ------------------------------
  * Textures used to live for the whole session: ids were never reused and
@@ -940,6 +1048,7 @@ static unsigned tex_new_id(void){
     else if (g_texn < MAXTEX) id_ = g_texn++;
     if (!id_) return 0;
     g_tex_cube[id_] = 0; g_tex_lvlmask[id_] = 0; g_tex_isrt[id_] = 0; g_tex_freed[id_] = 0;
+    g_tex_zid[id_] = 0;
     hd_tex_forget(id_);
     return id_;
 }
@@ -954,6 +1063,13 @@ void metal_free_texture(unsigned id_){
     g_tfq[(g_tfq_h + g_tfq_n) % TFQ].at = g_gframe;
     g_tfq_n++;
 }
+static void tex_depth_forget(unsigned id_){
+    pthread_mutex_lock(&g_zlock);
+    unsigned zid=g_tex_zid[id_];
+    if(zid && g_ztex[zid]==g_tex[id_])g_ztex[zid]=nil;
+    g_tex_zid[id_]=0;
+    pthread_mutex_unlock(&g_zlock);
+}
 static void tex_free_due(int now){
     while (g_tfq_n){
         unsigned i = g_tfq_h;
@@ -961,6 +1077,7 @@ static void tex_free_due(int now){
         unsigned id_ = g_tfq[i].id;
         g_tfq_h = (g_tfq_h + 1) % TFQ; g_tfq_n--;
         if (g_tex[id_]){ g_freed_w[id_] = (unsigned short)g_tex[id_].width; g_freed_h[id_] = (unsigned short)g_tex[id_].height; }
+        tex_depth_forget(id_);
         g_tex[id_] = nil; g_tex_isrt[id_] = 0; g_tex_freed[id_] = 1; g_tex_released++;   /* freed_use() reports late users */
         g_tfree[g_ntfree++] = id_;
     }
@@ -972,7 +1089,7 @@ static MTLPixelFormat d3dfmt_to_mtl(unsigned f, unsigned *blk, unsigned *bpb){
     switch (f){
     case 21: case 22: *blk=1; *bpb=4; return MTLPixelFormatBGRA8Unorm;   /* A8R8G8B8 */
     case 28: *blk=1; *bpb=1; return MTLPixelFormatA8Unorm;               /* A8 */
-    case 41: *blk=1; *bpb=1; return MTLPixelFormatR8Unorm;               /* L8 */
+    case 50: *blk=1; *bpb=1; return MTLPixelFormatR8Unorm;               /* L8 */
     case 0x31545844: *blk=4; *bpb=8;  return MTLPixelFormatBC1_RGBA;     /* DXT1 */
     case 0x33545844: *blk=4; *bpb=16; return MTLPixelFormatBC2_RGBA;     /* DXT3 */
     case 0x35545844: *blk=4; *bpb=16; return MTLPixelFormatBC3_RGBA;     /* DXT5 */
@@ -1034,6 +1151,33 @@ unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
     atomic_fetch_add(&g_tex_created, 1); if (g_perflog) perflog_event(PL_TEX, 0, 0);
     return id_;
 }
+unsigned metal_create_depth_texture(unsigned w,unsigned h,unsigned zid){
+    if(!g_dev || !g_queue || !w || !h || w>8192 || h>8192 || zid<2 || zid>=MAXZ ||
+       (g_texn>=MAXTEX && !g_ntfree))return 0;
+    MTLTextureDescriptor *td=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+        MTLPixelFormatDepth32Float width:w height:h mipmapped:NO];
+    td.storageMode=MTLStorageModePrivate;
+    td.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;
+    id<MTLTexture> texture=[g_dev newTextureWithDescriptor:td];
+    if(!texture)return 0;
+    /* Initialize before publication, including sampling before the first depth bind. */
+    id<MTLCommandBuffer> cb=[g_queue commandBuffer];
+    if(!cb)return 0;
+    MTLRenderPassDescriptor *rp=[MTLRenderPassDescriptor renderPassDescriptor];
+    rp.depthAttachment.texture=texture;
+    rp.depthAttachment.loadAction=MTLLoadActionClear;
+    rp.depthAttachment.storeAction=MTLStoreActionStore;
+    rp.depthAttachment.clearDepth=1.;
+    id<MTLRenderCommandEncoder> enc=[cb renderCommandEncoderWithDescriptor:rp];
+    if(!enc)return 0;
+    [enc endEncoding];[cb commit];
+    unsigned id_=tex_new_id();
+    if(!id_)return 0;
+    g_tex[id_]=texture;g_tex_zid[id_]=(unsigned char)zid;g_tex_isrt[id_]=1;
+    z_publish_texture(zid,texture);
+    atomic_fetch_add(&g_tex_created,1);if(g_perflog)perflog_event(PL_TEX,0,0);
+    return id_;
+}
 /* [status] mtl=/tex=: Metal heap usage and live texture count (heap.c). */
 void metal_mem_stats(uint64_t *alloc_bytes, unsigned *live_tex, unsigned *tex_slots, uint64_t *tex_bytes){
     *alloc_bytes = g_dev ? (uint64_t)g_dev.currentAllocatedSize : 0;
@@ -1050,14 +1194,19 @@ void metal_mem_stats(uint64_t *alloc_bytes, unsigned *live_tex, unsigned *tex_sl
 }
 /* Guest (Reset): the render targets created so far are dead. */
 void metal_reset_rts(void){
+    pthread_mutex_lock(&g_qlock);
+    g_cur_target=0; memset(g_cur_mrt,0,sizeof g_cur_mrt); g_cur_mrt_write=0xfffu;
+    pthread_mutex_unlock(&g_qlock);
     if (ENVC("NORTFREE")) return;        /* diagnostic: turn releasing off */
     /* the created depth surfaces (ids 2..; 1 is the implicit one): D3D9 has
      * the game release every one before Reset, and com.c only recycles their
      * ids (a Release does not drop the Metal depth texture), so their
      * textures go here in both lifetime modes; a create after the Reset
      * clears its id again (metal_z_forget) */
+    pthread_mutex_lock(&g_zlock);
     for (unsigned zid = 2; zid < MAXZ; zid++) atomic_store(&g_zdead[zid], 1);
     atomic_store(&g_zsweep_at, atomic_load(&g_frames_drawn) + 3);
+    pthread_mutex_unlock(&g_zlock);
     { int com_frees(void); if (com_frees()) return; }   /* v12na: Release frees them (metal_free_texture) */
     atomic_store(&g_rtfree_upto, g_texn);
     atomic_store(&g_rtfree_at, atomic_load(&g_frames_drawn) + 3);
@@ -1071,6 +1220,7 @@ static void rt_free_pending(void){
     for (unsigned i = g_rtfree_done; i < upto && i < MAXTEX; i++)
         if (g_tex_isrt[i] && g_tex[i]){
             g_freed_w[i] = (unsigned short)g_tex[i].width; g_freed_h[i] = (unsigned short)g_tex[i].height;
+            tex_depth_forget(i);
             g_tex[i] = nil; g_tex_isrt[i] = 0; g_tex_freed[i] = 1; g_rt_freed++; }
     g_rtfree_done = upto;
 }
@@ -1111,6 +1261,8 @@ void metal_hd_mark_road(unsigned id_, unsigned ow, unsigned oh){ (void)id_; (voi
  * keeps a multisampled TWIN (contents are not shared; see the g_hd_zshare
  * counter). */
 static int g_hd_msn = -1;
+static _Atomic unsigned g_ws_screen_samples = 1;
+unsigned metal_widescreen_samples(unsigned target){return target?1:atomic_load(&g_ws_screen_samples);}
 static id<MTLTexture> g_hd_mscol, g_hd_msdepth_scratch;
 static id<MTLTexture> g_hd_msz[64];
 /* --- MEMORYLESS MSAA ATTACHMENTS -------------------------------------------
@@ -1156,10 +1308,21 @@ static uint8_t g_hd_zpend_ms[64];             /* the twin's pending Clear(Z) */
 static float   g_hd_zpend_msv[64];
 static _Atomic unsigned long long g_hd_mspass, g_hd_msblit, g_hd_zshare, g_hd_zrev, g_hd_zres;
 static uint8_t g_hd_zsdirty[64];              /* Z written to the single-sample twin off screen */
+static void z_prepare(unsigned zid){
+    pthread_mutex_lock(&g_zlock);
+    unsigned forget=atomic_exchange(&g_zforget[zid],0);
+    if(!forget){pthread_mutex_unlock(&g_zlock);return;}
+    if(forget==1)g_ztex[zid]=nil;
+    g_zpend[zid]=0;
+    g_hd_msz[zid]=nil;g_hd_msz_seen[zid]=g_hd_msz_kept[zid]=0;
+    g_hd_zpend_ms[zid]=g_hd_zms_used[zid]=g_hd_zsdirty[zid]=0;
+    pthread_mutex_unlock(&g_zlock);
+}
 /* main thread: drop the textures of depth surfaces released at a Reset (see g_zdead) */
 static void z_sweep_dead(void){
+    pthread_mutex_lock(&g_zlock);
     long at = atomic_load(&g_zsweep_at);
-    if (!at || atomic_load(&g_frames_drawn) < at) return;
+    if (!at || atomic_load(&g_frames_drawn) < at){pthread_mutex_unlock(&g_zlock);return;}
     atomic_store(&g_zsweep_at, 0);
     for (unsigned zid = 2; zid < MAXZ; zid++){
         if (!atomic_exchange(&g_zdead[zid], 0)) continue;
@@ -1167,6 +1330,7 @@ static void z_sweep_dead(void){
         g_ztex[zid] = nil;
         if (zid < 64u){ g_hd_msz[zid] = nil; g_hd_msz_seen[zid] = 0; g_hd_msz_kept[zid] = 0; }
     }
+    pthread_mutex_unlock(&g_zlock);
 }
 static int hd_msaa_n(void){
     if (g_hd_msn < 0){
@@ -1174,7 +1338,7 @@ static int hd_msaa_n(void){
         if (n != 2 && n != 4 && n != 8) n = 1;
         /* 8x is not supported on every Apple GPU (M4 Pro: 1, 2, 4): 4x, not off */
         while (n > 1 && g_dev && ![g_dev supportsTextureSampleCount:(NSUInteger)n]) n >>= 1;
-        g_hd_msn = n;
+        g_hd_msn = n;atomic_store(&g_ws_screen_samples,n);
         if (n > 1 || NFS_ENHANCED)
             fprintf(stderr, "[HD] MSAA: %s\n", n > 1 ? (n == 8 ? "8x" : n == 4 ? "4x" : "2x") : "OFF");
     }
@@ -1199,7 +1363,7 @@ static void hd_msaa_frame(NSUInteger w, NSUInteger h){
     if (!aut || hd_msaa_n() <= 1 || !hd_mslazy()) return;
     int want = (h >= 1400u) ? 2 : 4;
     if (want == g_hd_msn || ![g_dev supportsTextureSampleCount:(NSUInteger)want]) return;
-    g_hd_msn = want;
+    g_hd_msn = want;atomic_store(&g_ws_screen_samples,want);
     fprintf(stderr, "[HD] MSAA: %dx (drawable %lux%lu; 2x at 1400 rows and above)\n",
             want, (unsigned long)w, (unsigned long)h);
 }
@@ -2669,17 +2833,18 @@ static int hd_mslazy(void){
  * at close).  Returns: bit0 color must be resolved, bit1 a screen copy reads
  * it (G must be resolved too). */
 static unsigned hd_ms_predict(int rb, unsigned i){
+    if(g_encoding_partial)return 3u;
     unsigned n = g_dn[rb], zid = DEPTH_ZID(g_dbuf[rb][i].depth), j = i + 1;
     if (!hd_mslazy()) return 3u;
     for (; j < n; j++){ const MDraw *x = &g_dbuf[rb][j];                 /* end of the pass */
-        if (x->is_blit || x->target || DEPTH_ZID(x->depth) != zid) break;
-        if (x->is_clear && (x->clr_flags & 2u) && zid) break; }
+        if (x->is_blit || x->target || color_has_mrt(x) || DEPTH_ZID(x->depth) != zid) break;
+        if (x->is_clear && ((x->clr_flags & 1u) || ((x->clr_flags & 2u) && zid))) break; }
     for (; j < n; j++){ const MDraw *x = &g_dbuf[rb][j];
         if (x->is_blit){
             if (!x->blit_src) return 3u;                                  /* the screen is read */
             if (!x->target) return 1u;                                    /* copy to the screen: be careful */
             continue; }
-        if (!x->target) return 0u;                                        /* another multisampled screen pass */
+        if (!x->target) return color_has_mrt(x)?1u:0u;                     /* MRT reads the resolved screen */
     }
     return 1u;                                                            /* end of frame: present */
 }
@@ -2690,16 +2855,17 @@ static unsigned hd_ms_predict(int rb, unsigned i){
  * detection is the same as hd_ms_predict; the encode loop closes the pass at
  * the same places too. */
 static int hd_ms_memless_ok(int rb, unsigned i){
+    if(g_encoding_partial)return 0;
     unsigned n = g_dn[rb], zid = DEPTH_ZID(g_dbuf[rb][i].depth), j = i + 1;
     for (; j < n; j++){ const MDraw *x = &g_dbuf[rb][j];                 /* end of the pass */
-        if (x->is_blit || x->target || DEPTH_ZID(x->depth) != zid) break;
-        if (x->is_clear && (x->clr_flags & 2u) && zid) break; }
+        if (x->is_blit || x->target || color_has_mrt(x) || DEPTH_ZID(x->depth) != zid) break;
+        if (x->is_clear && ((x->clr_flags & 1u) || ((x->clr_flags & 2u) && zid))) break; }
     for (; j < n; j++){ const MDraw *x = &g_dbuf[rb][j];
         if (x->is_blit){
             if (!x->blit_src) return 1;                                   /* the screen is read: single-sample after that */
             if (!x->target) return 0;                                     /* copy to the screen: stored to MS color */
             continue; }
-        if (!x->target) return 0;                                         /* another screen pass: it loads */
+        if (!x->target) return color_has_mrt(x)?1:0;                        /* MRT loads the resolved color */
     }
     return 1;                                                             /* end of frame: resolve only */
 }
@@ -2715,13 +2881,24 @@ static int hd_mszstore_all(void){              /* HD_MSZSTORE=1: MS depth always
 static _Atomic unsigned long long g_hd_msfb;
 static int hd_ms_end(id<MTLRenderCommandEncoder> enc, int rb, unsigned k, int c_ms, int c_gb, unsigned att){
     if (!c_ms || !hd_mslazy()){ g_hd_msp.on = 0; return 0; }
+    if(g_encoding_partial){
+        [enc setColorStoreAction:MTLStoreActionStoreAndMultisampleResolve atIndex:0];
+#if NFS_ENHANCED
+        if(c_gb)for(unsigned i=0;i<HD_NG;i++)[enc setColorStoreAction:MTLStoreActionStoreAndMultisampleResolve atIndex:1+i];
+#endif
+        if(g_hd_msp.on && g_hd_msp.dz){
+            [enc setDepthStoreAction:g_hd_msp.res?MTLStoreActionStoreAndMultisampleResolve:MTLStoreActionStore];
+            if(g_hd_msp.zid<64)g_hd_msz_kept[g_hd_msp.zid]=1;
+        }
+        g_hd_msp.on=0;return 0;
+    }
     unsigned n = g_dn[rb], k0 = k; int store = 0, res = 0, reader = 0, pend = 0;
     for (; k < n; k++){ const MDraw *x = &g_dbuf[rb][k];
         if (x->is_blit){
             if (!x->blit_src){ res = 1; reader = 1; break; }
             if (!x->target){ res = 1; store = 1; break; }
             continue; }
-        if (!x->target){ store = 1; break; }
+        if (!x->target){ if(color_has_mrt(x))res=1;else store=1; break; }
     }
     if (k >= n) res = 1;
     if (g_hd_msp.on && g_hd_msp.ml){
@@ -2758,6 +2935,7 @@ static int hd_ms_end(id<MTLRenderCommandEncoder> enc, int rb, unsigned k, int c_
     if (g_hd_msp.on && g_hd_msp.dz){
         unsigned zid = g_hd_msp.zid; int sd = -1;
         for (unsigned q = k0; q < n && sd < 0; q++){ const MDraw *x = &g_dbuf[rb][q];
+            if(!x->target && color_has_mrt(x))break;
             if (x->is_blit){ if (!x->blit_src) break; continue; }        /* screen was read: single-sampled after this */
             if (DEPTH_ZID(x->depth) != zid) continue;
             if (x->is_clear && (x->clr_flags & 2u)) sd = 0;               /* cleared before reuse */
@@ -2981,6 +3159,17 @@ static int pass_merge_on(void){
     if (v < 0){ const char *e = ENVC("PASSMERGE"); v = (e && *e == '0') ? 0 : 1; }
     return v;
 }
+static uint64_t draw_depth_textures(const MDraw *draw){
+    if(draw->is_clear || draw->ps<=0 || draw->ps>=MAXPS)return 0;
+    uint64_t mask=0;
+    unsigned stages=g_ps_model[draw->ps]>=0x0200?16:4;
+    for(unsigned stage=0;stage<stages;stage++){
+        if(stages==16 && !g_ps_sampler_type[draw->ps][stage])continue;
+        unsigned texture=draw->stage_tex[stage];
+        if(texture && texture<MAXTEX && g_tex_zid[texture])mask|=1ull<<g_tex_zid[texture];
+    }
+    return mask;
+}
 /* ---- DEFER THE PASS THAT SPLITS THE SCENE ------------------------------
  * Measured (PASSPROF content dump, race frame): the main scene is 674 draws
  * in one screen pass; then an off-screen pass of 23 draws (light flares:
@@ -2997,8 +3186,9 @@ static int pass_merge_on(void){
 static _Atomic unsigned long long g_hd_reord;
 static void pass_reorder(int rb){
     static int on = -1; if (on < 0){ const char *e = ENVC("HD_REORDER"); on = (e && *e == '0') ? 0 : 1; }
-    if (!on || !pass_merge_on()) return;
+    if (!on || !pass_merge_on() || g_mqframe[rb].count) return;
     unsigned n = g_dn[rb]; MDraw *D = g_dbuf[rb];
+    for(unsigned i=0;i<n;i++)if(color_has_mrt(&D[i]))return;
     static MDraw tmp[64];
     for (unsigned a = 1; a + 1 < n; a++){
         const MDraw *p = &D[a - 1];
@@ -3013,7 +3203,10 @@ static void pass_reorder(int rb){
         for (c = b; c < n && c - b < 64u; c++){ const MDraw *x = &D[c];
             if (x->target || x->is_blit || x->is_clear) break;
             if (DEPTH_ZID(x->depth) != zs || (x->depth & 2u) ||
-                x->tex == tid || x->tex1 == tid || x->tex2 == tid || x->tex3 == tid){ ok = 0; break; } }
+                x->tex == tid || x->tex1 == tid || x->tex2 == tid || x->tex3 == tid){ ok = 0; break; }
+            for(unsigned stage=0;stage<16;stage++)if(x->stage_tex[stage]==tid){ok=0;break;}
+            if(!ok)break;
+        }
         if (!ok || c == b) continue;
         if (c < n && !D[c].target && !D[c].is_blit && !D[c].is_clear) continue;   /* S exceeded 64: no gain */
         unsigned ns = c - b, nr = b - a;
@@ -3030,6 +3223,7 @@ static void pass_reorder(int rb){
 static int pass_clear_only(int rb, unsigned i){
     unsigned n = g_dn[rb], j = i;
     const MDraw *d0 = &g_dbuf[rb][i];
+    for(unsigned k=i;k<n;k++)if(color_has_mrt(&g_dbuf[rb][k]))return 0;
     if (!hd_mslazy()) return 0;
     if (!pass_merge_on() || d0->target || !d0->is_clear || d0->is_blit) return 0;
     while (j < n && g_dbuf[rb][j].is_clear && !g_dbuf[rb][j].target && !g_dbuf[rb][j].is_blit) j++;
@@ -3074,6 +3268,45 @@ unsigned metal_create_texture_cube(unsigned edge, unsigned levels,
     atomic_fetch_add(&g_tex_created, 1); if (g_perflog) perflog_event(PL_TEX, 0, 0);
     return id_;
 }
+unsigned metal_create_texture_volume(unsigned w,unsigned h,unsigned d,unsigned levels,unsigned format){
+    if(!g_dev || !w || !h || !d || w>2048 || h>2048 || d>2048)return 0;
+    unsigned block,bpb;MTLPixelFormat pf=d3dfmt_to_mtl(format,&block,&bpb);
+    /* Metal does not support BC compressed 3D textures. */
+    if(pf==MTLPixelFormatInvalid || block!=1)return 0;
+    unsigned maximum=1,extent=w;if(h>extent)extent=h;if(d>extent)extent=d;
+    while(extent>1){maximum++;extent>>=1;}
+    if(!levels)levels=maximum;
+    if(levels>maximum)return 0;
+    MTLTextureDescriptor *td=[MTLTextureDescriptor new];
+    td.textureType=MTLTextureType3D;td.pixelFormat=pf;td.width=w;td.height=h;td.depth=d;
+    td.mipmapLevelCount=levels;td.usage=MTLTextureUsageShaderRead;td.storageMode=MTLStorageModeShared;
+    if(format==50)td.swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleRed,MTLTextureSwizzleRed,MTLTextureSwizzleOne);
+    if(format==22)td.swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed,MTLTextureSwizzleGreen,MTLTextureSwizzleBlue,MTLTextureSwizzleOne);
+    id<MTLTexture> texture=[g_dev newTextureWithDescriptor:td];if(!texture)return 0;
+    unsigned handle=tex_new_id();if(!handle)return 0;
+    g_tex[handle]=texture;
+    for(unsigned level=0;level<levels;level++){
+        unsigned lw=w>>level,lh=h>>level,ld=d>>level;if(!lw)lw=1;if(!lh)lh=1;if(!ld)ld=1;
+        size_t row=(size_t)lw*bpb,slice=row*lh;
+        void *zero=calloc(ld,slice);if(!zero){g_tex[handle]=nil;metal_free_texture(handle);return 0;}
+        [texture replaceRegion:MTLRegionMake3D(0,0,0,lw,lh,ld) mipmapLevel:level slice:0 withBytes:zero bytesPerRow:row bytesPerImage:slice];
+        free(zero);
+    }
+    atomic_fetch_add(&g_tex_created,1);return handle;
+}
+int metal_upload_texture_volume(unsigned handle,unsigned level,const void *data,unsigned pitch,unsigned slice_pitch){
+    if(!handle || handle>=MAXTEX || !data)return 0;
+    id<MTLTexture> texture=g_tex[handle];
+    if(!texture || texture.textureType!=MTLTextureType3D || level>=texture.mipmapLevelCount)return 0;
+    unsigned w=(unsigned)texture.width>>level,h=(unsigned)texture.height>>level,d=(unsigned)texture.depth>>level;
+    if(!w)w=1;if(!h)h=1;if(!d)d=1;
+    unsigned bpb=texture.pixelFormat==MTLPixelFormatBGRA8Unorm?4:1;
+    if(pitch<(size_t)w*bpb || slice_pitch<(size_t)pitch*h)return 0;
+    [texture replaceRegion:MTLRegionMake3D(0,0,0,w,h,d) mipmapLevel:level slice:0 withBytes:data bytesPerRow:pitch bytesPerImage:slice_pitch];
+    if(level<16)g_tex_lvlmask[handle]|=1u<<level;
+    atomic_fetch_add(&g_tex_uploaded,1);return 1;
+}
+
 int metal_tex_is_cube(unsigned id_){
     return (id_ && id_ < MAXTEX) ? g_tex_cube[id_] : 0;
 }
@@ -3149,11 +3382,11 @@ unsigned metal_level_rows(unsigned h, unsigned level, unsigned d3dfmt){
 static NSString *kPrelude = @
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
-"struct VOut { float4 pos [[position]]; float4 col0; float4 col1;\n"
-"              float4 uv0; float4 uv1; float4 uv2; float4 uv3;\n"
+"struct VOut { float4 pos [[position]]; float4 col0; float4 col1; float4 col2; float4 col3; float4 col4; float4 col5;\n"
+"              float4 uv0; float4 uv1; float4 uv2; float4 uv3; float4 uv4; float4 uv5; float4 uv6; float4 uv7;\n"
 "              float fog; };\n"
 "struct PSPar { float aref; float usec; float pad0; float pad1;\n"
-"               float4 proj; float4 c[32]; float4 fog; };\n"
+"               float4 proj; float4 c[224]; float4 fog; int4 b[4]; };\n"
 #if NFS_ENHANCED
 /* HD: color + G-buffer (c1..c3 = G0..G2; contents: see G-BUFFER PACKING) */
 "struct PSOut { float4 c0 [[color(0)]]; float4 c1 [[color(1)]]; float4 c2 [[color(2)]];\n"
@@ -3171,26 +3404,30 @@ static NSString *kShaderSrc = @
 "struct VIn  { float4 pos [[attribute(0)]]; float4 col0 [[attribute(1)]];\n"
 "              float4 col1 [[attribute(2)]];\n"
 "              float4 uv0 [[attribute(3)]]; float4 uv1 [[attribute(4)]];\n"
-"              float4 uv2 [[attribute(5)]]; float4 uv3 [[attribute(6)]]; };\n"
-"struct VOut { float4 pos [[position]]; float4 col0; float4 col1;\n"
-"              float4 uv0; float4 uv1; float4 uv2; float4 uv3;\n"
+"              float4 uv2 [[attribute(5)]]; float4 uv3 [[attribute(6)]];\n"
+"              float4 uv4 [[attribute(7)]]; float4 uv5 [[attribute(8)]]; float4 uv6 [[attribute(9)]]; float4 uv7 [[attribute(10)]];\n"
+"              float4 col2 [[attribute(11)]]; float4 col3 [[attribute(12)]]; float4 col4 [[attribute(13)]]; float4 col5 [[attribute(14)]]; };\n"
+"struct VOut { float4 pos [[position]]; float4 col0; float4 col1; float4 col2; float4 col3; float4 col4; float4 col5;\n"
+"              float4 uv0; float4 uv1; float4 uv2; float4 uv3; float4 uv4; float4 uv5; float4 uv6; float4 uv7;\n"
 "              float fog; };\n"
 "struct PSPar { float aref; float usec; float pad0; float pad1;\n"
-"               float4 proj; float4 c[32]; float4 fog; };\n"
+"               float4 proj; float4 c[224]; float4 fog; int4 b[4]; };\n"
 "vertex VOut vmain(VIn v [[stage_in]]) {\n"
 "  VOut o;\n"
 "  o.pos = v.pos; o.col0 = v.col0; o.col1 = v.col1;\n"
 "  o.uv0 = v.uv0; o.uv1 = v.uv1; o.uv2 = v.uv2; o.uv3 = v.uv3;\n"
-"  o.fog = 1.0;\n"
+"  o.uv4=v.uv4; o.uv5=v.uv5; o.uv6=v.uv6; o.uv7=v.uv7;\n"
+"  o.col2=v.col2; o.col3=v.col3; o.col4=v.col4; o.col5=v.col5; o.fog=1.0;\n"
 "  return o;\n"
 "}\n"
 "fragment float4 fmain(VOut i [[stage_in]], texture2d<float> t [[texture(0)]],\n"
 "                      texture2d<float> t1 [[texture(1)]],\n"
 "                      texture2d<float> t2 [[texture(2)]],\n"
 "                      texture2d<float> t3 [[texture(3)]],\n"
-"                      sampler sm [[sampler(0)]],\n"
+"                      sampler sm [[sampler(0)]], sampler sm1 [[sampler(1)]],\n"
 "                      constant PSPar &P [[buffer(0)]]) {\n"
 "  float4 c = i.col0 * t.sample(sm, i.uv0.xy);\n"
+"  if (P.pad0 == 1.0) c.rgb *= t1.sample(sm1, i.uv1.xy).rgb;\n"
 "  if (c.a < P.aref) discard_fragment();\n"
 "  c.rgb = mix(P.fog.rgb, c.rgb, mix(1.0, saturate(i.fog), P.fog.a));\n"
 "  return c;\n"
@@ -3199,9 +3436,10 @@ static NSString *kShaderSrc = @
 "                      texture2d<float> t1 [[texture(1)]],\n"
 "                      texture2d<float> t2 [[texture(2)]],\n"
 "                      texture2d<float> t3 [[texture(3)]],\n"
-"                      sampler sm [[sampler(0)]],\n"
+"                      sampler sm [[sampler(0)]], sampler sm1 [[sampler(1)]],\n"
 "                      constant PSPar &P [[buffer(0)]]) {\n"
 "  float4 c = i.col0 * t.sample(sm, i.uv0.xy);\n"
+"  if (P.pad0 == 1.0) c.rgb *= t1.sample(sm1, i.uv1.xy).rgb;\n"
 "  c.rgb = mix(P.fog.rgb, c.rgb, mix(1.0, saturate(i.fog), P.fog.a));\n"
 "  return c;\n"
 "}\n";
@@ -3231,19 +3469,26 @@ void metal_draw_tv(const TVert *src, unsigned nverts, unsigned prim, unsigned te
          * draw with a stale texture (the screen turned into a mosaic
          * over time).  Zero the whole record before filling it. */
         memset(&g_dbuf[b][g_dn[b]], 0, sizeof g_dbuf[b][g_dn[b]]);
+        g_dbuf[b][g_dn[b]].query_mask = mq_snapshot(b);
         g_dbuf[b][g_dn[b]].first  = g_vn[b];
         g_dbuf[b][g_dn[b]].count  = tris*3;
         g_dbuf[b][g_dn[b]].tex    = tex;
         g_dbuf[b][g_dn[b]].target = g_cur_target;
+        memcpy(g_dbuf[b][g_dn[b]].mrt,g_cur_mrt,sizeof g_cur_mrt);
+        g_dbuf[b][g_dn[b]].mrt_write=g_cur_mrt_write;
         g_dbuf[b][g_dn[b]].is_clear = 0;
         g_dbuf[b][g_dn[b]].blend = g_cur_blend;
         g_dbuf[b][g_dn[b]].bcol  = g_cur_bcol;
         g_dbuf[b][g_dn[b]].cull  = g_cur_cull;
         g_dbuf[b][g_dn[b]].depth = g_cur_depth;
+        g_dbuf[b][g_dn[b]].depth_bias=g_cur_depth_bias;g_dbuf[b][g_dn[b]].slope_bias=g_cur_slope_bias;
+        g_dbuf[b][g_dn[b]].fixed_function=g_cur_fixed_function;
         g_dbuf[b][g_dn[b]].tex1 = g_cur_tex1;
         g_dbuf[b][g_dn[b]].tex2 = g_cur_tex2;
         g_dbuf[b][g_dn[b]].tex3 = g_cur_tex3;
-        g_dbuf[b][g_dn[b]].ps   = (g_cur_ps > 0 && g_cur_ps < PSCUBE &&
+        memcpy(g_dbuf[b][g_dn[b]].stage_tex,g_cur_stage_tex,sizeof g_cur_stage_tex);
+        g_dbuf[b][g_dn[b]].stage_tex[0]=tex;
+        g_dbuf[b][g_dn[b]].ps   = (g_cur_ps > 0 && g_cur_ps < PSCUBE && g_ps_model[g_cur_ps]<0x0300 &&
                                    metal_tex_is_cube(tex))
                                     ? g_cur_ps + PSCUBE : g_cur_ps;
 #if NFS_ENHANCED
@@ -3261,7 +3506,7 @@ void metal_draw_tv(const TVert *src, unsigned nverts, unsigned prim, unsigned te
         memcpy(g_dbuf[b][g_dn[b]].smp, g_cur_smp, sizeof g_cur_smp);
         g_dn[b]++;
         g_vn[b] += tris*3;
-    }
+    }else mq_fail_active();
     pthread_mutex_unlock(&g_qlock);
 }
 
@@ -3480,7 +3725,7 @@ unsigned long g_smp_overflow = 0;
 static id<MTLSamplerState> samp_for(unsigned k){
     for (int i = 0; i < g_smpc_n; i++) if (g_smpc[i].key == k) return g_smpc[i].st;
     unsigned mn=k&3u, mg=(k>>2)&3u, mp=(k>>4)&3u;
-    unsigned au=(k>>6)&7u, av=(k>>9)&7u, al=(k>>12)&7u;
+    unsigned au=(k>>6)&7u, av=(k>>9)&7u, al=(k>>12)&7u, aw=(k>>18)&7u;
     MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
     /* D3DTEXF: 1=POINT 2=LINEAR 3=ANISOTROPIC */
     sd.minFilter = (mn==1u) ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
@@ -3520,6 +3765,7 @@ static id<MTLSamplerState> samp_for(unsigned k){
         MTLSamplerAddressModeMirrorClampToEdge };
     sd.sAddressMode = am[au < 6u ? au : 1u];
     sd.tAddressMode = am[av < 6u ? av : 1u];
+    sd.rAddressMode = am[aw < 6u ? aw : 1u];
     id<MTLSamplerState> st = [g_dev newSamplerStateWithDescriptor:sd];
     if (!st) return g_samp;
     if (g_smpc_n < MAXSMP){ g_smpc[g_smpc_n].key = k; g_smpc[g_smpc_n].st = st; g_smpc_n++; }
@@ -3596,7 +3842,16 @@ void metal_resize(unsigned w, unsigned h){
     if (!w || !h || w > 8192u || h > 8192u) return;
     dispatch_async(dispatch_get_main_queue(), ^{ win_apply_size(w, h); });
 }
+void metal_set_fixed_function(unsigned mode){g_cur_fixed_function=mode;}
+void metal_set_stage_textures(const unsigned textures[16]){
+    memcpy(g_cur_stage_tex,textures,sizeof g_cur_stage_tex);
+    g_cur_tex1=textures[1];g_cur_tex2=textures[2];g_cur_tex3=textures[3];
+}
+void metal_set_ps_bool(const int booleans[16]){
+    if(memcmp(g_cur_psbool,booleans,sizeof g_cur_psbool)){memcpy(g_cur_psbool,booleans,sizeof g_cur_psbool);g_psc_ver++;}
+}
 void metal_set_stage_tex(unsigned t1, unsigned t2, unsigned t3){
+    g_cur_stage_tex[1]=t1;g_cur_stage_tex[2]=t2;g_cur_stage_tex[3]=t3;
     g_cur_tex1 = t1; g_cur_tex2 = t2; g_cur_tex3 = t3;
 }
 /* The guest's active pixel shader and its constants. */
@@ -3682,13 +3937,17 @@ static MDraw *raw_rec(int b, unsigned stride, unsigned tex, int vsid,
     }
     MDraw *D = &g_dbuf[b][g_dn[b]];
     memset(D, 0, sizeof *D);          /* reused slot: see metal_draw_tv */
+    D->query_mask=mq_snapshot(b);
     D->tex = tex; D->target = g_cur_target;
+    memcpy(D->mrt,g_cur_mrt,sizeof g_cur_mrt); D->mrt_write=g_cur_mrt_write;
     memcpy(D->smp, g_cur_smp, sizeof D->smp);
     D->blend = g_cur_blend; D->depth = g_cur_depth; D->alpha_ref = g_cur_aref;
+    D->depth_bias=g_cur_depth_bias;D->slope_bias=g_cur_slope_bias;D->fixed_function=g_cur_fixed_function;
     D->bcol  = g_cur_bcol; D->cull = g_cur_cull;
     memcpy(D->fogv, g_cur_fog, sizeof D->fogv);
     D->tex1 = g_cur_tex1; D->tex2 = g_cur_tex2; D->tex3 = g_cur_tex3;
-    D->ps = (g_cur_ps > 0 && g_cur_ps < PSCUBE && metal_tex_is_cube(tex))
+    memcpy(D->stage_tex,g_cur_stage_tex,sizeof D->stage_tex);D->stage_tex[0]=tex;
+    D->ps = (g_cur_ps > 0 && g_cur_ps < PSCUBE && g_ps_model[g_cur_ps]<0x0300 && metal_tex_is_cube(tex))
               ? g_cur_ps + PSCUBE : g_cur_ps;
 #if NFS_ENHANCED
     { unsigned tx4[4] = { tex, g_cur_tex1, g_cur_tex2, g_cur_tex3 };
@@ -3711,10 +3970,10 @@ int metal_draw_raw(const void *src, unsigned nverts, unsigned stride,
     pthread_mutex_lock(&g_qlock);
     int b = g_cur;
     unsigned roff = (g_rvn[b] + 255u) & ~255u;
-    if (roff + need > MAXRV){ g_ov_rv++; pthread_mutex_unlock(&g_qlock); return 0; }
-    if (g_dn[b] >= MAXD){ pthread_mutex_unlock(&g_qlock); return 0; }
+    if (roff + need > MAXRV){ mq_fail_active();g_ov_rv++; pthread_mutex_unlock(&g_qlock); return 0; }
+    if (g_dn[b] >= MAXD){ mq_fail_active();pthread_mutex_unlock(&g_qlock); return 0; }
     MDraw *D = raw_rec(b, stride, tex, vsid, kdata, nk);
-    if (!D){ pthread_mutex_unlock(&g_qlock); return 0; }
+    if (!D){ mq_fail_active();pthread_mutex_unlock(&g_qlock); return 0; }
 
     uint8_t *dst = g_rvbuf[b] + roff;
     /* TRIANGLE LIST: the source is already contiguous, one block copy is
@@ -3752,9 +4011,9 @@ int metal_draw_ix(unsigned vbo, unsigned stride, unsigned ibo, unsigned isz, uns
     if (!g_pool || nidx < 3 || !stride || stride > 256u || (isz != 2u && isz != 4u)) return 0;
     pthread_mutex_lock(&g_qlock);
     int b = g_cur;
-    if (g_dn[b] >= MAXD){ pthread_mutex_unlock(&g_qlock); return 0; }
+    if (g_dn[b] >= MAXD){ mq_fail_active();pthread_mutex_unlock(&g_qlock); return 0; }
     MDraw *D = raw_rec(b, stride, tex, vsid, kdata, nk);
-    if (!D){ pthread_mutex_unlock(&g_qlock); return 0; }
+    if (!D){ mq_fail_active();pthread_mutex_unlock(&g_qlock); return 0; }
     D->count = nidx - nidx % 3u; D->rawoff = vbo;
     D->ix_isz = isz; D->ix_ib = ibo; D->ix_base = base; D->gh = gh ? gh : 1ull;
     g_dn[b]++;
@@ -3835,6 +4094,7 @@ void metal_register_ps(int psid, const char *msl){
         }
         char nm[32]; snprintf(nm, sizeof nm, "ps_%d", psid);
         g_psfn[psid] = [lib newFunctionWithName:[NSString stringWithUTF8String:nm]];
+        g_ps_source[psid]=[NSString stringWithUTF8String:msl];
         if (!g_psfn[psid]) fprintf(stderr, "ps%d: function not found\n", psid);
         g_psfn_nd[psid] = g_psfn[psid];
         { const char *at = "if (res.a < P.aref) discard_fragment();";
@@ -3854,6 +4114,54 @@ void metal_register_ps(int psid, const char *msl){
               } } }
     }
     free(iso);
+}
+
+/* Preserve the shader body, including discard, inside a depth-writing entry.
+ * Only constant-biased draws use it, so normal draws keep early depth tests. */
+id<MTLFunction> metal_depth_fragment(int psid){
+    if(psid<0 || psid>=MAXPS || !g_psfn[psid])psid=0;
+    if(g_psfn_depth[psid])return g_psfn_depth[psid];
+    NSString *source=g_ps_source[psid];
+    NSString *name=psid?[NSString stringWithFormat:@"ps_%d",psid]:@"fmain";
+    if(!source){
+        NSRange start=[kShaderSrc rangeOfString:@"fragment float4 fmain("],end=[kShaderSrc rangeOfString:@"fragment float4 fmain_nd("];
+        source=[kShaderSrc substringWithRange:NSMakeRange(start.location,end.location-start.location)];
+    }
+    NSRange entry=[source rangeOfString:@"fragment "];
+    if(entry.location==NSNotFound)return nil;
+    NSRange body=[source rangeOfString:@") {" options:0 range:NSMakeRange(entry.location,source.length-entry.location)];
+    if(body.location==NSNotFound)return nil;
+    NSUInteger brace=body.location+2;
+    NSString *declaration=[source substringWithRange:NSMakeRange(entry.location,brace-entry.location)];
+    NSString *returnType=[[declaration substringFromIndex:9] componentsSeparatedByString:@" "][0];
+    BOOL multiple=![returnType isEqualToString:@"float4"];
+    unsigned outputMask=[returnType isEqualToString:@"PSOut"]?15u:(g_ps_outputs[psid]?g_ps_outputs[psid]:1u);
+    NSRegularExpression *attributes=[NSRegularExpression regularExpressionWithPattern:@"\\[\\[[^]]*\\]\\]" options:0 error:nil];
+    NSString *helper=[attributes stringByReplacingMatchesInString:declaration options:0 range:NSMakeRange(0,declaration.length) withTemplate:@""];
+    helper=[helper stringByReplacingOccurrencesOfString:@"fragment " withString:@"inline "];
+    helper=[helper stringByReplacingOccurrencesOfString:[name stringByAppendingString:@"("] withString:@"depth_shade("];
+    NSRegularExpression *parameters=[NSRegularExpression regularExpressionWithPattern:@"([A-Za-z_][A-Za-z_0-9]*)\\s*\\[\\[" options:0 error:nil];
+    NSMutableArray<NSString*> *arguments=[NSMutableArray new];
+    for(NSTextCheckingResult *match in [parameters matchesInString:declaration options:0 range:NSMakeRange(0,declaration.length)])
+        [arguments addObject:[declaration substringWithRange:[match rangeAtIndex:1]]];
+    NSString *wrapper=[declaration stringByReplacingOccurrencesOfString:[NSString stringWithFormat:@"fragment %@ ",returnType] withString:@"fragment D3DDepthResult "];
+    wrapper=[wrapper stringByReplacingOccurrencesOfString:[name stringByAppendingString:@"("] withString:[[name stringByAppendingString:@"_depth"] stringByAppendingString:@"("]];
+    wrapper=[[wrapper substringToIndex:[wrapper rangeOfString:@")" options:NSBackwardsSearch].location] stringByAppendingString:@", constant float &depth_offset [[buffer(1)]]) {\n"];
+    NSMutableString *result=[NSMutableString stringWithString:@"struct D3DDepthResult { "];
+    NSMutableArray<NSString*> *colors=[NSMutableArray new];
+    if(multiple){for(unsigned n=0;n<4;n++)if(outputMask&(1u<<n)){
+        [result appendFormat:@"float4 c%u [[color(%u)]]; ",n,n];
+        [colors addObject:[NSString stringWithFormat:@"color.c%u",n]];
+    }}else{[result appendString:@"float4 color [[color(0)]]; "];[colors addObject:@"color"];}
+    [result appendString:@"float depth [[depth(any)]]; };\n"];
+    NSMutableString *translated=[[source substringToIndex:entry.location] mutableCopy];
+    [translated appendString:result];[translated appendString:helper];[translated appendString:[source substringFromIndex:brace]];
+    [translated appendString:wrapper];
+    [translated appendFormat:@"  %@ color=depth_shade(%@);\n  return { %@, clamp(i.pos.z+depth_offset,0.0f,1.0f) };\n}\n",returnType,[arguments componentsJoinedByString:@","],[colors componentsJoinedByString:@","]];
+    NSError *error=nil;
+    id<MTLLibrary> library=[g_dev newLibraryWithSource:[kPrelude stringByAppendingString:translated] options:nil error:&error];
+    if(!library){fprintf(stderr,"depth-bias shader %d did not compile: %s\n",psid,error.localizedDescription.UTF8String);return nil;}
+    g_psfn_depth[psid]=[library newFunctionWithName:[name stringByAppendingString:@"_depth"]];return g_psfn_depth[psid];
 }
 
 /* D3DCMPFUNC (1..8) -> Metal compare function */
@@ -3880,10 +4188,41 @@ static id<MTLDepthStencilState> dss_for(unsigned mode){
     return g_dss[k];
 }
 /* Guest: the following draws go to this target (0 = screen). */
-void metal_set_render_target(unsigned texid){
+void metal_set_render_target_at(unsigned slot,unsigned texid){
+    if(slot>=4)return;
     pthread_mutex_lock(&g_qlock);
-    g_cur_target = texid;
+    if(slot)g_cur_mrt[slot-1]=texid; else g_cur_target = texid;
     pthread_mutex_unlock(&g_qlock);
+}
+void metal_set_render_target(unsigned texid){metal_set_render_target_at(0,texid);}
+
+static unsigned color_target_at(const MDraw *d,unsigned slot){return slot?d->mrt[slot-1]:d->target;}
+static void color_pass_attachments(MTLRenderPassDescriptor *pass,const MDraw *d,
+                                  id<MTLTexture> screen,const unsigned char *touched,int screen_touched){
+    for(unsigned slot=0;slot<4;slot++){
+        unsigned target=color_target_at(d,slot),tid=TGT_ID(target),face=TGT_FACE(target);
+        if(slot && !target)continue;
+        id<MTLTexture> texture=target?(tid<MAXTEX?g_tex[tid]:nil):screen;
+        if(!texture)continue;
+        unsigned bit=tid*8u+face;
+        int first=target?!(touched[bit>>3]&(1u<<(bit&7))):!screen_touched;
+        int clear=d->is_clear && (d->clr_flags&1u);
+        MTLRenderPassColorAttachmentDescriptor *a=pass.colorAttachments[slot];
+        a.texture=texture; if(face)a.slice=face-1u;
+        a.loadAction=(clear||first)?MTLLoadActionClear:MTLLoadActionLoad;
+        a.storeAction=MTLStoreActionStore;
+        a.clearColor=clear?MTLClearColorMake(((d->clear_argb>>16)&255)/255.,((d->clear_argb>>8)&255)/255.,
+                                           (d->clear_argb&255)/255.,(d->clear_argb>>24)/255.):
+                          MTLClearColorMake(atomic_load(&g_clear_r),atomic_load(&g_clear_g),atomic_load(&g_clear_b),1.);
+    }
+}
+static void color_pass_mark_touched(const MDraw *d,unsigned char *touched,int *screen_touched){
+    for(unsigned slot=0;slot<4;slot++){
+        unsigned target=color_target_at(d,slot),tid=TGT_ID(target);
+        if(!target){if(!slot)*screen_touched=1;continue;}
+        if(tid>=MAXTEX || !g_tex[tid])continue;
+        unsigned bit=tid*8u+TGT_FACE(target); touched[bit>>3]|=1u<<(bit&7);
+    }
 }
 /* Guest: clear the active target (applied at the right place in draw order). */
 /* StretchRect: the game copies the scene FROM THE BACK BUFFER into a
@@ -3892,6 +4231,8 @@ void metal_set_render_target(unsigned texid){
  * -> the source texture stayed empty and the composite came out black.
  * We put the copy into the draw list as an ORDERED entry; at present time
  * it runs as a full-screen quad (scaling and format conversion for free). */
+#include "metal_ws_postfx.inc"
+
 void metal_blit(unsigned src_tex, unsigned dst_tex){
     pthread_mutex_lock(&g_qlock);
     int b = g_cur;
@@ -3908,7 +4249,32 @@ void metal_blit(unsigned src_tex, unsigned dst_tex){
  * lockable render target back for the game (the DVD and magazine covers);
  * here the whole source is copied and the lock buffer keeps what it has. */
 void metal_blit_rect(unsigned src_tex, unsigned dst_tex, const int *r){ (void)r; metal_blit(src_tex, dst_tex); }
-int metal_read_texture(unsigned id, void *dst, unsigned pitch, unsigned rows){ (void)id; (void)dst; (void)pitch; (void)rows; return 0; }
+int metal_read_texture(unsigned texid,void *dst,unsigned pitch,unsigned rows){
+    if(!g_layer || !g_vbuf[0] || !g_queue || !dst || texid>=MAXTEX || atomic_load(&g_should_quit))return 0;
+    id<MTLTexture> texture=g_tex[texid];
+    if(!texture || texture.textureType!=MTLTextureType2D || texture.sampleCount!=1)return 0;
+    unsigned bytes;
+    switch(texture.pixelFormat){
+        case MTLPixelFormatBGRA8Unorm:case MTLPixelFormatRGBA8Unorm:bytes=4;break;
+        case MTLPixelFormatR8Unorm:case MTLPixelFormatA8Unorm:bytes=1;break;
+        default:return 0;
+    }
+    NSUInteger row_bytes=texture.width*bytes,stride=(row_bytes+255u)&~(NSUInteger)255u;
+    if(pitch<row_bytes || rows<texture.height || !stride || texture.height>NSUIntegerMax/stride)return 0;
+    MReadback request={.texture=texture,.stride=stride,.row_bytes=row_bytes,.height=texture.height};
+    request.staging=[g_dev newBufferWithLength:stride*texture.height options:MTLResourceStorageModeShared];
+    if(!request.staging || !metal_submit(0,&request))return 0;
+    void guest_wait_begin(void);void guest_wait_end(void);
+    guest_wait_begin();
+    pthread_mutex_lock(&g_qlock);
+    while(!request.done)pthread_cond_wait(&g_qcond,&g_qlock);
+    int success=request.success;
+    pthread_mutex_unlock(&g_qlock);
+    guest_wait_end();
+    if(success)for(NSUInteger y=0;y<request.height;y++)
+        memcpy((uint8_t*)dst+y*pitch,(const uint8_t*)request.staging.contents+y*stride,row_bytes);
+    return success;
+}
 
 void metal_clear_target_ex(unsigned argb, unsigned flags, float z);
 void metal_clear_target(unsigned argb){ metal_clear_target_ex(argb, 1u, 1.f); }
@@ -3919,6 +4285,8 @@ void metal_clear_target_ex(unsigned argb, unsigned flags, float z){
         memset(&g_dbuf[b][g_dn[b]], 0, sizeof g_dbuf[b][g_dn[b]]);
         g_dbuf[b][g_dn[b]].first = 0; g_dbuf[b][g_dn[b]].count = 0;
         g_dbuf[b][g_dn[b]].tex = 0;   g_dbuf[b][g_dn[b]].target = g_cur_target;
+        memcpy(g_dbuf[b][g_dn[b]].mrt,g_cur_mrt,sizeof g_cur_mrt);
+        g_dbuf[b][g_dn[b]].mrt_write=g_cur_mrt_write;
         { static unsigned ov = 0xFFFFFFFFu;      /* CLEARCOL=0xAARRGGBB: diagnostic */
           if (ov == 0xFFFFFFFFu){ const char *e=ENVC("CLEARCOL");
                                   ov = e ? (unsigned)strtoul(e,0,0) : 0u; }
@@ -3933,8 +4301,8 @@ void metal_clear_target_ex(unsigned argb, unsigned flags, float z){
     pthread_mutex_unlock(&g_qlock);
 }
 
-void metal_present(void){
-    if (!g_layer || !g_vbuf[0]){ tex_free_due(1); return; }   /* headless: nothing draws */
+static int metal_submit(int final,MReadback *request){
+    if (!g_layer || !g_vbuf[0]){ tex_free_due(1); return 0; }   /* headless: nothing draws */
     /* Mailbox (NFSU2_FPS=uncapped, or a content rate above the display's,
      * framerate.c): a newer frame replaces one the main thread has not
      * started to encode; only a frame being encoded is waited for (its
@@ -3946,6 +4314,9 @@ void metal_present(void){
      * meanwhile, so the guest lock is released around it. */
     int unlocked = 0;
     pthread_mutex_lock(&g_qlock);
+    int critical=!final || g_record_split || (g_ready>=0 && g_chunk_keep[g_ready]);
+    if(critical)mailbox=0;
+    if(mq_frame_pending(g_ready))mailbox=0;
     if (g_ready >= 0 && (!mailbox || g_enc_rb >= 0)){
         void guest_wait_begin(void);
         pthread_mutex_unlock(&g_qlock);
@@ -3965,14 +4336,15 @@ void metal_present(void){
         if (ts.tv_nsec >= 1000000000L){ ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
         int late = 0;
         while (g_ready >= 0){
+            if(atomic_load(&g_should_quit))break;
             /* Time is up but the main thread is still ENCODING the previous
              * frame: do not give up, wait.  The swap would point g_cur at the
              * buffer it is reading (see g_enc_rb).  The signal comes as soon
              * as encoding ends. */
-            if (late && g_enc_rb >= 0){ pthread_cond_wait(&g_qcond, &g_qlock); continue; }
+            if (late && (g_enc_rb >= 0 || critical || mq_frame_pending(g_ready))){ pthread_cond_wait(&g_qcond, &g_qlock); continue; }
             if (mailbox && g_enc_rb < 0) break;     /* encoding done: replace the pending frame */
             if (pthread_cond_timedwait(&g_qcond, &g_qlock, &ts) != 0){
-                if (g_enc_rb >= 0){
+                if (g_enc_rb >= 0 || critical || mq_frame_pending(g_ready)){
                     if (!late){ late = 1;
                         unsigned long n = atomic_fetch_add(&g_enc_late, 1ul);
                         if (n < 8) g_enc_late_f[n] = atomic_load(&g_frames_drawn) + 1; }
@@ -3987,10 +4359,18 @@ void metal_present(void){
             (unsigned long long)(_w1.tv_sec-_w0.tv_sec)*1000000000ull
             + (unsigned long long)_w1.tv_nsec - (unsigned long long)_w0.tv_nsec); }
     }
+    if(atomic_load(&g_should_quit)){
+        pthread_mutex_unlock(&g_qlock);
+        if(unlocked){void guest_wait_end(void);guest_wait_end();}
+        return 0;
+    }
     g_pool_fr[g_cur] = g_pool;       /* this frame's indexed draws are in this pool */
-    g_gframe++;
+    g_chunk_final[g_cur]=final!=0;g_chunk_keep[g_cur]=!final || g_record_split;
+    g_readback[g_cur]=request;
+    if(final){g_gframe++;g_record_split=0;}else g_record_split=1;
     g_ready = g_cur;                 /* the main thread draws this buffer */
     g_cur ^= 1;                      /* the guest keeps writing to the other one */
+    ws_postfx_release_frame(g_cur);
     g_vn[g_cur] = 0; g_dn[g_cur] = 0;
     g_rvn[g_cur] = 0; g_kn[g_cur] = 0; g_pscn[g_cur] = 0;
 #if NFS_ENHANCED
@@ -4001,7 +4381,9 @@ void metal_present(void){
     pthread_mutex_unlock(&g_qlock);
     if (unlocked){ void guest_wait_end(void); guest_wait_end(); }
     tex_free_due(0);                 /* with the guest lock held again (g_tfree) */
+    return 1;
 }
+void metal_present(void){(void)metal_submit(1,NULL);}
 
 long metal_frames_dropped(void){ return atomic_load(&g_frames_dropped); }
 unsigned long long metal_wait_present_ns(void){ return atomic_load(&g_wait_present_ns); }
@@ -4140,6 +4522,7 @@ void metal_early_init(void){
             vd.attributes[5].offset = 80; vd.attributes[5].bufferIndex = 0;
             vd.attributes[6].format = MTLVertexFormatFloat4;   /* oT3 */
             vd.attributes[6].offset = 96; vd.attributes[6].bufferIndex = 0;
+            for(int q=7;q<15;q++){vd.attributes[q].format=MTLVertexFormatFloat4;vd.attributes[q].offset=112+(q-7)*16;vd.attributes[q].bufferIndex=0;}
             vd.layouts[0].stride = sizeof(MVert);
             vd.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
             g_vdesc = vd;
@@ -4211,7 +4594,7 @@ void metal_early_init(void){
  * D3D9's fixed-function blend settings are baked into the pipeline in
  * Metal, so every distinct combination needs its own pipeline.          */
 #define MAXPSO 2048         /* + MSAA (and in the research build G-buffer) bits */
-static struct { uint64_t key; id<MTLRenderPipelineState> pso; } g_psocache[MAXPSO];
+static struct { uint64_t key; MTLPixelFormat colors[4]; id<MTLRenderPipelineState> pso; } g_psocache[MAXPSO];
 static unsigned g_pson = 0;
 
 static MTLBlendFactor d3d_blend(unsigned f, int is_alpha){
@@ -4250,14 +4633,39 @@ static MTLBlendOperation d3d_blendop(unsigned op){
     }
 }
 
-static id<MTLRenderPipelineState> pso_for(uint64_t key){
-    for (unsigned i = 0; i < g_pson; i++)
-        if (g_psocache[i].key == key) return g_psocache[i].pso;
-    if (!g_lib || g_pson >= MAXPSO) return g_pso;
+static void pixel_aux_constants(const MDraw *draw,int blur,float *p0,float *p1){
+    *p0=draw->ps?0.f:(float)draw->fixed_function;*p1=0.f;
+#if NFS_ENHANCED
+    /* Fixed-function pad0 selects stages; mip parameters belong to PS bytecode. */
+    if(blur && draw->ps){
+        id<MTLTexture> source=g_tex[draw->tex];
+        float sx=g_hd_ow[draw->tex]?(float)source.width/g_hd_ow[draw->tex]:1.f;
+        float sy=g_hd_oh[draw->tex]?(float)source.height/g_hd_oh[draw->tex]:1.f;
+        float scale=fmaxf(sx,sy);
+        if(scale>1.f){float level=enh_blur()*log2f(scale);*p0=exp2f(level)/scale;*p1=level;}
+        atomic_fetch_add(&g_hd_blurdraw,1ull);
+    }
+#else
+    (void)blur;
+#endif
+}
 
-    /* key: blend(0..19) | ps<<20 | vs<<32 | (HD) msaa<<48 | G<<49 | log2(samples)<<50 | no-discard<<52 */
-    int psid = (int)((key >> 20) & 0xFFFu);
-    int vsid = (int)((key >> 32) & 0xFFFu);
+_Static_assert(METAL_PS_ENHANCED_CAPACITY<=1u<<14,"pixel shader namespace exceeds pipeline key");
+_Static_assert(MAXVSF<=1u<<10,"vertex shader namespace exceeds pipeline key");
+static uint64_t metal_shader_key(unsigned ps,unsigned vs){
+    return ((uint64_t)(ps&0x3fffu)<<20)|((uint64_t)(vs&0x3ffu)<<34);
+}
+static id<MTLRenderPipelineState> pso_for_colors(uint64_t key,const MTLPixelFormat colors[4]){
+    for (unsigned i = 0; i < g_pson; i++)
+        if (g_psocache[i].key == key && !memcmp(g_psocache[i].colors,colors,sizeof g_psocache[i].colors)) return g_psocache[i].pso;
+    int psid = (int)((key >> 20) & 0x3FFFu);
+    int secondary=colors[1]!=MTLPixelFormatInvalid || colors[2]!=MTLPixelFormatInvalid || colors[3]!=MTLPixelFormatInvalid;
+    int fallback=!secondary && colors[0]==MTLPixelFormatBGRA8Unorm && !((key>>53)&1u) &&
+                 !(psid>0 && psid<MAXPS && (g_ps_outputs[psid]&~1u));
+    if (!g_lib || g_pson >= MAXPSO) return fallback?g_pso:nil;
+
+    /* blend(0..19), PS(20..33), VS(34..43), color masks and pass flags(44..61). */
+    int vsid = (int)((key >> 34) & 0x3FFu);
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
     /* A GPU vertex shader reads its own vertex data from the buffer:
      * NO vertexDescriptor is given (otherwise Metal expects stage_in). */
@@ -4265,30 +4673,31 @@ static id<MTLRenderPipelineState> pso_for(uint64_t key){
                           ? g_vsfn[vsid]
                           : [g_lib newFunctionWithName:@"vmain"];
     int nd = (int)((key >> 52) & 1u);          /* alpha test off: the variant without discard */
-    pd.fragmentFunction = (psid > 0 && psid < MAXPS && g_psfn[psid])
+    pd.fragmentFunction = ((key>>53)&1u) ? metal_depth_fragment(psid) : (psid > 0 && psid < MAXPS && g_psfn[psid])
                           ? ((nd && g_psfn_nd[psid]) ? g_psfn_nd[psid] : g_psfn[psid])
                           : [g_lib newFunctionWithName:(nd ? @"fmain_nd" : @"fmain")];
+    if(!pd.fragmentFunction)return nil;
     pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
     pd.vertexDescriptor = (vsid > 0 && vsid < MAXVSF && g_vsfn[vsid]) ? nil : g_vdesc;
-    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
     unsigned en   = key & 1u;
     unsigned sf   = (key >> 1) & 31u;
     unsigned df   = (key >> 6) & 31u;
     unsigned op   = (key >> 11) & 7u;
-    unsigned mask = (key >> 14) & 15u;
-    pd.colorAttachments[0].blendingEnabled = en ? YES : NO;
-    pd.colorAttachments[0].sourceRGBBlendFactor        = d3d_blend(sf, 0);
-    pd.colorAttachments[0].destinationRGBBlendFactor   = d3d_blend(df, 0);
-    pd.colorAttachments[0].sourceAlphaBlendFactor      = d3d_blend(sf, 1);
-    pd.colorAttachments[0].destinationAlphaBlendFactor = d3d_blend(df, 1);
-    pd.colorAttachments[0].rgbBlendOperation   = d3d_blendop(op);
-    pd.colorAttachments[0].alphaBlendOperation = d3d_blendop(op);
-    MTLColorWriteMask cw = 0;
-    if (mask & 1) cw |= MTLColorWriteMaskRed;
-    if (mask & 2) cw |= MTLColorWriteMaskGreen;
-    if (mask & 4) cw |= MTLColorWriteMaskBlue;
-    if (mask & 8) cw |= MTLColorWriteMaskAlpha;
-    pd.colorAttachments[0].writeMask = cw;
+    const unsigned shifts[4]={14,44,54,58};
+    for(unsigned slot=0;slot<4;slot++){
+        if(colors[slot]==MTLPixelFormatInvalid)continue;
+        MTLRenderPipelineColorAttachmentDescriptor *a=pd.colorAttachments[slot];
+        a.pixelFormat=colors[slot];
+        a.blendingEnabled=en?YES:NO;
+        a.sourceRGBBlendFactor=d3d_blend(sf,0); a.destinationRGBBlendFactor=d3d_blend(df,0);
+        a.sourceAlphaBlendFactor=d3d_blend(sf,1); a.destinationAlphaBlendFactor=d3d_blend(df,1);
+        a.rgbBlendOperation=d3d_blendop(op); a.alphaBlendOperation=d3d_blendop(op);
+        unsigned mask=(key>>shifts[slot])&15u;
+        MTLColorWriteMask cw=0;
+        if(mask&1)cw|=MTLColorWriteMaskRed; if(mask&2)cw|=MTLColorWriteMaskGreen;
+        if(mask&4)cw|=MTLColorWriteMaskBlue; if(mask&8)cw|=MTLColorWriteMaskAlpha;
+        a.writeMask=cw;
+    }
     if ((key >> 48) & 1u) pd.rasterSampleCount = ((key >> 50) & 3u) ? (NSUInteger)1u << ((key >> 50) & 3u)
                                                                     : (NSUInteger)hd_msaa_n();
 #if NFS_ENHANCED
@@ -4308,11 +4717,22 @@ static id<MTLRenderPipelineState> pso_for(uint64_t key){
     id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e2];
     if (g_perflog){ struct timespec _o1; clock_gettime(CLOCK_MONOTONIC, &_o1);
         perflog_event(PL_PSO, (uint64_t)(_o1.tv_sec - _o0.tv_sec) * 1000000000ull + (uint64_t)_o1.tv_nsec - (uint64_t)_o0.tv_nsec, 0); }
-    if (!ps) return g_pso;
+    if (!ps){
+        if(!fallback){fprintf(stderr,"render pipeline did not compile (ps %d): %s\n",psid,e2.localizedDescription.UTF8String);return nil;}
+        return g_pso;
+    }
     g_psocache[g_pson].key = key;
+    memcpy(g_psocache[g_pson].colors,colors,sizeof g_psocache[g_pson].colors);
     g_psocache[g_pson].pso = ps;
     g_pson++;
     return ps;
+}
+static id<MTLRenderPipelineState> pso_for(uint64_t key){
+    MTLPixelFormat colors[4]={MTLPixelFormatBGRA8Unorm,0,0,0};
+#if NFS_ENHANCED
+    if((key>>49)&1u)for(unsigned i=0;i<HD_NG;i++)colors[1+i]=hd_gfmt(i);
+#endif
+    return pso_for_colors(key,colors);
 }
 
 /* DUMPTEX=<id>: draw the texture onto a full-screen quad and write it as PNG.
@@ -4640,8 +5060,1245 @@ static void power_state_changed(void){
     return NSTerminateCancel; }
 @end
 
-/* Must be called on the main thread. Opens the window and runs the NSApp
- * loop; does not return (until the app quits).                          */
+/* Encode one ordered chunk on the main render thread. */
+static void metal_encode_ready(id<MTLTexture> screen,id<CAMetalDrawable> drawable,
+                               struct timespec _d0,struct timespec _d1){
+                        struct timespec _e0; clock_gettime(CLOCK_MONOTONIC,&_e0);
+                        texrep_main_frame(g_queue);     /* optional texture packs (texrep.m) */
+                        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+                        int encode_failed=0;
+                        pp_begin(atomic_load(&g_frames_drawn) + 1);
+                        int ab_count = 0;
+                        g_ab_mode = ab_frame(atomic_load(&g_frames_drawn) + 1, &ab_count);
+                        int ab_mode = g_ab_mode;
+                        /* Do not overwrite a buffer the GPU may still be reading:
+                         * take a free set for this frame (wait without the lock). */
+                        int fbi = fb_acquire();
+                        pthread_mutex_lock(&g_qlock);
+                        int rb = g_ready;
+                        int final=rb<0 || g_chunk_final[rb];
+                        MReadback *readback=rb<0?NULL:g_readback[rb];
+                        if(rb>=0)g_readback[rb]=NULL;
+                        g_encoding_partial=!final;
+                        g_enc_rb = rb;
+                        /* Release the lock HERE.  It used to be held for the
+                         * whole frame encode (0.4-2 ms) and then for the vertex
+                         * copy as well; metal_draw_raw takes the same lock per
+                         * draw, so the guest thread blocked on every draw in
+                         * that window -- and that overlap is exactly what
+                         * double buffering is for.  Safe: once g_enc_rb is set,
+                         * rb belongs to the main thread only; the guest always
+                         * writes the other one (g_cur) and metal_present does
+                         * not swap while g_enc_rb >= 0 (not even on timeout). */
+                        pthread_mutex_unlock(&g_qlock);
+                        if(!cb){
+                            MQSubmission *lost=mq_capture(rb);mq_complete(lost,NULL,0);fb_release(fbi);
+                            g_logical_frame.active=0;g_logical_frame.drawable=nil;
+                            pthread_mutex_lock(&g_qlock);g_ready=g_enc_rb=-1;
+                            if(readback){readback->success=0;readback->done=1;}
+                            pthread_cond_broadcast(&g_qcond);pthread_mutex_unlock(&g_qlock);
+                            return;
+                        }
+                        if (rb >= 0){
+                            g_fb_vb[fbi]  = fb_fit(g_fb_vb[fbi],  sizeof(MVert)*(NSUInteger)g_vn[rb], sizeof(MVert)*MAXV);
+                            g_fb_rvb[fbi] = fb_fit(g_fb_rvb[fbi], g_rvn[rb], MAXRV);
+                            g_fb_kb[fbi]  = fb_fit(g_fb_kb[fbi],  g_kn[rb],  MAXKB);
+                        }
+                        g_mtlvb = g_fb_vb[fbi]; g_mtlrvb = g_fb_rvb[fbi]; g_mtlkb = g_fb_kb[fbi];
+                        if (rb >= 0){
+                            fb_put(g_mtlvb,  g_vbuf[rb],  sizeof(MVert)*(NSUInteger)g_vn[rb]);
+                            fb_put(g_mtlrvb, g_rvbuf[rb], g_rvn[rb]);
+                            fb_put(g_mtlkb,  g_kbuf[rb],  g_kn[rb]);
+                        }
+
+                        if(!g_logical_frame.active){
+                            memset(g_logical_frame.touched,0,sizeof g_logical_frame.touched);
+                            g_logical_frame.screen_touched=g_logical_frame.hd_post=0;
+                            g_logical_frame.scene_open=g_logical_frame.gb_first=1;
+                            g_logical_frame.refl_drawn=0;g_logical_frame.scene_zid=0;
+                            g_logical_frame.gpu_ns=g_logical_frame.encode_ns=0;
+                            g_logical_frame.draws=g_logical_frame.verts=g_logical_frame.resource_count=0;
+                            memset(g_logical_frame.resources,0,sizeof g_logical_frame.resources);
+                            memset(g_hd_zms_used,0,sizeof g_hd_zms_used);
+                            g_logical_frame.active=1;
+                            hd_msaa_frame(screen.width, screen.height);
+                        }
+                        /* Draws are ordered by target; each change of target
+                         * opens a new render pass. */
+                        id<MTLRenderCommandEncoder> enc = nil;
+                        unsigned cur_t = 0xFFFFFFFFu;
+                        unsigned cur_mrt[3]={~0u,~0u,~0u};
+                        MTLPixelFormat c_colors[4]={0};
+                        unsigned cur_z = 0xFFFFFFFFu;   /* the pass's Z surface */
+                        /* --- encoder state cache ----------------------------
+                         * A frame has ~1350 draws; each one bound 4 samplers,
+                         * the 532-byte constant buffer and 4 textures UNCONDITIONALLY.
+                         * Rebinding what did not change is not free in Metal. */
+                        id<MTLRenderPipelineState> c_pso = nil;
+                        unsigned c_smp[16];for(int q=0;q<16;q++)c_smp[q]=~0u;
+                        unsigned c_tex[16];for(int q=0;q<16;q++)c_tex[q]=~0u;
+                        unsigned c_bcol = ~0u;
+                        unsigned c_cull = ~0u;
+                        unsigned c_depth = ~0u;
+                        float c_bias=NAN,c_slope=NAN;
+                        int c_zon = 0;                  /* the pass has a real Z surface */
+                        int c_ms = 0;                   /* (msaa) the pass is multisampled */
+                        int c_gb = 0;                   /* (HD research) the pass carries the G-buffer */
+                        int hd_post = g_logical_frame.hd_post;
+                        unsigned c_att = 0;             /* (msaa) resolve target bound to the pass: bit0 colour, bit1 G */
+                        (void)hd_post; (void)c_att;
+                        if (rb >= 0) pass_reorder(rb); /* preserve query scopes and pass dependencies */
+                        MQSubmission *queries=mq_capture(rb);
+                        id<MTLBuffer> query_buffer=mq_buffer(queries);
+                        if(rb>=0 && g_dn[rb] && !g_pso)encode_failed=1;
+                        if(queries && queries->draws && !g_pso)queries->failed=1;
+#if NFS_ENHANCED
+                        int hd_scene_open=g_logical_frame.scene_open;
+                        int hd_gb_first=g_logical_frame.gb_first;
+                        int hd_refl_drawn=g_logical_frame.refl_drawn;
+                        unsigned hd_scene_zid=g_logical_frame.scene_zid;
+#endif
+                        struct { float aref, usec, p0, p1; float proj[4]; float c[PSC_N][4]; float fogv[4]; int32_t b[16]; } c_fp;
+                        int c_fp_valid = 0;
+                        unsigned c_psci = ~0u;          /* c_fp's ps-constant pool index */
+                        unsigned char touched[MAXTEX + 1];   /* bit (texture*8 + face) */
+                        memcpy(touched,g_logical_frame.touched,sizeof touched);
+                        int screen_touched=g_logical_frame.screen_touched;
+
+                        long fno_pre = atomic_load(&g_frames_drawn) + 1;
+                        if (g_hsr_ab == 1 && gpuw_in(fno_pre)) g_hsr_cur = (int)(((fno_pre - g_gpuw_a) / 120) & 1);
+                        if (ENVC("FRAMELOG") && rb >= 0 && (fno_pre % 10) == 0)
+                            fprintf(stderr,"  [frame %3ld] draws=%u verts=%u\n",
+                                    fno_pre, g_dn[rb], g_vn[rb]);
+                        long dreq = final?atomic_exchange(&g_dump_req_frame, -1):-1;
+                        g_dump_cur_guest = dreq;
+                        int  dumpnow = final && ((g_dump_n && dump_wanted(fno_pre)) || dreq >= 0);
+                        /* GLYPHDUMP: every quad's screen box + UVs.
+                         * Goal: decode the TEXT the game draws to read its state. */
+                        if (ENVC("GLYPHDUMP") && dumpnow && rb >= 0){
+                            fprintf(stderr,"  [glyph] frame %ld, %u draws\n", fno_pre, g_dn[rb]);
+                            for (unsigned i = 0; i < g_dn[rb]; i++){
+                                MDraw *dr = &g_dbuf[rb][i];
+                                if (dr->count < 3) continue;
+                                MVert *v0 = &g_vbuf[rb][dr->first];
+                                float xmin=1e30f,xmax=-1e30f,ymin=1e30f,ymax=-1e30f;
+                                float umin=1e30f,vmin=1e30f,umax=-1e30f,vmax=-1e30f;
+                                for (unsigned q=0;q<dr->count;q++){
+                                    float w2 = v0[q].w != 0.f ? v0[q].w : 1.f;
+                                    float X=v0[q].x/w2, Y=v0[q].y/w2;
+                                    if(X<xmin)xmin=X; if(X>xmax)xmax=X;
+                                    if(Y<ymin)ymin=Y; if(Y>ymax)ymax=Y;
+                                    if(v0[q].t[0][0]<umin)umin=v0[q].t[0][0];
+                                    if(v0[q].t[0][0]>umax)umax=v0[q].t[0][0];
+                                    if(v0[q].t[0][1]<vmin)vmin=v0[q].t[0][1];
+                                    if(v0[q].t[0][1]>vmax)vmax=v0[q].t[0][1];
+                                }
+                                fprintf(stderr,"    G %u %.5f %.5f %.5f %.5f %.6f %.6f %.6f %.6f %.3f %.3f %.3f\n",
+                                        dr->tex, xmin,xmax,ymin,ymax, umin,umax,vmin,vmax,
+                                        v0[0].r, v0[0].g, v0[0].b);
+                            }
+                        }
+                        if (dumpnow && rb >= 0){
+                            fprintf(stderr,"  [frame %ld] %u draws, %u verts\n",
+                                    fno_pre, g_dn[rb], g_vn[rb]);
+                            { unsigned hist[16]; memset(hist,0,sizeof hist);
+                              unsigned other=0;
+                              for (unsigned q=0;q<g_dn[rb];q++){
+                                  unsigned tg=g_dbuf[rb][q].target;
+                                  if (tg<16) hist[tg]++; else other++; }
+                              fprintf(stderr,"    targets:");
+                              for (unsigned q=0;q<16;q++) if (hist[q])
+                                  fprintf(stderr," %s=%u", q?"":"screen", hist[q]),
+                                  (q? fprintf(stderr,"(tex%u)",q):0);
+                              if (other) fprintf(stderr," other=%u", other);
+                              fprintf(stderr,"\n"); }
+                            for (unsigned i = 0; i < g_dn[rb] && i < 200; i++){
+                                MDraw *dr = &g_dbuf[rb][i];
+                                fprintf(stderr,"    #%u target=%u tex=%u verts=%u blend=%05x ps=%d smp=%04x",
+                                        i, dr->target, dr->tex, dr->count, dr->blend, dr->ps, dr->smp[0]);
+                                if (dr->count >= 3){
+                                    MVert *v0 = &g_vbuf[rb][dr->first];
+                                    /* the quad's bounds + colour: to see why it is not visible */
+                                    float xmin=1e30f,xmax=-1e30f,ymin=1e30f,ymax=-1e30f;
+                                    for (unsigned q=0;q<dr->count;q++){
+                                        float w2 = v0[q].w != 0.f ? v0[q].w : 1.f;
+                                        float X = v0[q].x/w2, Y = v0[q].y/w2;
+                                        if(X<xmin)xmin=X; if(X>xmax)xmax=X;
+                                        if(Y<ymin)ymin=Y; if(Y>ymax)ymax=Y;
+                                    }
+                                    fprintf(stderr,"  x[%.3g..%.3g] y[%.3g..%.3g]"
+                                            " colour=(%.2g %.2g %.2g a=%.2g) uv=(%.3g,%.3g)",
+                                            xmin,xmax,ymin,ymax,
+                                            v0[0].r,v0[0].g,v0[0].b,v0[0].a, v0[0].t[0][0], v0[0].t[0][1]);
+                                }
+                                fprintf(stderr,"\n");
+                            }
+                        }
+                        /* SLIVER=1: find triangles that span the screen but
+                         * have an area close to zero.  The 1-pixel diagonal
+                         * lines on screen come from these; we measure which
+                         * draw call produces them instead of guessing. */
+                        /* DRAWV=<n>: print ALL vertices of draw number n.
+                         * Whether two triangles have a seam on their shared
+                         * edge can only be told from the raw values. */
+                        /* DRAWSUM: group the frame's draws by the key
+                         * (target,texture,ps,blend).  Shows the structure at a
+                         * glance instead of thousands of lines. */
+                        if (rb >= 0 && ENVC("DRAWSUM") && dump_wanted(fno_pre)){
+                            typedef struct { unsigned tg,tx,t1,t2,bl,sm; int ps;
+                                             unsigned nd,nv; float x0,x1,y0,y1; } Grp;
+                            static Grp gp[192]; int gn = 0;
+                            for (unsigned i = 0; i < g_dn[rb]; i++){
+                                MDraw *dr = &g_dbuf[rb][i];
+                                int k = -1;
+                                for (int q=0;q<gn;q++)
+                                    if (gp[q].tg==dr->target && gp[q].tx==dr->tex &&
+                                        gp[q].t1==dr->tex1 && gp[q].t2==dr->tex2 &&
+                                        gp[q].bl==dr->blend && gp[q].ps==dr->ps &&
+                                        gp[q].sm==dr->smp[0]) { k=q; break; }
+                                if (k < 0){ if (gn >= 192) continue; k = gn++;
+                                    gp[k].tg=dr->target; gp[k].tx=dr->tex; gp[k].bl=dr->blend;
+                                    gp[k].t1=dr->tex1; gp[k].t2=dr->tex2;
+                                    gp[k].ps=dr->ps; gp[k].sm=dr->smp[0];
+                                    gp[k].nd=gp[k].nv=0;
+                                    gp[k].x0=gp[k].y0=1e30f; gp[k].x1=gp[k].y1=-1e30f; }
+                                gp[k].nd++; gp[k].nv += dr->count;
+                                if (dr->vsid <= 0 && dr->count >= 3){
+                                    MVert *v0 = &g_vbuf[rb][dr->first];
+                                    for (unsigned q=0;q<dr->count;q++){
+                                        float w2 = v0[q].w != 0.f ? v0[q].w : 1.f;
+                                        float X=v0[q].x/w2, Y=v0[q].y/w2;
+                                        if(X<gp[k].x0)gp[k].x0=X; if(X>gp[k].x1)gp[k].x1=X;
+                                        if(Y<gp[k].y0)gp[k].y0=Y; if(Y>gp[k].y1)gp[k].y1=Y;
+                                    }
+                                }
+                            }
+                            fprintf(stderr,"  [summary] frame %ld: %u draws, %d groups\n",
+                                    fno_pre, g_dn[rb], gn);
+                            for (int pass=0; pass<gn && pass<192; pass++){
+                                int best=-1; unsigned bv=0;
+                                for (int q=0;q<gn;q++) if (gp[q].nv>bv){ bv=gp[q].nv; best=q; }
+                                if (best<0) break;
+                                Grp *g = &gp[best];
+                                { unsigned tw=0,th=0,dw=0,dh=0;
+                                  if (g->tx && g->tx<MAXTEX && g_tex[g->tx]){
+                                      tw=(unsigned)g_tex[g->tx].width; th=(unsigned)g_tex[g->tx].height; }
+                                  if (g->tg && g->tg<MAXTEX && g_tex[g->tg]){
+                                      dw=(unsigned)g_tex[g->tg].width; dh=(unsigned)g_tex[g->tg].height; }
+                                  unsigned aw=0,ah=0;
+                                  if (g->t1 && g->t1<MAXTEX && g_tex[g->t1]){
+                                      aw=(unsigned)g_tex[g->t1].width; ah=(unsigned)g_tex[g->t1].height; }
+                                  fprintf(stderr,"    target=%u(%ux%u) tex=%u(%ux%u) tex1=%u(%ux%u) tex2=%u"
+                                        " ps=%d blend=%05x smp=%04x  %u draws %u verts\n",
+                                        g->tg,dw,dh,g->tx,tw,th,g->t1,aw,ah,g->t2,
+                                        g->ps,g->bl,g->sm,g->nd,g->nv); }
+                                g->nv = 0;
+                            }
+                        }
+                        /* DRAWLIST=1 (with DUMPFRAME): every draw's full state +
+                         * constant hashes; to find the first differing draw of two runs. */
+                        if (rb >= 0 && ENVC("DRAWLIST") && dumpnow){   /* also at script dumps */
+                            for (unsigned di = 0; di < g_dn[rb]; di++){
+                                MDraw *dr = &g_dbuf[rb][di];
+                                uint64_t hp = 1469598103934665603ull, hk = 1469598103934665603ull;
+                                const uint8_t *pp = (const uint8_t *)&g_pscb[rb][dr->psci];
+                                for (size_t q = 0; q < sizeof g_pscb[rb][0]; q++){ hp ^= pp[q]; hp *= 1099511628211ull; }
+                                if (dr->vsid > 0 && g_kbuf[rb]){
+                                    const uint8_t *kp = (const uint8_t *)g_kbuf[rb] + dr->koff;
+                                    for (unsigned q = 0; q < dr->ksz && dr->koff + q < MAXKB; q++){ hk ^= kp[q]; hk *= 1099511628211ull; }
+                                }
+                                fprintf(stderr,"  [dl] %4u t=%x z=%x cull=%u bl=%05x ps=%d vs=%d tx=%u,%u,%u,%u n=%u clr=%u blit=%u psc=%016llx vk=%016llx\n",
+                                        di, dr->target, dr->depth, dr->cull, dr->blend, dr->ps, dr->vsid,
+                                        dr->tex, dr->tex1, dr->tex2, dr->tex3, dr->count, dr->is_clear, dr->is_blit,
+                                        (unsigned long long)hp, (unsigned long long)hk);
+                            }
+                        }
+                        if (rb >= 0 && ENVC("DRAWV") && dump_wanted(fno_pre)){
+                            unsigned di = (unsigned)atoi(ENVC("DRAWV"));
+                            if (di < g_dn[rb]){
+                                MDraw *dr = &g_dbuf[rb][di];
+                                fprintf(stderr,"  [verts] draw#%u vsid=%d verts=%u tex=%u\n",
+                                        di, dr->vsid, dr->count, dr->tex);
+                                if (dr->vsid <= 0){
+                                    MVert *v0 = &g_vbuf[rb][dr->first];
+                                    for (unsigned q = 0; q < dr->count && q < 12; q++)
+                                        fprintf(stderr,"    v%u  pos=(%.9g, %.9g, %.9g, %.9g)"
+                                                "  uv0=(%.9g, %.9g)\n", q,
+                                                v0[q].x, v0[q].y, v0[q].z, v0[q].w,
+                                                v0[q].t[0][0], v0[q].t[0][1]);
+                                }
+                            }
+                        }
+#if NFS_ENHANCED
+                        if (rb >= 0 && ENVC("HD_RTPROBE") && dump_wanted(fno_pre))
+                            hd_rt_probe(rb, screen, fno_pre);
+                        g_hd_dump_now = dump_wanted(fno_pre);
+                        /* CAMLOG=1 (with DUMPFRAME): the frame's camera + the vertex
+                         * constants of the first few draws of world geometry. */
+                        if (rb >= 0 && ENVC("CAMLOG") && dump_wanted(fno_pre)){
+                            fprintf(stderr, "  [camera] frame %ld valid=%d\n", fno_pre, g_hd_cam_ok[rb]);
+                            static const char *mn[3] = { "view", "projection", "product" };
+                            for (int m = 0; m < 3; m++){
+                                fprintf(stderr, "    %s\n", mn[m]);
+                                for (int r = 0; r < 4; r++)
+                                    fprintf(stderr, "      %11.5f %11.5f %11.5f %11.5f\n",
+                                            g_hd_cam[rb][m*16+r*4], g_hd_cam[rb][m*16+r*4+1],
+                                            g_hd_cam[rb][m*16+r*4+2], g_hd_cam[rb][m*16+r*4+3]); }
+                            int shown = 0;
+                            for (unsigned di = 0; di < g_dn[rb] && shown < 4; di++){
+                                MDraw *dr = &g_dbuf[rb][di];
+                                if (dr->target || dr->vsid <= 0 || dr->is_clear || dr->is_blit || dr->count < 30) continue;
+                                const float *k = (const float *)(g_kbuf[rb] + dr->koff + 16);
+                                unsigned nk = (dr->ksz - 16u) / 16u; if (nk > 16) nk = 16;
+                                fprintf(stderr, "    draw#%u ps=%d vs=%d verts=%u constants c0..c%u:\n",
+                                        di, dr->ps, dr->vsid, dr->count, nk ? nk-1 : 0);
+                                for (unsigned q = 0; q < nk; q++)
+                                    fprintf(stderr, "      c%-2u %11.5f %11.5f %11.5f %11.5f\n", q,
+                                            k[q*4], k[q*4+1], k[q*4+2], k[q*4+3]);
+                                shown++;
+                            }
+                        }
+#endif
+                        /* DRAWVPS=<ps>: dump the vertices of ALL draws that use that
+                         * shader, together with all four texture coordinate sets. */
+                        if (rb >= 0 && ENVC("DRAWVPS") && dump_wanted(fno_pre)){
+                            int want = atoi(ENVC("DRAWVPS"));
+                            for (unsigned di = 0; di < g_dn[rb]; di++){
+                                MDraw *dr = &g_dbuf[rb][di];
+                                if (dr->ps != want) continue;
+                                fprintf(stderr,"  [verts-ps] draw#%u ps=%d vsid=%d verts=%u target=%u tex=%u,%u,%u,%u\n",
+                                        di, dr->ps, dr->vsid, dr->count, dr->target,
+                                        dr->tex, dr->tex1, dr->tex2, dr->tex3);
+                                if (dr->vsid > 0) continue;
+                                MVert *v0 = &g_vbuf[rb][dr->first];
+                                for (unsigned q = 0; q < dr->count && q < 6; q++)
+                                    fprintf(stderr,"    v%u pos=(%.5g,%.5g,%.5g,%.5g) t0=(%.6g,%.6g) t1=(%.6g,%.6g)"
+                                            " t2=(%.6g,%.6g) t3=(%.6g,%.6g)\n", q,
+                                            v0[q].x, v0[q].y, v0[q].z, v0[q].w,
+                                            v0[q].t[0][0], v0[q].t[0][1], v0[q].t[1][0], v0[q].t[1][1],
+                                            v0[q].t[2][0], v0[q].t[2][1], v0[q].t[3][0], v0[q].t[3][1]);
+                            }
+                        }
+                        if (rb >= 0 && ENVC("PSHIST") && dump_wanted(fno_pre)){
+                            /* Draw/triangle count per ps within the frame.  The
+                             * DRAWSUM group table fills up at 192 and the LAST
+                             * passes were not listed; this histogram covers all. */
+                            struct { int ps; unsigned nd, nv, bl; } h[128]; int hn = 0;
+                            for (unsigned i = 0; i < g_dn[rb]; i++){
+                                MDraw *dr = &g_dbuf[rb][i];
+                                int k = -1;
+                                for (int q = 0; q < hn; q++) if (h[q].ps == dr->ps){ k = q; break; }
+                                if (k < 0){ if (hn >= 128) continue; k = hn++;
+                                            h[k].ps = dr->ps; h[k].nd = h[k].nv = 0;
+                                            h[k].bl = dr->blend; }
+                                h[k].nd++; h[k].nv += dr->count;
+                            }
+                            fprintf(stderr, "  [pshist] frame %ld: %u draws, %d distinct ps\n",
+                                    fno_pre, g_dn[rb], hn);
+                            for (int q = 0; q < hn; q++)
+                                fprintf(stderr, "     ps=%-4d %5u draws %7u verts  blend=%05x\n",
+                                        h[q].ps, h[q].nd, h[q].nv, h[q].bl);
+                        }
+                        if (rb >= 0 && ENVC("SLIVER") && dump_wanted(fno_pre)){
+                            int nrep = 0;
+                            for (unsigned i = 0; i < g_dn[rb] && nrep < 24; i++){
+                                MDraw *dr = &g_dbuf[rb][i];
+                                if (dr->vsid > 0 || dr->count < 3) continue;
+                                MVert *v0 = &g_vbuf[rb][dr->first];
+                                for (unsigned t = 0; t + 2 < dr->count && nrep < 24; t += 3){
+                                    float X[3], Y[3];
+                                    for (int q = 0; q < 3; q++){
+                                        float w2 = v0[t+q].w != 0.f ? v0[t+q].w : 1.f;
+                                        X[q] = v0[t+q].x / w2; Y[q] = v0[t+q].y / w2;
+                                    }
+                                    float ar = 0.5f * fabsf((X[1]-X[0])*(Y[2]-Y[0]) -
+                                                            (X[2]-X[0])*(Y[1]-Y[0]));
+                                    float sp = 0.f;
+                                    for (int q = 0; q < 3; q++){
+                                        int r2 = (q+1)%3;
+                                        float dx = X[r2]-X[q], dy = Y[r2]-Y[q];
+                                        float L = sqrtf(dx*dx+dy*dy); if (L > sp) sp = L;
+                                    }
+                                    if (sp > 0.5f && ar < 2e-4f){
+                                        nrep++;
+                                        fprintf(stderr,"  [sliver] draw#%u tri%u tex=%u"
+                                                " blend=%05x ps=%d verts=%u  length=%.3f area=%.2e\n"
+                                                "      (%.4f,%.4f) (%.4f,%.4f) (%.4f,%.4f)"
+                                                "  colour=(%.2f %.2f %.2f a=%.2f)\n",
+                                                i, t/3, dr->tex, dr->blend, dr->ps, dr->count,
+                                                sp, ar, X[0],Y[0], X[1],Y[1], X[2],Y[2],
+                                                v0[t].r, v0[t].g, v0[t].b, v0[t].a);
+                                    }
+                                }
+                            }
+                            if (!nrep) fprintf(stderr,"  [sliver] frame %ld: none found\n", fno_pre);
+                        }
+                        if (rb >= 0 && g_pso){
+                            for (unsigned i = 0; i < g_dn[rb]; i++){
+                                MDraw *dr = &g_dbuf[rb][i];
+                                { static int sk = -2;
+                                  if (sk == -2){ const char *e=ENVC("SKIPDRAW"); sk = e?atoi(e):-1; }
+                                  if (sk >= 0 && (int)i == sk) continue; }
+                                /* SKIPPS=<n>[,<n>...]: skip ALL draws that use this
+                                 * pixel shader.  The most direct way to isolate what
+                                 * one pass contributes. */
+                                { static int spinit = 0; static int sps[16]; static int spn = 0;
+                                  if (!spinit){ spinit = 1;
+                                    const char *e = ENVC("SKIPPS");
+                                    for (const char *q = e; q && *q && spn < 16; ){
+                                        while (*q==',' || *q==' ') q++;
+                                        if (!*q) break;
+                                        sps[spn++] = atoi(q);
+                                        while (*q && *q != ',') q++; } }
+                                  int skip = 0;
+                                  for (int q = 0; q < spn; q++) if (sps[q] == dr->ps) skip = 1;
+                                  if (skip) continue; }
+                                if (dr->is_blit==2){
+                                    if(enc){int pe=hd_ms_end(enc,rb,i,c_ms,c_gb,c_att);
+                                        [enc endEncoding];enc=nil;cur_t=0xFFFFFFFFu;
+                                        if(pe)hd_ms_fallback(cb,screen,pe);}
+                                    int ok=ws_postfx_encode(cb,screen,g_ws_sources[rb][i],dr,query_buffer,i);
+                                    g_ws_sources[rb][i]=nil;
+                                    if(!ok){encode_failed=1;if(queries&&dr->query_mask)queries->failed=1;
+                                        static unsigned failures;if(failures++<4)fprintf(stderr,"WS postfx: target or pipeline unavailable\n");}
+                                    else {
+                                        if(dr->ws_gamma||!dr->blit_src){screen_touched=1;hd_post=1;}
+                                        if(dr->ws_border&&dr->blit_src){unsigned tk=TGT_ID(dr->blit_src)*8u+TGT_FACE(dr->blit_src);
+                                            touched[tk>>3]|=1u<<(tk&7);}
+                                    }
+                                    continue;
+                                }
+                                if (dr->is_blit){
+                                    /* valid or not: hd_ms_end may have seen this copy and not stored the samples */
+                                    if (!dr->blit_src && hd_mslazy() && (NFS_ENHANCED || hd_msaa_n() > 1)) hd_post = 1;
+                                    /* Resolve the source/target texture; screen = drawable */
+                                    id<MTLTexture> st2 = dr->blit_src
+                                        ? ((dr->blit_src < MAXTEX) ? g_tex[dr->blit_src] : nil)
+                                        : screen;
+                                    id<MTLTexture> dt2 = dr->target
+                                        ? ((TGT_ID(dr->target) < MAXTEX)
+                                             ? g_tex[TGT_ID(dr->target)] : nil)
+                                        : screen;
+                                    if(!st2 || !dt2)encode_failed=1;
+                                    if (st2 && dt2 && st2 != dt2){
+                                        if (ENVC("BLITLOG")){
+                                            static unsigned seen[32]; static int sn = 0;
+                                            unsigned key = (dr->blit_src<<16) ^ dr->target;
+                                            int nw = 1;
+                                            for (int q=0;q<sn;q++) if (seen[q]==key) nw = 0;
+                                            if (nw && sn < 32){ seen[sn++] = key;
+                                                fprintf(stderr,"  [blit] texture %u (%lux%lu) -> texture %u (%lux%lu)  scale %.2fx\n",
+                                                    dr->blit_src,(unsigned long)st2.width,(unsigned long)st2.height,
+                                                    dr->target,(unsigned long)dt2.width,(unsigned long)dt2.height,
+                                                    (double)st2.width/(double)(dt2.width?dt2.width:1)); }
+                                        }
+                                        if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
+                                                  [enc endEncoding]; enc = nil; cur_t = 0xFFFFFFFFu; cur_z = 0xFFFFFFFFu;
+                                                  if (pe) hd_ms_fallback(cb, screen, pe); }
+#if NFS_ENHANCED
+                                        /* SSR composite: the main scene is copied from the screen for
+                                         * the FIRST time (post-processing begins).  Scene + G-buffer + Z are ready. */
+                                        if (st2 == screen && hd_scene_open){
+                                            hd_scene_open = 0;
+                                            hd_composite(cb, rb, i, screen, hd_scene_zid, hd_refl_drawn);
+                                        }
+#endif
+                                        /* MSAA: the screen contents live in the multisampled
+                                         * texture.  A copy written straight to the drawable
+                                         * would be OVERWRITTEN by the next screen pass's
+                                         * resolve; draw the copy into the multisampled
+                                         * texture as a quad and resolve. */
+                                        if (dt2 == screen && hd_msaa_n() > 1 && hd_pso_ms() && !hd_post){
+                                            g_hd_mscol = hd_ms_tex(g_hd_mscol, screen.pixelFormat,
+                                                                   screen.width, screen.height);
+                                            MTLRenderPassDescriptor *mp =
+                                                [MTLRenderPassDescriptor renderPassDescriptor];
+                                            mp.colorAttachments[0].texture = g_hd_mscol;
+                                            mp.colorAttachments[0].resolveTexture = screen;
+                                            mp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+                                            mp.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+                                            pp_rp(mp, "blit -> screen (MSAA quad)");
+                                            id<MTLRenderCommandEncoder> me =
+                                                [cb renderCommandEncoderWithDescriptor:mp];
+                                            if(!me){encode_failed=1;continue;}
+                                            [me setRenderPipelineState:hd_pso_ms()];
+                                            [me setVertexBuffer:g_blitvb offset:0 atIndex:0];
+                                            [me setFragmentSamplerState:g_samp atIndex:0];
+                                            [me setFragmentTexture:st2 atIndex:0];
+                                            { struct { float aref, usec, p0, p1; float proj[4]; float c[PSC_N][4]; float fogv[4]; int32_t b[16]; } bf;
+                                              memset(&bf, 0, sizeof bf);
+                                              [me setFragmentBytes:&bf length:sizeof bf atIndex:0]; }
+                                            [me drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+                                            [me endEncoding];
+                                            screen_touched = 1;
+                                            atomic_fetch_add(&g_hd_msblit, 1ull);
+                                            continue;
+                                        }
+                                        /* At 1:1 and the same format use a REAL copy.
+                                         * SAMPLING the drawable with a fullscreen quad
+                                         * gave stale contents at tile (32x32) borders:
+                                         * a rectangular mosaic in the sky and on glass
+                                         * facades.  (Measured: the block edges sit at
+                                         * exact multiples of 32/64 pixels.)  copyFromTexture
+                                         * is both correct and cheaper. */
+                                        if (st2.width == dt2.width && st2.height == dt2.height &&
+                                            st2.pixelFormat == dt2.pixelFormat &&
+                                            !ENVC("BLITQUAD")){
+                                            id<MTLBlitCommandEncoder> bc = pp_blit(cb, "blit (same-size copy)");
+                                            if(!bc){encode_failed=1;continue;}
+                                            [bc copyFromTexture:st2 sourceSlice:0 sourceLevel:0
+                                                   sourceOrigin:MTLOriginMake(0,0,0)
+                                                     sourceSize:MTLSizeMake(st2.width, st2.height, 1)
+                                                      toTexture:dt2 destinationSlice:0
+                                               destinationLevel:0
+                                              destinationOrigin:MTLOriginMake(0,0,0)];
+                                            [bc endEncoding];
+                                            if (dr->target){ unsigned tk_=TGT_ID(dr->target)*8u+TGT_FACE(dr->target);
+                                                     touched[tk_>>3] |= 1u<<(tk_&7); }
+                                            else screen_touched = 1;
+                                            continue;
+                                        }
+                                        /* Scaled blit: sampling the drawable
+                                         * DIRECTLY gives stale contents at tile
+                                         * borders (32/64 px mosaic).  First
+                                         * take a real copy into a scratch
+                                         * texture, then sample that, scaled. */
+                                        if (st2 == screen){
+                                            static id<MTLTexture> scratch;
+                                            if (!scratch || scratch.width != st2.width ||
+                                                scratch.height != st2.height ||
+                                                scratch.pixelFormat != st2.pixelFormat){
+                                                MTLTextureDescriptor *sd2 =
+                                                  [MTLTextureDescriptor
+                                                    texture2DDescriptorWithPixelFormat:st2.pixelFormat
+                                                    width:st2.width height:st2.height mipmapped:NO];
+                                                sd2.usage = MTLTextureUsageShaderRead |
+                                                            MTLTextureUsageRenderTarget;
+                                                sd2.storageMode = MTLStorageModePrivate;
+                                                scratch = [g_dev newTextureWithDescriptor:sd2];
+                                            }
+                                            if (scratch){
+                                                id<MTLBlitCommandEncoder> bc2 = pp_blit(cb, "blit (scratch copy)");
+                                                if(!bc2){encode_failed=1;continue;}
+                                                [bc2 copyFromTexture:st2 sourceSlice:0 sourceLevel:0
+                                                        sourceOrigin:MTLOriginMake(0,0,0)
+                                                          sourceSize:MTLSizeMake(st2.width,st2.height,1)
+                                                           toTexture:scratch destinationSlice:0
+                                                    destinationLevel:0
+                                                   destinationOrigin:MTLOriginMake(0,0,0)];
+                                                [bc2 endEncoding];
+                                                st2 = scratch;
+                                            }
+                                        }
+                                        MTLRenderPassDescriptor *bp =
+                                            [MTLRenderPassDescriptor renderPassDescriptor];
+                                        bp.colorAttachments[0].texture = dt2;
+                                        bp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+                                        bp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                                        { char pn[48]; snprintf(pn, sizeof pn, "blit quad -> %lux%lu", (unsigned long)dt2.width, (unsigned long)dt2.height);
+                                          pp_rp(bp, pn); }
+                                        id<MTLRenderCommandEncoder> be =
+                                            [cb renderCommandEncoderWithDescriptor:bp];
+                                        if(!be){encode_failed=1;continue;}
+                                        [be setRenderPipelineState:g_pso];
+                                        [be setVertexBuffer:g_blitvb offset:0 atIndex:0];
+                                        [be setFragmentSamplerState:g_samp atIndex:0];
+                                        [be setFragmentTexture:st2 atIndex:0];
+                                        { struct { float aref, usec, p0, p1; float proj[4]; float c[PSC_N][4]; float fogv[4]; int32_t b[16]; } bf;
+                                          memset(&bf, 0, sizeof bf);
+                                          [be setFragmentBytes:&bf length:sizeof bf atIndex:0]; }
+                                        [be drawPrimitives:MTLPrimitiveTypeTriangle
+                                               vertexStart:0 vertexCount:6];
+                                        [be endEncoding];
+                                        if (dr->target){ unsigned tk_=TGT_ID(dr->target)*8u+TGT_FACE(dr->target);
+                                                     touched[tk_>>3] |= 1u<<(tk_&7); }
+                                        else screen_touched = 1;
+                                    }
+                                    continue;
+                                }
+                                /* Clear(ZBUFFER): clear that Z surface at the start
+                                 * of the next pass.  If a pass with the same surface
+                                 * is open, close it so the clear order is kept. */
+                                if (dr->is_clear && (dr->clr_flags & 2u)){
+                                    unsigned zc = DEPTH_ZID(dr->depth);
+                                    if (zc && zc < MAXZ){
+                                        z_prepare(zc);
+                                        g_zpend[zc] = 1;
+                                        g_zpend_v[zc] = dr->clr_z < 0.f ? 0.f : dr->clr_z > 1.f ? 1.f : dr->clr_z;
+                                        /* the multisampled twin consumes its own clear separately */
+                                        if (zc < 64u){ g_hd_zpend_ms[zc] = 1; g_hd_zpend_msv[zc] = g_zpend_v[zc]; }
+                                        if (enc && cur_z == zc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
+                                                  [enc endEncoding]; enc = nil; cur_t = 0xFFFFFFFFu;
+                                                  if (pe) hd_ms_fallback(cb, screen, pe); }
+                                    }
+                                }
+                                int hd_blur=0;
+#if NFS_ENHANCED
+                                /* HD blur draw: from a road target to a road target.
+                                 * If the source's mips are stale, close the pass,
+                                 * generate them, reopen with the same target (Load). */
+                                hd_blur = !dr->is_clear && hd_is_road(dr->tex) &&
+                                              hd_is_road(TGT_ID(dr->target));
+                                if (hd_blur && g_hd_dirty[dr->tex]){
+                                    if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
+                                              [enc endEncoding]; enc = nil; cur_t = 0xFFFFFFFFu;
+                                              if (pe) hd_ms_fallback(cb, screen, pe); }
+                                    id<MTLBlitCommandEncoder> mb = pp_blit(cb, "road reflection mip generation");
+                                    if(!mb){encode_failed=1;continue;}
+                                    [mb generateMipmapsForTexture:g_tex[dr->tex]];
+                                    [mb endEncoding];
+                                    g_hd_dirty[dr->tex] = 0;
+                                    atomic_fetch_add(&g_hd_mipgen, 1ull);
+                                }
+#endif
+                                /* see PASS MERGING: a draw that does not use Z does not split the pass over its Z surface */
+                                uint64_t depth_reads=draw_depth_textures(dr),depth_clears=0;
+                                for(uint64_t bits=depth_reads;bits;bits&=bits-1){
+                                    unsigned zid=(unsigned)__builtin_ctzll(bits);z_prepare(zid);
+                                    if(g_zpend[zid])depth_clears|=1ull<<zid;
+                                }
+                                if(enc && depth_clears){
+                                    int pe=hd_ms_end(enc,rb,i,c_ms,c_gb,c_att);
+                                    [enc endEncoding];enc=nil;cur_t=0xffffffffu;
+                                    if(pe)hd_ms_fallback(cb,screen,pe);
+                                }
+                                /* A skipped clear-only screen pass still precedes a depth texture read. */
+                                int depth_clear_failed=0;
+                                for(uint64_t bits=depth_clears;bits;bits&=bits-1){
+                                    unsigned zid=(unsigned)__builtin_ctzll(bits);
+                                    if(!g_ztex[zid]){depth_clear_failed=1;break;}
+                                    MTLRenderPassDescriptor *rp=[MTLRenderPassDescriptor renderPassDescriptor];
+                                    rp.depthAttachment.texture=g_ztex[zid];
+                                    rp.depthAttachment.loadAction=MTLLoadActionClear;
+                                    rp.depthAttachment.storeAction=MTLStoreActionStore;
+                                    rp.depthAttachment.clearDepth=g_zpend_v[zid];
+                                    id<MTLRenderCommandEncoder> clear=[cb renderCommandEncoderWithDescriptor:rp];
+                                    if(!clear){depth_clear_failed=1;break;}
+                                    [clear endEncoding];g_zpend[zid]=0;g_hd_zsdirty[zid]=1;
+                                }
+                                if(depth_clear_failed){encode_failed=1;continue;}
+                                int samples_z=enc && cur_z<MAXZ && (depth_reads&(1ull<<cur_z));
+                                int zsplit = DEPTH_ZID(dr->depth) != cur_z &&
+                                             !(enc && pass_merge_on() && !dr->is_clear && !(dr->depth & 3u) && !samples_z);
+                                int tsplit=dr->target!=cur_t || memcmp(dr->mrt,cur_mrt,sizeof cur_mrt);
+                                int color_clear=dr->is_clear && (dr->clr_flags&1u);
+                                if(!dr->target && color_has_mrt(dr))hd_post=1;
+                                /* a screen pass with only Clears in it: do not open it (the Z clear was recorded above) */
+                                if (!enc || tsplit || zsplit || color_clear)
+                                    if (!hd_post && !screen_touched && pass_clear_only(rb, i)) continue;
+                                if (!enc || tsplit || zsplit || color_clear){
+                                    if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
+                                              [enc endEncoding]; enc = nil;
+                                              if (pe) hd_ms_fallback(cb, screen, pe); }
+#if NFS_ENHANCED
+                                    if (hd_is_road(TGT_ID(dr->target))) g_hd_dirty[TGT_ID(dr->target)] = 1;
+#endif
+                                    id<MTLTexture> tgt = screen;
+                                    if (dr->target) freed_use(TGT_ID(dr->target), 1);
+                                    if (dr->target && TGT_ID(dr->target) < MAXTEX &&
+                                        g_tex[TGT_ID(dr->target)])
+                                        tgt = g_tex[TGT_ID(dr->target)];
+                                    unsigned tk0 = TGT_ID(dr->target)*8u + TGT_FACE(dr->target);
+                                    int first_use = dr->target
+                                        ? !(touched[tk0>>3] & (1u<<(tk0&7)))
+                                        : !screen_touched;
+                                    MTLRenderPassDescriptor *rp =
+                                        [MTLRenderPassDescriptor renderPassDescriptor];
+                                    color_pass_attachments(rp,dr,screen,touched,screen_touched);
+                                    c_ms = 0;
+                                    int c_ml = 0;                   /* see MEMORYLESS MSAA ATTACHMENTS */
+                                    g_hd_msp.on = 0; g_hd_msp.ml = 0; g_hd_msp.dz = 0;
+                                    if (!dr->target && !color_has_mrt(dr) && hd_msaa_n() > 1 && !hd_post){
+                                        unsigned zq = DEPTH_ZID(dr->depth);
+                                        /* no attachment will be loaded (colour first use, G first
+                                         * time, depth to be cleared) and no sample will be stored */
+                                        c_ml = hd_ms_memless() && first_use &&
+#if NFS_ENHANCED
+                                               (hd_gb_first || !(hd_scene_open && hd_ssr_on())) &&
+#endif
+                                               !(zq && zq < 64u && g_hd_msz_seen[zq] && g_hd_msz_kept[zq] &&
+                                                 !g_hd_zpend_ms[zq]) &&
+                                               hd_ms_memless_ok(rb, i);
+                                        id<MTLTexture> msc;
+                                        if (c_ml) msc = g_hd_mscol_ml = hd_ms_tex_ml(g_hd_mscol_ml, tgt.pixelFormat,
+                                                                                     tgt.width, tgt.height);
+                                        else      msc = g_hd_mscol = hd_ms_tex(g_hd_mscol, tgt.pixelFormat,
+                                                                               tgt.width, tgt.height);
+                                        if (!msc) c_ml = 0;
+                                        if (msc){
+                                            c_ms = 1;
+                                            c_att = hd_ms_predict(rb, i);
+                                            if (c_ml) atomic_fetch_add(&g_hd_ml_pass, 1ull);
+                                            rp.colorAttachments[0].texture = msc;
+                                            if (c_att & 1u) rp.colorAttachments[0].resolveTexture = tgt;
+                                            rp.colorAttachments[0].storeAction =
+                                                  c_ml ? ((c_att & 1u) ? MTLStoreActionMultisampleResolve   /* memoryless: final */
+                                                                       : MTLStoreActionDontCare)
+                                                : hd_mslazy() ? MTLStoreActionUnknown             /* at close: hd_ms_end */
+                                                : MTLStoreActionStoreAndMultisampleResolve;
+                                            atomic_fetch_add(&g_hd_mspass, 1ull);
+                                        }
+                                    }
+                                    c_gb = 0;
+#if NFS_ENHANCED
+                                    if (!dr->target && !color_has_mrt(dr) && hd_scene_open && hd_ssr_on()){
+                                        NSUInteger ns = c_ms ? (NSUInteger)hd_msaa_n() : 1u;
+                                        for (int gi = 0; gi < HD_NG; gi++){
+                                            g_hd_g[gi] = hd_tex(g_hd_g[gi], hd_gfmt(gi), tgt.width, tgt.height, 1);
+                                            if (ns > 1 && c_ml) g_hd_gms_ml[gi] = hd_ms_tex_ml(g_hd_gms_ml[gi], hd_gfmt(gi), tgt.width, tgt.height);
+                                            else if (ns > 1) g_hd_gms[gi] = hd_tex(g_hd_gms[gi], hd_gfmt(gi), tgt.width, tgt.height, ns);
+                                        }
+                                        for (int gi = 0; gi < HD_NG; gi++){
+                                            MTLRenderPassColorAttachmentDescriptor *ga = rp.colorAttachments[1 + gi];
+                                            ga.texture = (ns > 1) ? (c_ml ? g_hd_gms_ml[gi] : g_hd_gms[gi]) : g_hd_g[gi];
+                                            if (ns > 1){ if (c_att & 2u) ga.resolveTexture = g_hd_g[gi];
+                                                         ga.storeAction = c_ml ? ((c_att & 2u) ? MTLStoreActionMultisampleResolve
+                                                                                                : MTLStoreActionDontCare)
+                                                                       : hd_mslazy() ? MTLStoreActionUnknown
+                                                                       : MTLStoreActionStoreAndMultisampleResolve; }
+                                            else ga.storeAction = MTLStoreActionStore;
+                                            ga.loadAction = hd_gb_first ? MTLLoadActionClear : MTLLoadActionLoad;
+                                            ga.clearColor = (gi == 2 && hd_gpack())     /* packed: zero direction = 512 */
+                                                ? MTLClearColorMake(512.0 / 1023.0, 512.0 / 1023.0, 512.0 / 1023.0, 0)
+                                                : MTLClearColorMake(0, 0, 0, 0);
+                                        }
+                                        hd_gb_first = 0;
+                                        hd_scene_zid = DEPTH_ZID(dr->depth);
+                                        c_gb = 1;
+                                    }
+#endif
+                                    /* Z: the bound Z surface's own texture (see g_ztex).
+                                     * With no surface, or one whose size does not match
+                                     * the target, a scratch texture is bound and the Z
+                                     * test is turned off (the pipelines always expect
+                                     * Depth32Float). */
+                                    unsigned zid = DEPTH_ZID(dr->depth);
+                                    id<MTLTexture> ztex = nil;
+                                    int zclear = 0; float zval = 1.f;
+                                    if (zid && zid < MAXZ){
+                                        z_prepare(zid);
+                                        id<MTLTexture> zt = g_ztex[zid];
+                                        if (!zt || zt.width != tgt.width || zt.height != tgt.height){
+                                            /* the implicit surface (1) is sized with the screen;
+                                             * created surfaces with the target they are first
+                                             * used with.  Later use with a target of another
+                                             * size: scratch. */
+                                            if (!zt || zid == 1u){
+                                                MTLTextureDescriptor *zd =
+                                                    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                                                        MTLPixelFormatDepth32Float
+                                                        width:tgt.width height:tgt.height mipmapped:NO];
+                                                zd.usage = MTLTextureUsageRenderTarget
+#if NFS_ENHANCED
+                                                         | MTLTextureUsageShaderRead   /* SSR reads the depth */
+#endif
+                                                         ;
+                                                zd.storageMode = MTLStorageModePrivate;
+                                                g_ztex[zid] = zt = [g_dev newTextureWithDescriptor:zd];
+                                                zclear = 1;
+                                            } else { zt = nil; atomic_fetch_add(&g_z_mismatch, 1ull); }
+                                        }
+                                        ztex = zt;
+                                        if (ztex && g_zpend[zid] && !c_ms){ zclear = 1; zval = g_zpend_v[zid]; g_zpend[zid] = 0; }
+                                    }
+                                    if (!ztex){
+                                        if (!zid) atomic_fetch_add(&g_z_null, 1ull);
+                                        if (!g_depth_tex ||
+                                            g_depth_tex.width  != tgt.width ||
+                                            g_depth_tex.height != tgt.height){
+                                            MTLTextureDescriptor *zd =
+                                                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                                                    MTLPixelFormatDepth32Float
+                                                    width:tgt.width height:tgt.height mipmapped:NO];
+                                            zd.usage = MTLTextureUsageRenderTarget;
+                                            zd.storageMode = MTLStorageModePrivate;
+                                            g_depth_tex = [g_dev newTextureWithDescriptor:zd];
+                                        }
+                                    }
+                                    id<MTLTexture> zres = nil;     /* depth resolve target (msaa) */
+                                    if (c_ms){
+                                        if (ztex && zid < 64u){
+                                            zres = ztex;
+                                            /* wants to load without a clear, but the last pass did not store */
+                                            int lost = g_hd_msz_seen[zid] && !g_hd_msz_kept[zid] && !g_hd_zpend_ms[zid];
+                                            if (c_ml){
+                                                g_hd_msz_ml = hd_ms_tex_ml(g_hd_msz_ml, MTLPixelFormatDepth32Float,
+                                                                           tgt.width, tgt.height);
+                                                ztex = g_hd_msz_ml;
+                                                zclear = 1;                     /* memoryless: always cleared */
+                                            } else {
+                                                id<MTLTexture> old = g_hd_msz[zid];
+                                                g_hd_msz[zid] = hd_ms_tex(old, MTLPixelFormatDepth32Float,
+                                                                          tgt.width, tgt.height);
+                                                zclear = (g_hd_msz[zid] != old);       /* new: undefined */
+                                                ztex = g_hd_msz[zid];
+                                            }
+                                            zval = 1.f;
+                                            if (g_hd_zpend_ms[zid]){ zclear = 1; zval = g_hd_zpend_msv[zid]; g_hd_zpend_ms[zid] = 0; }
+                                            if (lost){ zclear = 1; atomic_fetch_add(&g_hd_mszlost, 1ull); }
+                                            g_hd_msz_seen[zid] = 1;
+                                            g_hd_zms_used[zid] = 1;
+                                            g_hd_msp.dz = 1; g_hd_msp.zid = zid; g_hd_msp.zclr = zclear;
+                                        } else {
+                                            /* screen pass without depth: always Clear + DontCare */
+                                            g_hd_msdepth_scratch = hd_ml_hw()
+                                                ? hd_ms_tex_ml(g_hd_msdepth_scratch, MTLPixelFormatDepth32Float, tgt.width, tgt.height)
+                                                : hd_ms_tex(g_hd_msdepth_scratch, MTLPixelFormatDepth32Float, tgt.width, tgt.height);
+                                        }
+                                    }
+                                    if (ztex){
+                                        rp.depthAttachment.texture = ztex;
+                                        rp.depthAttachment.loadAction = zclear ? MTLLoadActionClear : MTLLoadActionLoad;
+                                        rp.depthAttachment.storeAction = MTLStoreActionStore;
+                                        rp.depthAttachment.clearDepth = zval;
+                                        /* RESOLVE the MSAA depth into the single-sample twin: passes
+                                         * that draw to a single-sample target with the same Z after
+                                         * the screen (light flares etc.) then see the scene's depth.
+                                         * The twin now reflects the MS state, so its pending clear
+                                         * is void. */
+                                        if (zres && zres.width == ztex.width && zres.height == ztex.height &&
+                                            !(ENVC("HD_ZRESOLVE") && ENVC("HD_ZRESOLVE")[0] == '0')){
+                                            rp.depthAttachment.resolveTexture = zres;
+                                            rp.depthAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+                                            rp.depthAttachment.depthResolveFilter = MTLMultisampleDepthResolveFilterSample0;
+                                            g_zpend[zid] = 0;
+                                            g_hd_zsdirty[zid] = 0;
+                                            atomic_fetch_add(&g_hd_zres, 1ull);
+                                        }
+                                        /* Storing the MS depth: memoryless decides at open (never
+                                         * stored), Private chooses at close (hd_ms_end) */
+                                        if (c_ms && g_hd_msp.dz && c_ml){
+                                            rp.depthAttachment.storeAction = rp.depthAttachment.resolveTexture
+                                                ? MTLStoreActionMultisampleResolve : MTLStoreActionDontCare;
+                                            g_hd_msz_kept[g_hd_msp.zid] = 0;
+                                            atomic_fetch_add(&g_hd_mszskip, 1ull);
+                                            g_hd_msp.dz = 0;
+                                        } else if (c_ms && g_hd_msp.dz && hd_mslazy()){
+                                            g_hd_msp.res = rp.depthAttachment.resolveTexture != nil;
+                                            rp.depthAttachment.storeAction = MTLStoreActionUnknown;
+                                        } else g_hd_msp.dz = 0;
+                                    } else if (g_depth_tex){
+                                        rp.depthAttachment.texture = g_depth_tex;
+                                        if (c_ms) rp.depthAttachment.texture = g_hd_msdepth_scratch;
+                                        rp.depthAttachment.loadAction = MTLLoadActionClear;
+                                        rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+                                        rp.depthAttachment.clearDepth = 1.0;
+                                    }
+                                    cur_z = zid;
+                                    c_zon = ztex != nil;
+                                    g_hd_msp.on = c_ms; g_hd_msp.ml = c_ml;
+                                    if (!c_ms) g_hd_msp.dz = 0;
+                                    if (g_pp_sb){ char pn[48];
+                                        if (!dr->target) snprintf(pn, sizeof pn, "SCREEN%s%s", c_ms ? " +MSAA" : "",
+#if NFS_ENHANCED
+                                                                  c_gb ? " +G-buffer" : "");
+#else
+                                                                  "");
+#endif
+                                        else snprintf(pn, sizeof pn, "%s #%u %lux%lu", TGT_FACE(dr->target) ? "cube face" : "target",
+                                                      TGT_ID(dr->target), (unsigned long)tgt.width, (unsigned long)tgt.height);
+                                        pp_rp(rp, pn);
+                                        { static long ff = -1;        /* pass contents in the first profiled frame */
+                                          if (ff < 0) ff = fno_pre;
+                                          if (ff == fno_pre){
+                                              unsigned nd = 0, nz = 0, nzt = 0, na = 0, zz = DEPTH_ZID(dr->depth);
+                                              for (unsigned q = i; q < g_dn[rb]; q++){ MDraw *x = &g_dbuf[rb][q];
+                                                  if (x->is_blit || !color_targets_equal(x,dr) || DEPTH_ZID(x->depth) != zz) break;
+                                                  if (x->is_clear){ if (q > i && (x->clr_flags & 2u)) break; continue; }
+                                                  nd++; if (x->depth & 2u) nz++; if (x->depth & 1u) nzt++; if (x->alpha_ref > 0.f) na++; }
+                                              fprintf(stderr, "  [content] draw#%u %s: zid %u, %u draws, Z writing %u, Z testing %u, alpha tested %u, first ps %d tex %u\n",
+                                                      i, pn, zz, nd, nz, nzt, na, dr->ps, dr->tex); } } }
+                                    rp.visibilityResultBuffer=query_buffer;
+                                    for(unsigned slot=0;slot<4;slot++)c_colors[slot]=rp.colorAttachments[slot].texture.pixelFormat;
+                                    enc = [cb renderCommandEncoderWithDescriptor:rp];
+                                    if(!enc){encode_failed=1;continue;}
+                                    atomic_fetch_add(&g_pass_n, 1ull);
+                                    [enc setVertexBuffer:g_mtlvb offset:0 atIndex:0];
+                                    [enc setFragmentSamplerState:g_samp atIndex:0];
+                                    /* new encoder = all state reset */
+                                    c_pso = nil; c_bcol = ~0u; c_depth = ~0u; c_fp_valid = 0;
+                                    c_bias=c_slope=NAN;
+                                    c_cull = ~0u;
+                                    /* In D3D the front face is CLOCKWISE.  CULLWIND=1
+                                     * flips it (needed if our vertex path flips
+                                     * Y). */
+                                    { static int cw = -1;
+                                      if (cw < 0){ const char *e = ENVC("CULLWIND");
+                                                   cw = (e && *e && *e != '0') ? 1 : 0; }
+                                      [enc setFrontFacingWinding:cw ? MTLWindingCounterClockwise
+                                                                    : MTLWindingClockwise]; }
+                                    for (int q4=0;q4<16;q4++){ c_smp[q4]=~0u; c_tex[q4]=~0u; }
+                                    color_pass_mark_touched(dr,touched,&screen_touched);
+                                    cur_t = dr->target;
+                                    memcpy(cur_mrt,dr->mrt,sizeof cur_mrt);
+                                }
+                                if (dr->is_clear || !dr->count) continue;
+                                /* PSINFO=<n>: print the target/texture/blend of the
+                                 * first draws that use this ps. */
+                                { static int pi = -2; static int shown = 0;
+                                  if (pi == -2){ const char *e=ENVC("PSINFO"); pi = e?atoi(e):-1; }
+                                  if (pi >= 0 && dr->ps == pi && shown < 6){ shown++;
+                                    fprintf(stderr,"  [psinfo] ps=%d target=%u tex=%u(%lux%lu) tex1=%u"
+                                            " blend=%05x verts=%u  c0=(%.3f %.3f %.3f %.3f)\n",
+                                            dr->ps, dr->target, dr->tex,
+                                            (dr->tex && dr->tex<MAXTEX && g_tex[dr->tex])?(unsigned long)g_tex[dr->tex].width:0ul,
+                                            (dr->tex && dr->tex<MAXTEX && g_tex[dr->tex])?(unsigned long)g_tex[dr->tex].height:0ul,
+                                            dr->tex1, dr->blend, dr->count,
+                                            (double)dr->c0[0],(double)dr->c0[1],
+                                            (double)dr->c0[2],(double)dr->c0[3]); } }
+#if NFS_ENHANCED
+                                if (dr->ps >= PSREFL && c_gb){ hd_refl_drawn = 1; atomic_fetch_add(&g_hd_refl_draws, 1ull); }
+#endif
+                                if (g_hd_msn > 1){              /* msaa diagnostics (report) */
+                                /* The same Z surface was used on the screen this frame
+                                 * (through its multisampled twin) and is now Z TESTED on a
+                                 * single-sample target: the twins share no contents, so
+                                 * this draw cannot see the scene's depth.  Count it. */
+                                /* The reverse: a single-sample pass WROTE Z, then the screen
+                                 * (MS twin) tests against that depth -- the twin cannot see it. */
+                                if (!c_ms && c_zon && cur_z < 64u && (dr->depth & 2u)) g_hd_zsdirty[cur_z] = 1;
+                                if (c_ms && c_zon && cur_z < 64u && (dr->depth & 1u) && g_hd_zsdirty[cur_z])
+                                    atomic_fetch_add(&g_hd_zrev, 1ull);
+                                if (!c_ms && c_zon && cur_z < 64u && g_hd_zms_used[cur_z] && (dr->depth & 1u)){
+                                    atomic_fetch_add(&g_hd_zshare, 1ull);
+                                    if (ENVC("ZSHARELOG")){
+                                        static unsigned zt[16], zz[16], zn[16], zps[16]; static int zk = 0;
+                                        int q, f = -1;
+                                        for (q = 0; q < zk; q++) if (zt[q] == dr->target && zz[q] == cur_z && zps[q] == (unsigned)dr->ps) f = q;
+                                        if (f < 0 && zk < 16){ f = zk++; zt[f] = dr->target; zz[f] = cur_z; zps[f] = (unsigned)dr->ps; zn[f] = 0;
+                                            id<MTLTexture> tt = (TGT_ID(dr->target) < MAXTEX) ? g_tex[TGT_ID(dr->target)] : nil;
+                                            fprintf(stderr, "  [zshare] target=%u (%lux%lu) z=%u ps=%d vs=%d blend=%05x verts=%u\n",
+                                                    dr->target, (unsigned long)tt.width, (unsigned long)tt.height,
+                                                    cur_z, dr->ps, dr->vsid, dr->blend, dr->count); }
+                                        if (f >= 0) zn[f]++;
+                                    }
+                                }
+                                }
+                                { uint64_t k2 = (uint64_t)(dr->blend & 0xFFFFFu)
+                                               | metal_shader_key((unsigned)dr->ps,(unsigned)dr->vsid)
+                                               | color_write_key(dr->mrt_write)
+                                               | ((uint64_t)(c_ms & 1) << 48)
+                                               | ((uint64_t)(c_gb & 1) << 49);
+                                  if (c_ms) k2 |= (uint64_t)hd_msaa_l2() << 50;   /* see MSAA BY RESOLUTION */
+                                  if(c_zon && (dr->depth&3u) && dr->depth_bias!=0.f)k2|=1ull<<53;
+                                  else if (dr->alpha_ref <= 0.f && hsr_draw_on()) k2 |= 1ull << 52;
+                                  id<MTLRenderPipelineState> ps2 = pso_for_colors(k2,c_colors);
+                                  if(!ps2){encode_failed=1;if(queries && dr->query_mask)queries->failed=1;continue;}
+                                  if (ps2 != c_pso){ c_pso = ps2;
+                                      [enc setRenderPipelineState:ps2]; } }
+                                if(queries && dr->query_mask && !enc)queries->failed=1;
+                                mq_encode(enc,query_buffer,dr,i);
+                                /* BLENDFACTOR: encoder state, not pipeline state;
+                                 * reset at every change of target. */
+                                if (dr->cull != c_cull){ c_cull = dr->cull;
+                                    [enc setCullMode:(dr->cull == 1u) ? MTLCullModeNone
+                                                   : (dr->cull == 2u) ? MTLCullModeFront
+                                                                      : MTLCullModeBack]; }
+                                if (dr->bcol != c_bcol){ c_bcol = dr->bcol;
+                                    [enc setBlendColorRed:(float)((dr->bcol>>16)&0xFFu)/255.f
+                                                    green:(float)((dr->bcol>>8)&0xFFu)/255.f
+                                                     blue:(float)(dr->bcol&0xFFu)/255.f
+                                                    alpha:(float)((dr->bcol>>24)&0xFFu)/255.f]; }
+                                unsigned stages=(dr->ps>0 && dr->ps<MAXPS && g_ps_model[dr->ps]>=0x0200)?16:4;
+                                for (unsigned si = 0; si < stages; si++){
+                                    unsigned sk = texrep_skey(dr->stage_tex[si],
+                                                              dr->smp[si]);
+#if NFS_ENHANCED
+                                    /* mip filter LINEAR (bits 4-5 = 2): a level() read is
+                                     * ignored on a sampler without mips. */
+                                    if (hd_blur) sk = (sk & ~0x30u) | 0x20u;
+#endif
+                                    if (sk != c_smp[si]){ c_smp[si] = sk;
+                                        [enc setFragmentSamplerState:samp_for(sk) atIndex:si]; } }
+                                { unsigned dm = c_zon ? (dr->depth & 63u) : 0u;
+                                  if (dm != c_depth){ c_depth = dm;
+                                      [enc setDepthStencilState:dss_for(dm)]; } }
+                                {float bias=c_zon?dr->depth_bias:0,slope=c_zon?dr->slope_bias:0;
+                                 if(bias!=c_bias || slope!=c_slope){metal_apply_depth_bias(enc,bias,slope);c_bias=bias;c_slope=slope;}}
+                                { struct { float aref, usec, p0, p1; float proj[4]; float c[PSC_N][4]; float fogv[4]; int32_t b[16]; } fp;
+                                  fp.aref = dr->alpha_ref;
+                                  fp.usec=0.f;pixel_aux_constants(dr,hd_blur,&fp.p0,&fp.p1);
+                                  memcpy(fp.proj, dr->proj, sizeof fp.proj);
+                                  memcpy(fp.fogv, dr->fogv, sizeof fp.fogv);
+                                  /* same pool index + same small fields: no need to build
+                                   * and compare the 548-byte block */
+                                  if (!(c_fp_valid && dr->psci == c_psci &&
+                                        !memcmp(&fp, &c_fp, offsetof(__typeof__(fp), c)) &&
+                                        !memcmp(fp.fogv, c_fp.fogv, sizeof fp.fogv))){
+                                      memcpy(fp.c, g_pscb[rb][dr->psci].c, sizeof fp.c);
+                                      memcpy(fp.b,g_pscb[rb][dr->psci].b,sizeof fp.b);
+                                      if (!c_fp_valid || memcmp(&fp, &c_fp, sizeof fp)){
+                                          memcpy(&c_fp, &fp, sizeof fp); c_fp_valid = 1;
+                                          [enc setFragmentBytes:&fp length:sizeof fp atIndex:0]; }
+                                      c_psci = dr->psci; } }
+                                for(unsigned stage=0;stage<stages;stage++){
+                                    unsigned tt=dr->stage_tex[stage];
+                                    int type=(dr->ps>0 && dr->ps<MAXPS)?g_ps_sampler_type[dr->ps][stage]:0;
+                                    unsigned cache=tt ^ ((unsigned)type<<24);
+                                    if(cache==c_tex[stage])continue;
+                                    c_tex[stage]=cache;freed_use(tt,0);
+                                    id<MTLTexture> texture=(tt && tt<MAXTEX)?g_tex[tt]:nil;
+                                    if(texture && texture.textureType==MTLTextureType2D)texture=texrep_pick(tt,texture);
+                                    if(type && tt<MAXTEX && g_tex_zid[tt] && ENVC("RTIDLOG")){
+                                        static unsigned logged;
+                                        if(logged++<16)fprintf(stderr,"[depth sample] ps=%d stage=%u texture=%u zid=%u\n",
+                                            dr->ps,stage,tt,(unsigned)g_tex_zid[tt]);
+                                    }
+                                    if(!texture){
+                                        if(type==3 || type==4){
+                                            id<MTLTexture> fallback=type==3?g_white_cube:g_white_volume;
+                                            if(!fallback){
+                                                MTLTextureDescriptor *td=[MTLTextureDescriptor new];td.pixelFormat=MTLPixelFormatRGBA8Unorm;
+                                                td.width=td.height=td.depth=1;td.textureType=type==3?MTLTextureTypeCube:MTLTextureType3D;td.storageMode=MTLStorageModeShared;
+                                                fallback=[g_dev newTextureWithDescriptor:td];uint32_t white=0xffffffff;
+                                                for(int face=0;face<(type==3?6:1);face++)[fallback replaceRegion:MTLRegionMake3D(0,0,0,1,1,1) mipmapLevel:0 slice:face withBytes:&white bytesPerRow:4 bytesPerImage:4];
+                                                if(type==3)g_white_cube=fallback;else g_white_volume=fallback;
+                                            }
+                                            texture=fallback;
+                                        } else texture=g_white;
+                                    }
+                                    [enc setFragmentTexture:texture atIndex:stage];
+                                }
+                                atomic_fetch_add(&g_draw_n, 1ull);
+                                if (dr->vsid > 0 && dr->ix_isz){
+                                    id<MTLBuffer> pl = g_pool_fr[rb];
+                                    [enc setVertexBuffer:pl offset:dr->rawoff atIndex:1];
+                                    [enc setVertexBuffer:g_mtlkb  offset:dr->koff   atIndex:2];
+                                    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:dr->count
+                                                     indexType:(dr->ix_isz == 4u) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
+                                                   indexBuffer:pl indexBufferOffset:dr->ix_ib
+                                                 instanceCount:1 baseVertex:dr->ix_base baseInstance:0];
+                                } else if (dr->vsid > 0){
+                                    [enc setVertexBuffer:g_mtlrvb offset:dr->rawoff atIndex:1];
+                                    [enc setVertexBuffer:g_mtlkb  offset:dr->koff   atIndex:2];
+                                    [enc drawPrimitives:MTLPrimitiveTypeTriangle
+                                            vertexStart:0 vertexCount:dr->count];
+                                } else {
+                                    [enc drawPrimitives:MTLPrimitiveTypeTriangle
+                                            vertexStart:dr->first vertexCount:dr->count];
+                                }
+                            }
+                            { long tt = (long)(g_vn[rb]/3);
+                              for (unsigned i = 0; i < g_dn[rb]; i++)
+                                  if (g_dbuf[rb][i].vsid > 0) tt += (long)(g_dbuf[rb][i].count/3);
+                              atomic_fetch_add(&g_tris_drawn, tt); }
+                        }
+                        if (enc){ int pe = rb >= 0 ? hd_ms_end(enc, rb, g_dn[rb], c_ms, c_gb, c_att) : 0;
+                                  [enc endEncoding]; enc = nil;
+                                  if (pe) hd_ms_fallback(cb, screen, pe); }
+                        /* if nothing was drawn to the screen, at least clear it */
+                        if (final && !screen_touched){
+                            MTLRenderPassDescriptor *rp =
+                                [MTLRenderPassDescriptor renderPassDescriptor];
+                            rp.colorAttachments[0].texture = screen;
+                            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                            rp.colorAttachments[0].clearColor = MTLClearColorMake(
+                                atomic_load(&g_clear_r), atomic_load(&g_clear_g),
+                                atomic_load(&g_clear_b), 1.0);
+                            id<MTLRenderCommandEncoder> e2 =
+                                [cb renderCommandEncoderWithDescriptor:rp];
+                            [e2 endEncoding];
+                        }
+                        memcpy(g_logical_frame.touched,touched,sizeof touched);
+                        g_logical_frame.screen_touched=screen_touched;
+                        g_logical_frame.hd_post=hd_post;
+#if NFS_ENHANCED
+                        g_logical_frame.scene_open=hd_scene_open;g_logical_frame.gb_first=hd_gb_first;
+                        g_logical_frame.refl_drawn=hd_refl_drawn;g_logical_frame.scene_zid=hd_scene_zid;
+#endif
+                        int readback_encoded=0;
+                        if(readback){
+                            id<MTLBlitCommandEncoder> bl=[cb blitCommandEncoder];
+                            if(bl){[bl copyFromTexture:readback->texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                                     sourceSize:MTLSizeMake(readback->texture.width,readback->height,1)
+                                       toBuffer:readback->staging destinationOffset:0 destinationBytesPerRow:readback->stride
+                       destinationBytesPerImage:readback->stride*readback->height];
+                            [bl endEncoding];readback_encoded=1;}
+                        }
+                        if(rb>=0){
+                            g_logical_frame.draws+=g_dn[rb];g_logical_frame.verts+=g_vn[rb];
+                            if(g_perflog)for(unsigned i=0;i<g_dn[rb];i++){
+                                const MDraw *draw=&g_dbuf[rb][i];
+                                unsigned ids[25]={draw->tex,draw->tex1,draw->tex2,draw->tex3,draw->blit_src};
+                                memcpy(ids+5,draw->stage_tex,sizeof draw->stage_tex);
+                                for(unsigned slot=0;slot<4;slot++)ids[21+slot]=TGT_ID(color_target_at(draw,slot));
+                                for(unsigned j=0;j<25;j++){unsigned tid=ids[j];
+                                    if(tid && tid<MAXTEX && !(g_logical_frame.resources[tid>>3]&(1u<<(tid&7)))){
+                                        g_logical_frame.resources[tid>>3]|=1u<<(tid&7);g_logical_frame.resource_count++;
+                                    }
+                                }
+                            }
+                        }
+                        unsigned logical_draws=g_logical_frame.draws,logical_verts=g_logical_frame.verts;
+                        unsigned logical_resources=g_logical_frame.resource_count;
+                        pthread_mutex_lock(&g_qlock);
+                        g_ready = -1; g_enc_rb = -1;
+                        pthread_cond_signal(&g_qcond);
+                        pthread_mutex_unlock(&g_qlock);
+                        if(!final){
+                            struct timespec end;clock_gettime(CLOCK_MONOTONIC,&end);
+                            uint64_t encoded=(uint64_t)(end.tv_sec-_e0.tv_sec)*1000000000ull+end.tv_nsec-_e0.tv_nsec;
+                            g_logical_frame.encode_ns+=encoded;atomic_fetch_add(&g_enc_ns,encoded);
+                            if(gpuw_in(fno_pre))atomic_fetch_add(&g_encw_ns,encoded);
+                            pp_end(cb);
+                            [cb addCompletedHandler:^(id<MTLCommandBuffer> completed){
+                                int ok=completed.status==MTLCommandBufferStatusCompleted;
+                                mq_complete(queries,query_buffer.contents,query_buffer && ok && !encode_failed);
+                                fb_release(fbi);
+                                double gpu=(completed.GPUEndTime-completed.GPUStartTime)*1e9;
+                                if(!ok){unsigned long count=atomic_fetch_add(&g_cb_err,1ul);
+                                    if(count<5)fprintf(stderr,"metal: readback COMMAND BUFFER ERROR: %s\n",completed.error.localizedDescription.UTF8String);}
+                                if(readback){pthread_mutex_lock(&g_qlock);
+                                    if(ok && gpu>0 && gpu<1e9)g_logical_frame.gpu_ns+=(uint64_t)gpu;
+                                    readback->success=ok && readback_encoded && !encode_failed;readback->done=1;
+                                    pthread_cond_broadcast(&g_qcond);pthread_mutex_unlock(&g_qlock);}
+                            }];
+                            [cb commit];g_encoding_partial=0;return;
+                        }
+                        /* TESTFILL: fill with a known colour to verify the
+                         * capture path.  If the PNG comes out magenta, capture works. */
+                        if (ENVC("TESTFILL")){
+                            MTLRenderPassDescriptor *rp =
+                                [MTLRenderPassDescriptor renderPassDescriptor];
+                            rp.colorAttachments[0].texture = screen;
+                            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                            rp.colorAttachments[0].clearColor =
+                                MTLClearColorMake(1.0, 0.0, 1.0, 1.0);
+                            id<MTLRenderCommandEncoder> e3 =
+                                [cb renderCommandEncoderWithDescriptor:rp];
+                            [e3 endEncoding];
+                        }
+                        if (g_perflog && atomic_exchange(&g_pl_thumb_req, 0)) pl_thumb(cb, screen, fno_pre);
+                        /* frame-rate counter (off by default, fpscounter.m): after the
+                         * game's frame; after the dump copy unless NFSU2_FPS_COUNTER_DUMP=1 */
+                        int fc_px = fpscounter_on() && rb >= 0;
+                        double fc_ppp = atomic_load(&g_cont_w) > 0 ? (double)screen.width / atomic_load(&g_cont_w) : 2.0;
+                        unsigned fc_bw = 0, fc_bh = 0;
+                        if (fc_px){ double bs = g_win ? [g_win backingScaleFactor] : 2.0;
+                            fc_bw = (unsigned)lround(atomic_load(&g_cont_w) * bs);
+                            fc_bh = (unsigned)lround(atomic_load(&g_cont_h) * bs); }
+                        if (fc_px && fpscounter_in_dumps()){
+                            fpscounter_draw(cb, screen, fc_ppp, fc_bw, fc_bh); fc_px = 0; }
+                        /* Take a readable copy BEFORE presenting: reading back from a
+                         * presented drawable's texture is not reliable. */
+                        if (dumpnow){
+                            /* recreate if the size changed (fullscreen transition) */
+                            if (g_capture && (g_capture.width != screen.width ||
+                                              g_capture.height != screen.height)) g_capture = nil;
+                            if (!g_capture){
+                                MTLTextureDescriptor *td =
+                                    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                                        MTLPixelFormatBGRA8Unorm
+                                        width:screen.width height:screen.height
+                                        mipmapped:NO];
+                                td.usage = MTLTextureUsageShaderRead;
+                                td.storageMode = MTLStorageModeShared;
+                                g_capture = [g_dev newTextureWithDescriptor:td];
+                            }
+                            if (g_capture){
+                                id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+                                [bl copyFromTexture:screen sourceSlice:0 sourceLevel:0
+                                       sourceOrigin:MTLOriginMake(0,0,0)
+                                         sourceSize:MTLSizeMake(screen.width,
+                                                                screen.height,1)
+                                          toTexture:g_capture destinationSlice:0
+                                   destinationLevel:0
+                                  destinationOrigin:MTLOriginMake(0,0,0)];
+                                [bl endEncoding];
+                            }
+                        }
+                        if (fc_px) fpscounter_draw(cb, screen, fc_ppp, fc_bw, fc_bh);
+                        { struct timespec _e1; clock_gettime(CLOCK_MONOTONIC,&_e1);
+                          unsigned long long dt =
+                              (unsigned long long)(_e1.tv_sec-_e0.tv_sec)*1000000000ull
+                            + (unsigned long long)_e1.tv_nsec - (unsigned long long)_e0.tv_nsec;
+                          atomic_fetch_add(&g_enc_ns, dt);
+                          if (gpuw_in(fno_pre)){ atomic_fetch_add(&g_encw_ns, dt); atomic_fetch_add(&g_encw_n, 1ull); } }
+                        int in_win = gpuw_in(fno_pre);
+                        int hsr_m = -1;
+                        if (g_hsr_ab == 1 && in_win){ long r = fno_pre - g_gpuw_a;
+                            if ((r % 120) >= 30) hsr_m = g_hsr_cur; }
+                        pp_end(cb);
+                        uint64_t partial_gpu_ns=g_logical_frame.gpu_ns,partial_encode_ns=g_logical_frame.encode_ns;
+                        [cb addCompletedHandler:^(id<MTLCommandBuffer> b2){
+                            mq_complete(queries,query_buffer.contents,query_buffer && b2.status==MTLCommandBufferStatusCompleted && !encode_failed);
+                            /* a frame that ended in an error: GPU times come back 0 and spoil the measurements */
+                            if (b2.status == MTLCommandBufferStatusError){
+                                unsigned long ne = atomic_fetch_add(&g_cb_err, 1ul);
+                                if (ne < 5) fprintf(stderr, "metal: COMMAND BUFFER ERROR: %s\n",
+                                                    [[b2.error localizedDescription] UTF8String]); }
+                            fb_release(fbi);        /* GPU done: the set can be reused */
+                            double g=b2.status==MTLCommandBufferStatusCompleted
+                                ?(b2.GPUEndTime-b2.GPUStartTime)*1e9+partial_gpu_ns:0;
+                            if (g > 0.0 && g < 1e9){
+                                unsigned long long ns = (unsigned long long)g;
+                                if (in_win){ atomic_fetch_add(&g_gpuw_ns, ns); atomic_fetch_add(&g_gpuw_n, 1ull); }
+                                if (ab_mode >= 0 && ab_count){ atomic_fetch_add(&g_ab_ns[ab_mode], ns); atomic_fetch_add(&g_ab_cnt[ab_mode], 1ull); }
+                                if (hsr_m >= 0){ atomic_fetch_add(&g_hsr_ns[hsr_m], ns); atomic_fetch_add(&g_hsr_cnt[hsr_m], 1ull); }
+                                atomic_fetch_add(&g_gpu_ns, ns);
+                                atomic_fetch_add(&g_gpu_n, 1ull);
+                                fpscounter_note_gpu(g / 1e6);
+                                if (g_perflog) perflog_gpu(fno_pre, g);
+                                unsigned long long mx = atomic_load(&g_gpu_max_ns);
+                                while (ns > mx &&
+                                       !atomic_compare_exchange_weak(&g_gpu_max_ns, &mx, ns)) {}
+                            } }];
+                        /* Content-rate pacing (framerate.c): at least the content
+                         * period minus half a refresh after the previous drawable,
+                         * so 60 fps on a 120 Hz panel holds every frame for exactly
+                         * two refreshes.  presentedTime feeds the interval stats. */
+                        { double hfr_present_min_duration(void);
+                          void hfr_note_presented(double);
+                          double md = hfr_present_min_duration();
+                          if(drawable){[drawable addPresentedHandler:^(id<MTLDrawable> pd){ hfr_note_presented(pd.presentedTime);
+                                                                        fpscounter_note_presented(pd.presentedTime); }];
+                          if (md > 0.0) [cb presentDrawable:drawable afterMinimumDuration:md];
+                          else [cb presentDrawable:drawable];}
+                          void hfr_note_present_call(void); hfr_note_present_call();
+                          fpscounter_note_present(); }
+                        [cb commit];
+                        g_logical_frame.active=0;g_logical_frame.drawable=nil;
+                        long fno = atomic_fetch_add(&g_frames_drawn, 1) + 1;
+                        if (g_perflog){ struct timespec _p1; clock_gettime(CLOCK_MONOTONIC, &_p1);
+                            /* number of distinct textures (+ targets) bound in the frame: the
+                             * kernel cost of a command buffer submit grows with the resource count */
+                            perflog_render_frame(fno, logical_resources,
+                                (uint64_t)(_d1.tv_sec - _d0.tv_sec) * 1000000000ull + (uint64_t)_d1.tv_nsec - (uint64_t)_d0.tv_nsec,
+                                partial_encode_ns+(uint64_t)(_p1.tv_sec - _e0.tv_sec) * 1000000000ull + (uint64_t)_p1.tv_nsec - (uint64_t)_e0.tv_nsec,
+                                logical_draws,logical_verts); }
+                        /* FPSCSV=<path>: per-frame time + workload.  To see WHERE
+                         * the stutter is without guessing. */
+                        { static FILE *fp = NULL; static int init = 0;
+                          static uint64_t prev = 0;
+                          if (!init){ init = 1; const char *e = ENVC("FPSCSV");
+                              if (e && *e){ fp = fopen(e, "w");
+                                  if (fp) fprintf(fp, "frame,ms,draws,verts,tris\n"); } }
+                          if (fp){ struct timespec _ts;
+                              clock_gettime(CLOCK_MONOTONIC, &_ts);
+                              uint64_t now = (uint64_t)_ts.tv_sec*1000000ull
+                                           + (uint64_t)_ts.tv_nsec/1000ull;
+                              if (prev) fprintf(fp, "%ld,%.2f,%u,%u,%u\n", fno,
+                                    (double)(now - prev)/1000.0,
+                                    logical_draws,logical_verts,logical_verts/3u);
+                              prev = now;
+                              if ((fno % 240) == 0) fflush(fp); } }
+                        if (dumpnow){
+                            [cb waitUntilCompleted];
+                            if (g_capture) dump_texture(g_capture, fno_pre);
+                            g_dump_cur_guest = -1;
+                            { const char *dt = ENVC("DUMPTEX");   /* comma list */
+                              for (const char *q = dt; q && *q; ){
+                                  while (*q==',' || *q==' ') q++;
+                                  if (!*q) break;
+                                  unsigned tn = (unsigned)strtoul(q, 0, 0);
+                                  dump_one_texture(tn, fno_pre*1000 + tn);
+                                  while (*q && *q != ',') q++; } }
+                        }
+                        (void)fno;
+}
+
 void metal_run_main_loop(void){
     @autoreleasepool {
         metal_early_init();
@@ -4782,7 +6439,7 @@ void metal_run_main_loop(void){
         /* Draw loop: present the queued frame at 60 Hz */
         while (!atomic_load(&g_should_quit)){
             if (quitat && atomic_load(&g_frames_drawn) >= quitat){
-                atomic_store(&g_should_quit, 1); break; }
+                metal_request_quit(); break; }
             lifecycle_tick();
             rt_free_pending();
             /* FSFAKE=<frame>[,...]: fake a fullscreen transition as THE GAME
@@ -5151,1115 +6808,15 @@ void metal_run_main_loop(void){
                 if (!have_new && atomic_load(&g_frame_pending)) g_skip_empty++;
                 if (have_new && atomic_exchange(&g_frame_pending, 0)){
                     struct timespec _d0,_d1; clock_gettime(CLOCK_MONOTONIC,&_d0);
-                    id<CAMetalDrawable> d = [g_layer nextDrawable];
+                    id<CAMetalDrawable> d=g_logical_frame.drawable;
+                    if(!d){d=[g_layer nextDrawable];if(d)g_logical_frame.drawable=d;}
                     clock_gettime(CLOCK_MONOTONIC,&_d1);
                     atomic_fetch_add(&g_wait_drawable_ns,
                       (unsigned long long)(_d1.tv_sec-_d0.tv_sec)*1000000000ull
                       + (unsigned long long)_d1.tv_nsec - (unsigned long long)_d0.tv_nsec);
                     if (d){
-                        struct timespec _e0; clock_gettime(CLOCK_MONOTONIC,&_e0);
-                        texrep_main_frame(g_queue);     /* optional texture packs (texrep.m) */
-                        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-                        pp_begin(atomic_load(&g_frames_drawn) + 1);
-                        int ab_count = 0;
-                        g_ab_mode = ab_frame(atomic_load(&g_frames_drawn) + 1, &ab_count);
-                        int ab_mode = g_ab_mode;
-                        /* Do not overwrite a buffer the GPU may still be reading:
-                         * take a free set for this frame (wait without the lock). */
-                        int fbi = fb_acquire();
-                        pthread_mutex_lock(&g_qlock);
-                        int rb = g_ready;
-                        g_enc_rb = rb;
-                        /* Release the lock HERE.  It used to be held for the
-                         * whole frame encode (0.4-2 ms) and then for the vertex
-                         * copy as well; metal_draw_raw takes the same lock per
-                         * draw, so the guest thread blocked on every draw in
-                         * that window -- and that overlap is exactly what
-                         * double buffering is for.  Safe: once g_enc_rb is set,
-                         * rb belongs to the main thread only; the guest always
-                         * writes the other one (g_cur) and metal_present does
-                         * not swap while g_enc_rb >= 0 (not even on timeout). */
-                        pthread_mutex_unlock(&g_qlock);
-                        if (rb >= 0){
-                            g_fb_vb[fbi]  = fb_fit(g_fb_vb[fbi],  sizeof(MVert)*(NSUInteger)g_vn[rb], sizeof(MVert)*MAXV);
-                            g_fb_rvb[fbi] = fb_fit(g_fb_rvb[fbi], g_rvn[rb], MAXRV);
-                            g_fb_kb[fbi]  = fb_fit(g_fb_kb[fbi],  g_kn[rb],  MAXKB);
-                        }
-                        g_mtlvb = g_fb_vb[fbi]; g_mtlrvb = g_fb_rvb[fbi]; g_mtlkb = g_fb_kb[fbi];
-                        if (rb >= 0){
-                            fb_put(g_mtlvb,  g_vbuf[rb],  sizeof(MVert)*(NSUInteger)g_vn[rb]);
-                            fb_put(g_mtlrvb, g_rvbuf[rb], g_rvn[rb]);
-                            fb_put(g_mtlkb,  g_kbuf[rb],  g_kn[rb]);
-                        }
-
-                        hd_msaa_frame(d.texture.width, d.texture.height);   /* see MSAA BY RESOLUTION */
-                        /* Draws are ordered by target; each change of target
-                         * opens a new render pass. */
-                        id<MTLRenderCommandEncoder> enc = nil;
-                        unsigned cur_t = 0xFFFFFFFFu;
-                        unsigned cur_z = 0xFFFFFFFFu;   /* the pass's Z surface */
-                        /* --- encoder state cache ----------------------------
-                         * A frame has ~1350 draws; each one bound 4 samplers,
-                         * the 532-byte constant buffer and 4 textures UNCONDITIONALLY.
-                         * Rebinding what did not change is not free in Metal. */
-                        id<MTLRenderPipelineState> c_pso = nil;
-                        unsigned c_smp[4] = {~0u,~0u,~0u,~0u};
-                        unsigned c_tex[4] = {~0u,~0u,~0u,~0u};
-                        unsigned c_bcol = ~0u;
-                        unsigned c_cull = ~0u;
-                        unsigned c_depth = ~0u;
-                        int c_zon = 0;                  /* the pass has a real Z surface */
-                        int c_ms = 0;                   /* (msaa) the pass is multisampled */
-                        int c_gb = 0;                   /* (HD research) the pass carries the G-buffer */
-                        int hd_post = 0;                /* (msaa) first copy from the screen done: post-processing stage */
-                        unsigned c_att = 0;             /* (msaa) resolve target bound to the pass: bit0 colour, bit1 G */
-                        (void)hd_post; (void)c_att;
-                        if (rb >= 0) pass_reorder(rb);  /* defer the pass that splits the scene (see PASS MERGING) */
-#if NFS_ENHANCED
-                        int hd_scene_open = 1;          /* main scene until the first copy from the screen */
-                        int hd_gb_first = 1;            /* G-buffer used for the first time this frame */
-                        int hd_refl_drawn = 0;          /* a reflection variant was drawn this frame */
-                        unsigned hd_scene_zid = 0;      /* the main scene's Z surface */
-#endif
-                        memset(g_hd_zms_used, 0, sizeof g_hd_zms_used);
-                        struct { float aref, usec, p0, p1; float proj[4]; float c[PSC_N][4]; float fogv[4]; } c_fp;
-                        int c_fp_valid = 0;
-                        unsigned c_psci = ~0u;          /* c_fp's ps-constant pool index */
-                        unsigned char touched[MAXTEX + 1];   /* bit (texture*8 + face) */
-                        memset(touched, 0, sizeof touched);
-                        int screen_touched = 0;
-
-                        long fno_pre = atomic_load(&g_frames_drawn) + 1;
-                        if (g_hsr_ab == 1 && gpuw_in(fno_pre)) g_hsr_cur = (int)(((fno_pre - g_gpuw_a) / 120) & 1);
-                        if (ENVC("FRAMELOG") && rb >= 0 && (fno_pre % 10) == 0)
-                            fprintf(stderr,"  [frame %3ld] draws=%u verts=%u\n",
-                                    fno_pre, g_dn[rb], g_vn[rb]);
-                        long dreq = atomic_exchange(&g_dump_req_frame, -1);
-                        g_dump_cur_guest = dreq;
-                        int  dumpnow = (g_dump_n && dump_wanted(fno_pre)) || dreq >= 0;
-                        /* GLYPHDUMP: every quad's screen box + UVs.
-                         * Goal: decode the TEXT the game draws to read its state. */
-                        if (ENVC("GLYPHDUMP") && dumpnow && rb >= 0){
-                            fprintf(stderr,"  [glyph] frame %ld, %u draws\n", fno_pre, g_dn[rb]);
-                            for (unsigned i = 0; i < g_dn[rb]; i++){
-                                MDraw *dr = &g_dbuf[rb][i];
-                                if (dr->count < 3) continue;
-                                MVert *v0 = &g_vbuf[rb][dr->first];
-                                float xmin=1e30f,xmax=-1e30f,ymin=1e30f,ymax=-1e30f;
-                                float umin=1e30f,vmin=1e30f,umax=-1e30f,vmax=-1e30f;
-                                for (unsigned q=0;q<dr->count;q++){
-                                    float w2 = v0[q].w != 0.f ? v0[q].w : 1.f;
-                                    float X=v0[q].x/w2, Y=v0[q].y/w2;
-                                    if(X<xmin)xmin=X; if(X>xmax)xmax=X;
-                                    if(Y<ymin)ymin=Y; if(Y>ymax)ymax=Y;
-                                    if(v0[q].t[0][0]<umin)umin=v0[q].t[0][0];
-                                    if(v0[q].t[0][0]>umax)umax=v0[q].t[0][0];
-                                    if(v0[q].t[0][1]<vmin)vmin=v0[q].t[0][1];
-                                    if(v0[q].t[0][1]>vmax)vmax=v0[q].t[0][1];
-                                }
-                                fprintf(stderr,"    G %u %.5f %.5f %.5f %.5f %.6f %.6f %.6f %.6f %.3f %.3f %.3f\n",
-                                        dr->tex, xmin,xmax,ymin,ymax, umin,umax,vmin,vmax,
-                                        v0[0].r, v0[0].g, v0[0].b);
-                            }
-                        }
-                        if (dumpnow && rb >= 0){
-                            fprintf(stderr,"  [frame %ld] %u draws, %u verts\n",
-                                    fno_pre, g_dn[rb], g_vn[rb]);
-                            { unsigned hist[16]; memset(hist,0,sizeof hist);
-                              unsigned other=0;
-                              for (unsigned q=0;q<g_dn[rb];q++){
-                                  unsigned tg=g_dbuf[rb][q].target;
-                                  if (tg<16) hist[tg]++; else other++; }
-                              fprintf(stderr,"    targets:");
-                              for (unsigned q=0;q<16;q++) if (hist[q])
-                                  fprintf(stderr," %s=%u", q?"":"screen", hist[q]),
-                                  (q? fprintf(stderr,"(tex%u)",q):0);
-                              if (other) fprintf(stderr," other=%u", other);
-                              fprintf(stderr,"\n"); }
-                            for (unsigned i = 0; i < g_dn[rb] && i < 200; i++){
-                                MDraw *dr = &g_dbuf[rb][i];
-                                fprintf(stderr,"    #%u target=%u tex=%u verts=%u blend=%05x ps=%d smp=%04x",
-                                        i, dr->target, dr->tex, dr->count, dr->blend, dr->ps, dr->smp[0]);
-                                if (dr->count >= 3){
-                                    MVert *v0 = &g_vbuf[rb][dr->first];
-                                    /* the quad's bounds + colour: to see why it is not visible */
-                                    float xmin=1e30f,xmax=-1e30f,ymin=1e30f,ymax=-1e30f;
-                                    for (unsigned q=0;q<dr->count;q++){
-                                        float w2 = v0[q].w != 0.f ? v0[q].w : 1.f;
-                                        float X = v0[q].x/w2, Y = v0[q].y/w2;
-                                        if(X<xmin)xmin=X; if(X>xmax)xmax=X;
-                                        if(Y<ymin)ymin=Y; if(Y>ymax)ymax=Y;
-                                    }
-                                    fprintf(stderr,"  x[%.3g..%.3g] y[%.3g..%.3g]"
-                                            " colour=(%.2g %.2g %.2g a=%.2g) uv=(%.3g,%.3g)",
-                                            xmin,xmax,ymin,ymax,
-                                            v0[0].r,v0[0].g,v0[0].b,v0[0].a, v0[0].t[0][0], v0[0].t[0][1]);
-                                }
-                                fprintf(stderr,"\n");
-                            }
-                        }
-                        /* SLIVER=1: find triangles that span the screen but
-                         * have an area close to zero.  The 1-pixel diagonal
-                         * lines on screen come from these; we measure which
-                         * draw call produces them instead of guessing. */
-                        /* DRAWV=<n>: print ALL vertices of draw number n.
-                         * Whether two triangles have a seam on their shared
-                         * edge can only be told from the raw values. */
-                        /* DRAWSUM: group the frame's draws by the key
-                         * (target,texture,ps,blend).  Shows the structure at a
-                         * glance instead of thousands of lines. */
-                        if (rb >= 0 && ENVC("DRAWSUM") && dump_wanted(fno_pre)){
-                            typedef struct { unsigned tg,tx,t1,t2,bl,sm; int ps;
-                                             unsigned nd,nv; float x0,x1,y0,y1; } Grp;
-                            static Grp gp[192]; int gn = 0;
-                            for (unsigned i = 0; i < g_dn[rb]; i++){
-                                MDraw *dr = &g_dbuf[rb][i];
-                                int k = -1;
-                                for (int q=0;q<gn;q++)
-                                    if (gp[q].tg==dr->target && gp[q].tx==dr->tex &&
-                                        gp[q].t1==dr->tex1 && gp[q].t2==dr->tex2 &&
-                                        gp[q].bl==dr->blend && gp[q].ps==dr->ps &&
-                                        gp[q].sm==dr->smp[0]) { k=q; break; }
-                                if (k < 0){ if (gn >= 192) continue; k = gn++;
-                                    gp[k].tg=dr->target; gp[k].tx=dr->tex; gp[k].bl=dr->blend;
-                                    gp[k].t1=dr->tex1; gp[k].t2=dr->tex2;
-                                    gp[k].ps=dr->ps; gp[k].sm=dr->smp[0];
-                                    gp[k].nd=gp[k].nv=0;
-                                    gp[k].x0=gp[k].y0=1e30f; gp[k].x1=gp[k].y1=-1e30f; }
-                                gp[k].nd++; gp[k].nv += dr->count;
-                                if (dr->vsid <= 0 && dr->count >= 3){
-                                    MVert *v0 = &g_vbuf[rb][dr->first];
-                                    for (unsigned q=0;q<dr->count;q++){
-                                        float w2 = v0[q].w != 0.f ? v0[q].w : 1.f;
-                                        float X=v0[q].x/w2, Y=v0[q].y/w2;
-                                        if(X<gp[k].x0)gp[k].x0=X; if(X>gp[k].x1)gp[k].x1=X;
-                                        if(Y<gp[k].y0)gp[k].y0=Y; if(Y>gp[k].y1)gp[k].y1=Y;
-                                    }
-                                }
-                            }
-                            fprintf(stderr,"  [summary] frame %ld: %u draws, %d groups\n",
-                                    fno_pre, g_dn[rb], gn);
-                            for (int pass=0; pass<gn && pass<192; pass++){
-                                int best=-1; unsigned bv=0;
-                                for (int q=0;q<gn;q++) if (gp[q].nv>bv){ bv=gp[q].nv; best=q; }
-                                if (best<0) break;
-                                Grp *g = &gp[best];
-                                { unsigned tw=0,th=0,dw=0,dh=0;
-                                  if (g->tx && g->tx<MAXTEX && g_tex[g->tx]){
-                                      tw=(unsigned)g_tex[g->tx].width; th=(unsigned)g_tex[g->tx].height; }
-                                  if (g->tg && g->tg<MAXTEX && g_tex[g->tg]){
-                                      dw=(unsigned)g_tex[g->tg].width; dh=(unsigned)g_tex[g->tg].height; }
-                                  unsigned aw=0,ah=0;
-                                  if (g->t1 && g->t1<MAXTEX && g_tex[g->t1]){
-                                      aw=(unsigned)g_tex[g->t1].width; ah=(unsigned)g_tex[g->t1].height; }
-                                  fprintf(stderr,"    target=%u(%ux%u) tex=%u(%ux%u) tex1=%u(%ux%u) tex2=%u"
-                                        " ps=%d blend=%05x smp=%04x  %u draws %u verts\n",
-                                        g->tg,dw,dh,g->tx,tw,th,g->t1,aw,ah,g->t2,
-                                        g->ps,g->bl,g->sm,g->nd,g->nv); }
-                                g->nv = 0;
-                            }
-                        }
-                        /* DRAWLIST=1 (with DUMPFRAME): every draw's full state +
-                         * constant hashes; to find the first differing draw of two runs. */
-                        if (rb >= 0 && ENVC("DRAWLIST") && dumpnow){   /* also at script dumps */
-                            for (unsigned di = 0; di < g_dn[rb]; di++){
-                                MDraw *dr = &g_dbuf[rb][di];
-                                uint64_t hp = 1469598103934665603ull, hk = 1469598103934665603ull;
-                                const uint8_t *pp = (const uint8_t *)g_pscb[rb][dr->psci];
-                                for (size_t q = 0; q < sizeof g_pscb[rb][0]; q++){ hp ^= pp[q]; hp *= 1099511628211ull; }
-                                if (dr->vsid > 0 && g_kbuf[rb]){
-                                    const uint8_t *kp = (const uint8_t *)g_kbuf[rb] + dr->koff;
-                                    for (unsigned q = 0; q < dr->ksz && dr->koff + q < MAXKB; q++){ hk ^= kp[q]; hk *= 1099511628211ull; }
-                                }
-                                fprintf(stderr,"  [dl] %4u t=%x z=%x cull=%u bl=%05x ps=%d vs=%d tx=%u,%u,%u,%u n=%u clr=%u blit=%u psc=%016llx vk=%016llx\n",
-                                        di, dr->target, dr->depth, dr->cull, dr->blend, dr->ps, dr->vsid,
-                                        dr->tex, dr->tex1, dr->tex2, dr->tex3, dr->count, dr->is_clear, dr->is_blit,
-                                        (unsigned long long)hp, (unsigned long long)hk);
-                            }
-                        }
-                        if (rb >= 0 && ENVC("DRAWV") && dump_wanted(fno_pre)){
-                            unsigned di = (unsigned)atoi(ENVC("DRAWV"));
-                            if (di < g_dn[rb]){
-                                MDraw *dr = &g_dbuf[rb][di];
-                                fprintf(stderr,"  [verts] draw#%u vsid=%d verts=%u tex=%u\n",
-                                        di, dr->vsid, dr->count, dr->tex);
-                                if (dr->vsid <= 0){
-                                    MVert *v0 = &g_vbuf[rb][dr->first];
-                                    for (unsigned q = 0; q < dr->count && q < 12; q++)
-                                        fprintf(stderr,"    v%u  pos=(%.9g, %.9g, %.9g, %.9g)"
-                                                "  uv0=(%.9g, %.9g)\n", q,
-                                                v0[q].x, v0[q].y, v0[q].z, v0[q].w,
-                                                v0[q].t[0][0], v0[q].t[0][1]);
-                                }
-                            }
-                        }
-#if NFS_ENHANCED
-                        if (rb >= 0 && ENVC("HD_RTPROBE") && dump_wanted(fno_pre))
-                            hd_rt_probe(rb, d.texture, fno_pre);
-                        g_hd_dump_now = dump_wanted(fno_pre);
-                        /* CAMLOG=1 (with DUMPFRAME): the frame's camera + the vertex
-                         * constants of the first few draws of world geometry. */
-                        if (rb >= 0 && ENVC("CAMLOG") && dump_wanted(fno_pre)){
-                            fprintf(stderr, "  [camera] frame %ld valid=%d\n", fno_pre, g_hd_cam_ok[rb]);
-                            static const char *mn[3] = { "view", "projection", "product" };
-                            for (int m = 0; m < 3; m++){
-                                fprintf(stderr, "    %s\n", mn[m]);
-                                for (int r = 0; r < 4; r++)
-                                    fprintf(stderr, "      %11.5f %11.5f %11.5f %11.5f\n",
-                                            g_hd_cam[rb][m*16+r*4], g_hd_cam[rb][m*16+r*4+1],
-                                            g_hd_cam[rb][m*16+r*4+2], g_hd_cam[rb][m*16+r*4+3]); }
-                            int shown = 0;
-                            for (unsigned di = 0; di < g_dn[rb] && shown < 4; di++){
-                                MDraw *dr = &g_dbuf[rb][di];
-                                if (dr->target || dr->vsid <= 0 || dr->is_clear || dr->is_blit || dr->count < 30) continue;
-                                const float *k = (const float *)(g_kbuf[rb] + dr->koff + 16);
-                                unsigned nk = (dr->ksz - 16u) / 16u; if (nk > 16) nk = 16;
-                                fprintf(stderr, "    draw#%u ps=%d vs=%d verts=%u constants c0..c%u:\n",
-                                        di, dr->ps, dr->vsid, dr->count, nk ? nk-1 : 0);
-                                for (unsigned q = 0; q < nk; q++)
-                                    fprintf(stderr, "      c%-2u %11.5f %11.5f %11.5f %11.5f\n", q,
-                                            k[q*4], k[q*4+1], k[q*4+2], k[q*4+3]);
-                                shown++;
-                            }
-                        }
-#endif
-                        /* DRAWVPS=<ps>: dump the vertices of ALL draws that use that
-                         * shader, together with all four texture coordinate sets. */
-                        if (rb >= 0 && ENVC("DRAWVPS") && dump_wanted(fno_pre)){
-                            int want = atoi(ENVC("DRAWVPS"));
-                            for (unsigned di = 0; di < g_dn[rb]; di++){
-                                MDraw *dr = &g_dbuf[rb][di];
-                                if (dr->ps != want) continue;
-                                fprintf(stderr,"  [verts-ps] draw#%u ps=%d vsid=%d verts=%u target=%u tex=%u,%u,%u,%u\n",
-                                        di, dr->ps, dr->vsid, dr->count, dr->target,
-                                        dr->tex, dr->tex1, dr->tex2, dr->tex3);
-                                if (dr->vsid > 0) continue;
-                                MVert *v0 = &g_vbuf[rb][dr->first];
-                                for (unsigned q = 0; q < dr->count && q < 6; q++)
-                                    fprintf(stderr,"    v%u pos=(%.5g,%.5g,%.5g,%.5g) t0=(%.6g,%.6g) t1=(%.6g,%.6g)"
-                                            " t2=(%.6g,%.6g) t3=(%.6g,%.6g)\n", q,
-                                            v0[q].x, v0[q].y, v0[q].z, v0[q].w,
-                                            v0[q].t[0][0], v0[q].t[0][1], v0[q].t[1][0], v0[q].t[1][1],
-                                            v0[q].t[2][0], v0[q].t[2][1], v0[q].t[3][0], v0[q].t[3][1]);
-                            }
-                        }
-                        if (rb >= 0 && ENVC("PSHIST") && dump_wanted(fno_pre)){
-                            /* Draw/triangle count per ps within the frame.  The
-                             * DRAWSUM group table fills up at 192 and the LAST
-                             * passes were not listed; this histogram covers all. */
-                            struct { int ps; unsigned nd, nv, bl; } h[128]; int hn = 0;
-                            for (unsigned i = 0; i < g_dn[rb]; i++){
-                                MDraw *dr = &g_dbuf[rb][i];
-                                int k = -1;
-                                for (int q = 0; q < hn; q++) if (h[q].ps == dr->ps){ k = q; break; }
-                                if (k < 0){ if (hn >= 128) continue; k = hn++;
-                                            h[k].ps = dr->ps; h[k].nd = h[k].nv = 0;
-                                            h[k].bl = dr->blend; }
-                                h[k].nd++; h[k].nv += dr->count;
-                            }
-                            fprintf(stderr, "  [pshist] frame %ld: %u draws, %d distinct ps\n",
-                                    fno_pre, g_dn[rb], hn);
-                            for (int q = 0; q < hn; q++)
-                                fprintf(stderr, "     ps=%-4d %5u draws %7u verts  blend=%05x\n",
-                                        h[q].ps, h[q].nd, h[q].nv, h[q].bl);
-                        }
-                        if (rb >= 0 && ENVC("SLIVER") && dump_wanted(fno_pre)){
-                            int nrep = 0;
-                            for (unsigned i = 0; i < g_dn[rb] && nrep < 24; i++){
-                                MDraw *dr = &g_dbuf[rb][i];
-                                if (dr->vsid > 0 || dr->count < 3) continue;
-                                MVert *v0 = &g_vbuf[rb][dr->first];
-                                for (unsigned t = 0; t + 2 < dr->count && nrep < 24; t += 3){
-                                    float X[3], Y[3];
-                                    for (int q = 0; q < 3; q++){
-                                        float w2 = v0[t+q].w != 0.f ? v0[t+q].w : 1.f;
-                                        X[q] = v0[t+q].x / w2; Y[q] = v0[t+q].y / w2;
-                                    }
-                                    float ar = 0.5f * fabsf((X[1]-X[0])*(Y[2]-Y[0]) -
-                                                            (X[2]-X[0])*(Y[1]-Y[0]));
-                                    float sp = 0.f;
-                                    for (int q = 0; q < 3; q++){
-                                        int r2 = (q+1)%3;
-                                        float dx = X[r2]-X[q], dy = Y[r2]-Y[q];
-                                        float L = sqrtf(dx*dx+dy*dy); if (L > sp) sp = L;
-                                    }
-                                    if (sp > 0.5f && ar < 2e-4f){
-                                        nrep++;
-                                        fprintf(stderr,"  [sliver] draw#%u tri%u tex=%u"
-                                                " blend=%05x ps=%d verts=%u  length=%.3f area=%.2e\n"
-                                                "      (%.4f,%.4f) (%.4f,%.4f) (%.4f,%.4f)"
-                                                "  colour=(%.2f %.2f %.2f a=%.2f)\n",
-                                                i, t/3, dr->tex, dr->blend, dr->ps, dr->count,
-                                                sp, ar, X[0],Y[0], X[1],Y[1], X[2],Y[2],
-                                                v0[t].r, v0[t].g, v0[t].b, v0[t].a);
-                                    }
-                                }
-                            }
-                            if (!nrep) fprintf(stderr,"  [sliver] frame %ld: none found\n", fno_pre);
-                        }
-                        if (rb >= 0 && g_pso){
-                            for (unsigned i = 0; i < g_dn[rb]; i++){
-                                MDraw *dr = &g_dbuf[rb][i];
-                                { static int sk = -2;
-                                  if (sk == -2){ const char *e=ENVC("SKIPDRAW"); sk = e?atoi(e):-1; }
-                                  if (sk >= 0 && (int)i == sk) continue; }
-                                /* SKIPPS=<n>[,<n>...]: skip ALL draws that use this
-                                 * pixel shader.  The most direct way to isolate what
-                                 * one pass contributes. */
-                                { static int spinit = 0; static int sps[16]; static int spn = 0;
-                                  if (!spinit){ spinit = 1;
-                                    const char *e = ENVC("SKIPPS");
-                                    for (const char *q = e; q && *q && spn < 16; ){
-                                        while (*q==',' || *q==' ') q++;
-                                        if (!*q) break;
-                                        sps[spn++] = atoi(q);
-                                        while (*q && *q != ',') q++; } }
-                                  int skip = 0;
-                                  for (int q = 0; q < spn; q++) if (sps[q] == dr->ps) skip = 1;
-                                  if (skip) continue; }
-                                if (dr->is_blit){
-                                    /* valid or not: hd_ms_end may have seen this copy and not stored the samples */
-                                    if (!dr->blit_src && hd_mslazy() && (NFS_ENHANCED || hd_msaa_n() > 1)) hd_post = 1;
-                                    /* Resolve the source/target texture; screen = drawable */
-                                    id<MTLTexture> st2 = dr->blit_src
-                                        ? ((dr->blit_src < MAXTEX) ? g_tex[dr->blit_src] : nil)
-                                        : d.texture;
-                                    id<MTLTexture> dt2 = dr->target
-                                        ? ((TGT_ID(dr->target) < MAXTEX)
-                                             ? g_tex[TGT_ID(dr->target)] : nil)
-                                        : d.texture;
-                                    if (st2 && dt2 && st2 != dt2){
-                                        if (ENVC("BLITLOG")){
-                                            static unsigned seen[32]; static int sn = 0;
-                                            unsigned key = (dr->blit_src<<16) ^ dr->target;
-                                            int nw = 1;
-                                            for (int q=0;q<sn;q++) if (seen[q]==key) nw = 0;
-                                            if (nw && sn < 32){ seen[sn++] = key;
-                                                fprintf(stderr,"  [blit] texture %u (%lux%lu) -> texture %u (%lux%lu)  scale %.2fx\n",
-                                                    dr->blit_src,(unsigned long)st2.width,(unsigned long)st2.height,
-                                                    dr->target,(unsigned long)dt2.width,(unsigned long)dt2.height,
-                                                    (double)st2.width/(double)(dt2.width?dt2.width:1)); }
-                                        }
-                                        if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
-                                                  [enc endEncoding]; enc = nil; cur_t = 0xFFFFFFFFu; cur_z = 0xFFFFFFFFu;
-                                                  if (pe) hd_ms_fallback(cb, d.texture, pe); }
-#if NFS_ENHANCED
-                                        /* SSR composite: the main scene is copied from the screen for
-                                         * the FIRST time (post-processing begins).  Scene + G-buffer + Z are ready. */
-                                        if (st2 == d.texture && hd_scene_open){
-                                            hd_scene_open = 0;
-                                            hd_composite(cb, rb, i, d.texture, hd_scene_zid, hd_refl_drawn);
-                                        }
-#endif
-                                        /* MSAA: the screen contents live in the multisampled
-                                         * texture.  A copy written straight to the drawable
-                                         * would be OVERWRITTEN by the next screen pass's
-                                         * resolve; draw the copy into the multisampled
-                                         * texture as a quad and resolve. */
-                                        if (dt2 == d.texture && hd_msaa_n() > 1 && hd_pso_ms() && !hd_post){
-                                            g_hd_mscol = hd_ms_tex(g_hd_mscol, d.texture.pixelFormat,
-                                                                   d.texture.width, d.texture.height);
-                                            MTLRenderPassDescriptor *mp =
-                                                [MTLRenderPassDescriptor renderPassDescriptor];
-                                            mp.colorAttachments[0].texture = g_hd_mscol;
-                                            mp.colorAttachments[0].resolveTexture = d.texture;
-                                            mp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-                                            mp.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
-                                            pp_rp(mp, "blit -> screen (MSAA quad)");
-                                            id<MTLRenderCommandEncoder> me =
-                                                [cb renderCommandEncoderWithDescriptor:mp];
-                                            [me setRenderPipelineState:hd_pso_ms()];
-                                            [me setVertexBuffer:g_blitvb offset:0 atIndex:0];
-                                            [me setFragmentSamplerState:g_samp atIndex:0];
-                                            [me setFragmentTexture:st2 atIndex:0];
-                                            { struct { float aref, usec, p0, p1; float proj[4]; float c[PSC_N][4]; float fogv[4]; } bf;
-                                              memset(&bf, 0, sizeof bf);
-                                              [me setFragmentBytes:&bf length:sizeof bf atIndex:0]; }
-                                            [me drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
-                                            [me endEncoding];
-                                            screen_touched = 1;
-                                            atomic_fetch_add(&g_hd_msblit, 1ull);
-                                            continue;
-                                        }
-                                        /* At 1:1 and the same format use a REAL copy.
-                                         * SAMPLING the drawable with a fullscreen quad
-                                         * gave stale contents at tile (32x32) borders:
-                                         * a rectangular mosaic in the sky and on glass
-                                         * facades.  (Measured: the block edges sit at
-                                         * exact multiples of 32/64 pixels.)  copyFromTexture
-                                         * is both correct and cheaper. */
-                                        if (st2.width == dt2.width && st2.height == dt2.height &&
-                                            st2.pixelFormat == dt2.pixelFormat &&
-                                            !ENVC("BLITQUAD")){
-                                            id<MTLBlitCommandEncoder> bc = pp_blit(cb, "blit (same-size copy)");
-                                            [bc copyFromTexture:st2 sourceSlice:0 sourceLevel:0
-                                                   sourceOrigin:MTLOriginMake(0,0,0)
-                                                     sourceSize:MTLSizeMake(st2.width, st2.height, 1)
-                                                      toTexture:dt2 destinationSlice:0
-                                               destinationLevel:0
-                                              destinationOrigin:MTLOriginMake(0,0,0)];
-                                            [bc endEncoding];
-                                            if (dr->target){ unsigned tk_=TGT_ID(dr->target)*8u+TGT_FACE(dr->target);
-                                                     touched[tk_>>3] |= 1u<<(tk_&7); }
-                                            else screen_touched = 1;
-                                            continue;
-                                        }
-                                        /* Scaled blit: sampling the drawable
-                                         * DIRECTLY gives stale contents at tile
-                                         * borders (32/64 px mosaic).  First
-                                         * take a real copy into a scratch
-                                         * texture, then sample that, scaled. */
-                                        if (st2 == d.texture){
-                                            static id<MTLTexture> scratch;
-                                            if (!scratch || scratch.width != st2.width ||
-                                                scratch.height != st2.height ||
-                                                scratch.pixelFormat != st2.pixelFormat){
-                                                MTLTextureDescriptor *sd2 =
-                                                  [MTLTextureDescriptor
-                                                    texture2DDescriptorWithPixelFormat:st2.pixelFormat
-                                                    width:st2.width height:st2.height mipmapped:NO];
-                                                sd2.usage = MTLTextureUsageShaderRead |
-                                                            MTLTextureUsageRenderTarget;
-                                                sd2.storageMode = MTLStorageModePrivate;
-                                                scratch = [g_dev newTextureWithDescriptor:sd2];
-                                            }
-                                            if (scratch){
-                                                id<MTLBlitCommandEncoder> bc2 = pp_blit(cb, "blit (scratch copy)");
-                                                [bc2 copyFromTexture:st2 sourceSlice:0 sourceLevel:0
-                                                        sourceOrigin:MTLOriginMake(0,0,0)
-                                                          sourceSize:MTLSizeMake(st2.width,st2.height,1)
-                                                           toTexture:scratch destinationSlice:0
-                                                    destinationLevel:0
-                                                   destinationOrigin:MTLOriginMake(0,0,0)];
-                                                [bc2 endEncoding];
-                                                st2 = scratch;
-                                            }
-                                        }
-                                        MTLRenderPassDescriptor *bp =
-                                            [MTLRenderPassDescriptor renderPassDescriptor];
-                                        bp.colorAttachments[0].texture = dt2;
-                                        bp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
-                                        bp.colorAttachments[0].storeAction = MTLStoreActionStore;
-                                        { char pn[48]; snprintf(pn, sizeof pn, "blit quad -> %lux%lu", (unsigned long)dt2.width, (unsigned long)dt2.height);
-                                          pp_rp(bp, pn); }
-                                        id<MTLRenderCommandEncoder> be =
-                                            [cb renderCommandEncoderWithDescriptor:bp];
-                                        [be setRenderPipelineState:g_pso];
-                                        [be setVertexBuffer:g_blitvb offset:0 atIndex:0];
-                                        [be setFragmentSamplerState:g_samp atIndex:0];
-                                        [be setFragmentTexture:st2 atIndex:0];
-                                        { struct { float aref, usec, p0, p1; float proj[4]; float c[PSC_N][4]; float fogv[4]; } bf;
-                                          memset(&bf, 0, sizeof bf);
-                                          [be setFragmentBytes:&bf length:sizeof bf atIndex:0]; }
-                                        [be drawPrimitives:MTLPrimitiveTypeTriangle
-                                               vertexStart:0 vertexCount:6];
-                                        [be endEncoding];
-                                        if (dr->target){ unsigned tk_=TGT_ID(dr->target)*8u+TGT_FACE(dr->target);
-                                                     touched[tk_>>3] |= 1u<<(tk_&7); }
-                                        else screen_touched = 1;
-                                    }
-                                    continue;
-                                }
-                                /* Clear(ZBUFFER): clear that Z surface at the start
-                                 * of the next pass.  If a pass with the same surface
-                                 * is open, close it so the clear order is kept. */
-                                if (dr->is_clear && (dr->clr_flags & 2u)){
-                                    unsigned zc = DEPTH_ZID(dr->depth);
-                                    if (zc && zc < MAXZ){
-                                        g_zpend[zc] = 1;
-                                        g_zpend_v[zc] = dr->clr_z < 0.f ? 0.f : dr->clr_z > 1.f ? 1.f : dr->clr_z;
-                                        /* the multisampled twin consumes its own clear separately */
-                                        if (zc < 64u){ g_hd_zpend_ms[zc] = 1; g_hd_zpend_msv[zc] = g_zpend_v[zc]; }
-                                        if (enc && cur_z == zc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
-                                                  [enc endEncoding]; enc = nil; cur_t = 0xFFFFFFFFu;
-                                                  if (pe) hd_ms_fallback(cb, d.texture, pe); }
-                                    }
-                                }
-#if NFS_ENHANCED
-                                /* HD blur draw: from a road target to a road target.
-                                 * If the source's mips are stale, close the pass,
-                                 * generate them, reopen with the same target (Load). */
-                                int hd_blur = !dr->is_clear && hd_is_road(dr->tex) &&
-                                              hd_is_road(TGT_ID(dr->target));
-                                if (hd_blur && g_hd_dirty[dr->tex]){
-                                    if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
-                                              [enc endEncoding]; enc = nil; cur_t = 0xFFFFFFFFu;
-                                              if (pe) hd_ms_fallback(cb, d.texture, pe); }
-                                    id<MTLBlitCommandEncoder> mb = pp_blit(cb, "road reflection mip generation");
-                                    [mb generateMipmapsForTexture:g_tex[dr->tex]];
-                                    [mb endEncoding];
-                                    g_hd_dirty[dr->tex] = 0;
-                                    atomic_fetch_add(&g_hd_mipgen, 1ull);
-                                }
-#endif
-                                /* see PASS MERGING: a draw that does not use Z does not split the pass over its Z surface */
-                                int zsplit = DEPTH_ZID(dr->depth) != cur_z &&
-                                             !(enc && pass_merge_on() && !dr->is_clear && !(dr->depth & 3u));
-                                /* a screen pass with only Clears in it: do not open it (the Z clear was recorded above) */
-                                if (!enc || dr->target != cur_t || zsplit)
-                                    if (!hd_post && !screen_touched && pass_clear_only(rb, i)) continue;
-                                if (dr->target != cur_t || zsplit){
-                                    if (enc){ int pe = hd_ms_end(enc, rb, i, c_ms, c_gb, c_att);
-                                              [enc endEncoding]; enc = nil;
-                                              if (pe) hd_ms_fallback(cb, d.texture, pe); }
-#if NFS_ENHANCED
-                                    if (hd_is_road(TGT_ID(dr->target))) g_hd_dirty[TGT_ID(dr->target)] = 1;
-#endif
-                                    id<MTLTexture> tgt = d.texture;
-                                    if (dr->target) freed_use(TGT_ID(dr->target), 1);
-                                    if (dr->target && TGT_ID(dr->target) < MAXTEX &&
-                                        g_tex[TGT_ID(dr->target)])
-                                        tgt = g_tex[TGT_ID(dr->target)];
-                                    unsigned tk0 = TGT_ID(dr->target)*8u + TGT_FACE(dr->target);
-                                    int first_use = dr->target
-                                        ? !(touched[tk0>>3] & (1u<<(tk0&7)))
-                                        : !screen_touched;
-                                    MTLRenderPassDescriptor *rp =
-                                        [MTLRenderPassDescriptor renderPassDescriptor];
-                                    rp.colorAttachments[0].texture = tgt;
-                                    if (TGT_FACE(dr->target))
-                                        rp.colorAttachments[0].slice = TGT_FACE(dr->target) - 1u;
-                                    rp.colorAttachments[0].loadAction =
-                                        first_use ? MTLLoadActionClear : MTLLoadActionLoad;
-                                    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-                                    rp.colorAttachments[0].clearColor = MTLClearColorMake(
-                                        atomic_load(&g_clear_r), atomic_load(&g_clear_g),
-                                        atomic_load(&g_clear_b), 1.0);
-                                    c_ms = 0;
-                                    int c_ml = 0;                   /* see MEMORYLESS MSAA ATTACHMENTS */
-                                    g_hd_msp.on = 0; g_hd_msp.ml = 0; g_hd_msp.dz = 0;
-                                    if (!dr->target && hd_msaa_n() > 1 && !hd_post){
-                                        unsigned zq = DEPTH_ZID(dr->depth);
-                                        /* no attachment will be loaded (colour first use, G first
-                                         * time, depth to be cleared) and no sample will be stored */
-                                        c_ml = hd_ms_memless() && first_use &&
-#if NFS_ENHANCED
-                                               (hd_gb_first || !(hd_scene_open && hd_ssr_on())) &&
-#endif
-                                               !(zq && zq < 64u && g_hd_msz_seen[zq] && g_hd_msz_kept[zq] &&
-                                                 !g_hd_zpend_ms[zq]) &&
-                                               hd_ms_memless_ok(rb, i);
-                                        id<MTLTexture> msc;
-                                        if (c_ml) msc = g_hd_mscol_ml = hd_ms_tex_ml(g_hd_mscol_ml, tgt.pixelFormat,
-                                                                                     tgt.width, tgt.height);
-                                        else      msc = g_hd_mscol = hd_ms_tex(g_hd_mscol, tgt.pixelFormat,
-                                                                               tgt.width, tgt.height);
-                                        if (!msc) c_ml = 0;
-                                        if (msc){
-                                            c_ms = 1;
-                                            c_att = hd_ms_predict(rb, i);
-                                            if (c_ml) atomic_fetch_add(&g_hd_ml_pass, 1ull);
-                                            rp.colorAttachments[0].texture = msc;
-                                            if (c_att & 1u) rp.colorAttachments[0].resolveTexture = tgt;
-                                            rp.colorAttachments[0].storeAction =
-                                                  c_ml ? ((c_att & 1u) ? MTLStoreActionMultisampleResolve   /* memoryless: final */
-                                                                       : MTLStoreActionDontCare)
-                                                : hd_mslazy() ? MTLStoreActionUnknown             /* at close: hd_ms_end */
-                                                : MTLStoreActionStoreAndMultisampleResolve;
-                                            atomic_fetch_add(&g_hd_mspass, 1ull);
-                                        }
-                                    }
-                                    c_gb = 0;
-#if NFS_ENHANCED
-                                    if (!dr->target && hd_scene_open && hd_ssr_on()){
-                                        NSUInteger ns = c_ms ? (NSUInteger)hd_msaa_n() : 1u;
-                                        for (int gi = 0; gi < HD_NG; gi++){
-                                            g_hd_g[gi] = hd_tex(g_hd_g[gi], hd_gfmt(gi), tgt.width, tgt.height, 1);
-                                            if (ns > 1 && c_ml) g_hd_gms_ml[gi] = hd_ms_tex_ml(g_hd_gms_ml[gi], hd_gfmt(gi), tgt.width, tgt.height);
-                                            else if (ns > 1) g_hd_gms[gi] = hd_tex(g_hd_gms[gi], hd_gfmt(gi), tgt.width, tgt.height, ns);
-                                        }
-                                        for (int gi = 0; gi < HD_NG; gi++){
-                                            MTLRenderPassColorAttachmentDescriptor *ga = rp.colorAttachments[1 + gi];
-                                            ga.texture = (ns > 1) ? (c_ml ? g_hd_gms_ml[gi] : g_hd_gms[gi]) : g_hd_g[gi];
-                                            if (ns > 1){ if (c_att & 2u) ga.resolveTexture = g_hd_g[gi];
-                                                         ga.storeAction = c_ml ? ((c_att & 2u) ? MTLStoreActionMultisampleResolve
-                                                                                                : MTLStoreActionDontCare)
-                                                                       : hd_mslazy() ? MTLStoreActionUnknown
-                                                                       : MTLStoreActionStoreAndMultisampleResolve; }
-                                            else ga.storeAction = MTLStoreActionStore;
-                                            ga.loadAction = hd_gb_first ? MTLLoadActionClear : MTLLoadActionLoad;
-                                            ga.clearColor = (gi == 2 && hd_gpack())     /* packed: zero direction = 512 */
-                                                ? MTLClearColorMake(512.0 / 1023.0, 512.0 / 1023.0, 512.0 / 1023.0, 0)
-                                                : MTLClearColorMake(0, 0, 0, 0);
-                                        }
-                                        hd_gb_first = 0;
-                                        hd_scene_zid = DEPTH_ZID(dr->depth);
-                                        c_gb = 1;
-                                    }
-#endif
-                                    /* Z: the bound Z surface's own texture (see g_ztex).
-                                     * With no surface, or one whose size does not match
-                                     * the target, a scratch texture is bound and the Z
-                                     * test is turned off (the pipelines always expect
-                                     * Depth32Float). */
-                                    unsigned zid = DEPTH_ZID(dr->depth);
-                                    id<MTLTexture> ztex = nil;
-                                    int zclear = 0; float zval = 1.f;
-                                    if (zid && zid < MAXZ){
-                                        if (atomic_exchange(&g_zforget[zid], 0)){ g_ztex[zid] = nil;
-                                            if (zid < 64u){ g_hd_msz[zid] = nil; g_hd_msz_seen[zid] = 0; g_hd_msz_kept[zid] = 0; }
-                                        }
-                                        id<MTLTexture> zt = g_ztex[zid];
-                                        if (!zt || zt.width != tgt.width || zt.height != tgt.height){
-                                            /* the implicit surface (1) is sized with the screen;
-                                             * created surfaces with the target they are first
-                                             * used with.  Later use with a target of another
-                                             * size: scratch. */
-                                            if (!zt || zid == 1u){
-                                                MTLTextureDescriptor *zd =
-                                                    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
-                                                        MTLPixelFormatDepth32Float
-                                                        width:tgt.width height:tgt.height mipmapped:NO];
-                                                zd.usage = MTLTextureUsageRenderTarget
-#if NFS_ENHANCED
-                                                         | MTLTextureUsageShaderRead   /* SSR reads the depth */
-#endif
-                                                         ;
-                                                zd.storageMode = MTLStorageModePrivate;
-                                                g_ztex[zid] = zt = [g_dev newTextureWithDescriptor:zd];
-                                                zclear = 1;
-                                            } else { zt = nil; atomic_fetch_add(&g_z_mismatch, 1ull); }
-                                        }
-                                        ztex = zt;
-                                        if (ztex && g_zpend[zid] && !c_ms){ zclear = 1; zval = g_zpend_v[zid]; g_zpend[zid] = 0; }
-                                    }
-                                    if (!ztex){
-                                        if (!zid) atomic_fetch_add(&g_z_null, 1ull);
-                                        if (!g_depth_tex ||
-                                            g_depth_tex.width  != tgt.width ||
-                                            g_depth_tex.height != tgt.height){
-                                            MTLTextureDescriptor *zd =
-                                                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
-                                                    MTLPixelFormatDepth32Float
-                                                    width:tgt.width height:tgt.height mipmapped:NO];
-                                            zd.usage = MTLTextureUsageRenderTarget;
-                                            zd.storageMode = MTLStorageModePrivate;
-                                            g_depth_tex = [g_dev newTextureWithDescriptor:zd];
-                                        }
-                                    }
-                                    id<MTLTexture> zres = nil;     /* depth resolve target (msaa) */
-                                    if (c_ms){
-                                        if (ztex && zid < 64u){
-                                            zres = ztex;
-                                            /* wants to load without a clear, but the last pass did not store */
-                                            int lost = g_hd_msz_seen[zid] && !g_hd_msz_kept[zid] && !g_hd_zpend_ms[zid];
-                                            if (c_ml){
-                                                g_hd_msz_ml = hd_ms_tex_ml(g_hd_msz_ml, MTLPixelFormatDepth32Float,
-                                                                           tgt.width, tgt.height);
-                                                ztex = g_hd_msz_ml;
-                                                zclear = 1;                     /* memoryless: always cleared */
-                                            } else {
-                                                id<MTLTexture> old = g_hd_msz[zid];
-                                                g_hd_msz[zid] = hd_ms_tex(old, MTLPixelFormatDepth32Float,
-                                                                          tgt.width, tgt.height);
-                                                zclear = (g_hd_msz[zid] != old);       /* new: undefined */
-                                                ztex = g_hd_msz[zid];
-                                            }
-                                            zval = 1.f;
-                                            if (g_hd_zpend_ms[zid]){ zclear = 1; zval = g_hd_zpend_msv[zid]; g_hd_zpend_ms[zid] = 0; }
-                                            if (lost){ zclear = 1; atomic_fetch_add(&g_hd_mszlost, 1ull); }
-                                            g_hd_msz_seen[zid] = 1;
-                                            g_hd_zms_used[zid] = 1;
-                                            g_hd_msp.dz = 1; g_hd_msp.zid = zid; g_hd_msp.zclr = zclear;
-                                        } else {
-                                            /* screen pass without depth: always Clear + DontCare */
-                                            g_hd_msdepth_scratch = hd_ml_hw()
-                                                ? hd_ms_tex_ml(g_hd_msdepth_scratch, MTLPixelFormatDepth32Float, tgt.width, tgt.height)
-                                                : hd_ms_tex(g_hd_msdepth_scratch, MTLPixelFormatDepth32Float, tgt.width, tgt.height);
-                                        }
-                                    }
-                                    if (ztex){
-                                        rp.depthAttachment.texture = ztex;
-                                        rp.depthAttachment.loadAction = zclear ? MTLLoadActionClear : MTLLoadActionLoad;
-                                        rp.depthAttachment.storeAction = MTLStoreActionStore;
-                                        rp.depthAttachment.clearDepth = zval;
-                                        /* RESOLVE the MSAA depth into the single-sample twin: passes
-                                         * that draw to a single-sample target with the same Z after
-                                         * the screen (light flares etc.) then see the scene's depth.
-                                         * The twin now reflects the MS state, so its pending clear
-                                         * is void. */
-                                        if (zres && zres.width == ztex.width && zres.height == ztex.height &&
-                                            !(ENVC("HD_ZRESOLVE") && ENVC("HD_ZRESOLVE")[0] == '0')){
-                                            rp.depthAttachment.resolveTexture = zres;
-                                            rp.depthAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
-                                            rp.depthAttachment.depthResolveFilter = MTLMultisampleDepthResolveFilterSample0;
-                                            g_zpend[zid] = 0;
-                                            g_hd_zsdirty[zid] = 0;
-                                            atomic_fetch_add(&g_hd_zres, 1ull);
-                                        }
-                                        /* Storing the MS depth: memoryless decides at open (never
-                                         * stored), Private chooses at close (hd_ms_end) */
-                                        if (c_ms && g_hd_msp.dz && c_ml){
-                                            rp.depthAttachment.storeAction = rp.depthAttachment.resolveTexture
-                                                ? MTLStoreActionMultisampleResolve : MTLStoreActionDontCare;
-                                            g_hd_msz_kept[g_hd_msp.zid] = 0;
-                                            atomic_fetch_add(&g_hd_mszskip, 1ull);
-                                            g_hd_msp.dz = 0;
-                                        } else if (c_ms && g_hd_msp.dz && hd_mslazy()){
-                                            g_hd_msp.res = rp.depthAttachment.resolveTexture != nil;
-                                            rp.depthAttachment.storeAction = MTLStoreActionUnknown;
-                                        } else g_hd_msp.dz = 0;
-                                    } else if (g_depth_tex){
-                                        rp.depthAttachment.texture = g_depth_tex;
-                                        if (c_ms) rp.depthAttachment.texture = g_hd_msdepth_scratch;
-                                        rp.depthAttachment.loadAction = MTLLoadActionClear;
-                                        rp.depthAttachment.storeAction = MTLStoreActionDontCare;
-                                        rp.depthAttachment.clearDepth = 1.0;
-                                    }
-                                    cur_z = zid;
-                                    c_zon = ztex != nil;
-                                    g_hd_msp.on = c_ms; g_hd_msp.ml = c_ml;
-                                    if (!c_ms) g_hd_msp.dz = 0;
-                                    if (g_pp_sb){ char pn[48];
-                                        if (!dr->target) snprintf(pn, sizeof pn, "SCREEN%s%s", c_ms ? " +MSAA" : "",
-#if NFS_ENHANCED
-                                                                  c_gb ? " +G-buffer" : "");
-#else
-                                                                  "");
-#endif
-                                        else snprintf(pn, sizeof pn, "%s #%u %lux%lu", TGT_FACE(dr->target) ? "cube face" : "target",
-                                                      TGT_ID(dr->target), (unsigned long)tgt.width, (unsigned long)tgt.height);
-                                        pp_rp(rp, pn);
-                                        { static long ff = -1;        /* pass contents in the first profiled frame */
-                                          if (ff < 0) ff = fno_pre;
-                                          if (ff == fno_pre){
-                                              unsigned nd = 0, nz = 0, nzt = 0, na = 0, zz = DEPTH_ZID(dr->depth);
-                                              for (unsigned q = i; q < g_dn[rb]; q++){ MDraw *x = &g_dbuf[rb][q];
-                                                  if (x->is_blit || x->target != dr->target || DEPTH_ZID(x->depth) != zz) break;
-                                                  if (x->is_clear){ if (q > i && (x->clr_flags & 2u)) break; continue; }
-                                                  nd++; if (x->depth & 2u) nz++; if (x->depth & 1u) nzt++; if (x->alpha_ref > 0.f) na++; }
-                                              fprintf(stderr, "  [content] draw#%u %s: zid %u, %u draws, Z writing %u, Z testing %u, alpha tested %u, first ps %d tex %u\n",
-                                                      i, pn, zz, nd, nz, nzt, na, dr->ps, dr->tex); } } }
-                                    enc = [cb renderCommandEncoderWithDescriptor:rp];
-                                    atomic_fetch_add(&g_pass_n, 1ull);
-                                    [enc setVertexBuffer:g_mtlvb offset:0 atIndex:0];
-                                    [enc setFragmentSamplerState:g_samp atIndex:0];
-                                    /* new encoder = all state reset */
-                                    c_pso = nil; c_bcol = ~0u; c_depth = ~0u; c_fp_valid = 0;
-                                    c_cull = ~0u;
-                                    /* In D3D the front face is CLOCKWISE.  CULLWIND=1
-                                     * flips it (needed if our vertex path flips
-                                     * Y). */
-                                    { static int cw = -1;
-                                      if (cw < 0){ const char *e = ENVC("CULLWIND");
-                                                   cw = (e && *e && *e != '0') ? 1 : 0; }
-                                      [enc setFrontFacingWinding:cw ? MTLWindingCounterClockwise
-                                                                    : MTLWindingClockwise]; }
-                                    for (int q4=0;q4<4;q4++){ c_smp[q4]=~0u; c_tex[q4]=~0u; }
-                                    if (dr->target){ unsigned tk_=TGT_ID(dr->target)*8u+TGT_FACE(dr->target);
-                                                     touched[tk_>>3] |= 1u<<(tk_&7); }
-                                    else screen_touched = 1;
-                                    cur_t = dr->target;
-                                }
-                                if (dr->is_clear || !dr->count) continue;
-                                /* PSINFO=<n>: print the target/texture/blend of the
-                                 * first draws that use this ps. */
-                                { static int pi = -2; static int shown = 0;
-                                  if (pi == -2){ const char *e=ENVC("PSINFO"); pi = e?atoi(e):-1; }
-                                  if (pi >= 0 && dr->ps == pi && shown < 6){ shown++;
-                                    fprintf(stderr,"  [psinfo] ps=%d target=%u tex=%u(%lux%lu) tex1=%u"
-                                            " blend=%05x verts=%u  c0=(%.3f %.3f %.3f %.3f)\n",
-                                            dr->ps, dr->target, dr->tex,
-                                            (dr->tex && dr->tex<MAXTEX && g_tex[dr->tex])?(unsigned long)g_tex[dr->tex].width:0ul,
-                                            (dr->tex && dr->tex<MAXTEX && g_tex[dr->tex])?(unsigned long)g_tex[dr->tex].height:0ul,
-                                            dr->tex1, dr->blend, dr->count,
-                                            (double)dr->c0[0],(double)dr->c0[1],
-                                            (double)dr->c0[2],(double)dr->c0[3]); } }
-#if NFS_ENHANCED
-                                if (dr->ps >= PSREFL && c_gb){ hd_refl_drawn = 1; atomic_fetch_add(&g_hd_refl_draws, 1ull); }
-#endif
-                                if (g_hd_msn > 1){              /* msaa diagnostics (report) */
-                                /* The same Z surface was used on the screen this frame
-                                 * (through its multisampled twin) and is now Z TESTED on a
-                                 * single-sample target: the twins share no contents, so
-                                 * this draw cannot see the scene's depth.  Count it. */
-                                /* The reverse: a single-sample pass WROTE Z, then the screen
-                                 * (MS twin) tests against that depth -- the twin cannot see it. */
-                                if (!c_ms && c_zon && cur_z < 64u && (dr->depth & 2u)) g_hd_zsdirty[cur_z] = 1;
-                                if (c_ms && c_zon && cur_z < 64u && (dr->depth & 1u) && g_hd_zsdirty[cur_z])
-                                    atomic_fetch_add(&g_hd_zrev, 1ull);
-                                if (!c_ms && c_zon && cur_z < 64u && g_hd_zms_used[cur_z] && (dr->depth & 1u)){
-                                    atomic_fetch_add(&g_hd_zshare, 1ull);
-                                    if (ENVC("ZSHARELOG")){
-                                        static unsigned zt[16], zz[16], zn[16], zps[16]; static int zk = 0;
-                                        int q, f = -1;
-                                        for (q = 0; q < zk; q++) if (zt[q] == dr->target && zz[q] == cur_z && zps[q] == (unsigned)dr->ps) f = q;
-                                        if (f < 0 && zk < 16){ f = zk++; zt[f] = dr->target; zz[f] = cur_z; zps[f] = (unsigned)dr->ps; zn[f] = 0;
-                                            id<MTLTexture> tt = (TGT_ID(dr->target) < MAXTEX) ? g_tex[TGT_ID(dr->target)] : nil;
-                                            fprintf(stderr, "  [zshare] target=%u (%lux%lu) z=%u ps=%d vs=%d blend=%05x verts=%u\n",
-                                                    dr->target, (unsigned long)tt.width, (unsigned long)tt.height,
-                                                    cur_z, dr->ps, dr->vsid, dr->blend, dr->count); }
-                                        if (f >= 0) zn[f]++;
-                                    }
-                                }
-                                }
-                                { uint64_t k2 = (uint64_t)(dr->blend & 0xFFFFFu)
-                                               | ((uint64_t)(dr->ps & 0xFFF) << 20)
-                                               | ((uint64_t)(dr->vsid & 0xFFF) << 32)
-                                               | ((uint64_t)(c_ms & 1) << 48)
-                                               | ((uint64_t)(c_gb & 1) << 49);
-                                  if (c_ms) k2 |= (uint64_t)hd_msaa_l2() << 50;   /* see MSAA BY RESOLUTION */
-                                  if (dr->alpha_ref <= 0.f && hsr_draw_on()) k2 |= 1ull << 52;
-                                  id<MTLRenderPipelineState> ps2 = pso_for(k2);
-                                  if (ps2 != c_pso){ c_pso = ps2;
-                                      [enc setRenderPipelineState:ps2]; } }
-                                /* BLENDFACTOR: encoder state, not pipeline state;
-                                 * reset at every change of target. */
-                                if (dr->cull != c_cull){ c_cull = dr->cull;
-                                    [enc setCullMode:(dr->cull == 1u) ? MTLCullModeNone
-                                                   : (dr->cull == 2u) ? MTLCullModeFront
-                                                                      : MTLCullModeBack]; }
-                                if (dr->bcol != c_bcol){ c_bcol = dr->bcol;
-                                    [enc setBlendColorRed:(float)((dr->bcol>>16)&0xFFu)/255.f
-                                                    green:(float)((dr->bcol>>8)&0xFFu)/255.f
-                                                     blue:(float)(dr->bcol&0xFFu)/255.f
-                                                    alpha:(float)((dr->bcol>>24)&0xFFu)/255.f]; }
-                                for (int si = 0; si < 4; si++){
-                                    unsigned sk = texrep_skey(si == 0 ? dr->tex : si == 1 ? dr->tex1 : si == 2 ? dr->tex2 : dr->tex3,
-                                                              dr->smp[si]);
-#if NFS_ENHANCED
-                                    /* mip filter LINEAR (bits 4-5 = 2): a level() read is
-                                     * ignored on a sampler without mips. */
-                                    if (hd_blur) sk = (sk & ~0x30u) | 0x20u;
-#endif
-                                    if (sk != c_smp[si]){ c_smp[si] = sk;
-                                        [enc setFragmentSamplerState:samp_for(sk) atIndex:si]; } }
-                                { unsigned dm = c_zon ? (dr->depth & 63u) : 0u;
-                                  if (dm != c_depth){ c_depth = dm;
-                                      [enc setDepthStencilState:dss_for(dm)]; } }
-                                { struct { float aref, usec, p0, p1; float proj[4]; float c[PSC_N][4]; float fogv[4]; } fp;
-                                  fp.aref = dr->alpha_ref;
-                                  fp.usec = 0.f; fp.p0 = fp.p1 = 0.f;
-#if NFS_ENHANCED
-                                  if (hd_blur){
-                                      /* scale = Metal texture / the size the game thinks; keep
-                                       * the sample spacing at ~1 texel at level L. */
-                                      id<MTLTexture> st = g_tex[dr->tex];
-                                      float sx = g_hd_ow[dr->tex] ? (float)st.width  / g_hd_ow[dr->tex] : 1.f;
-                                      float sy = g_hd_oh[dr->tex] ? (float)st.height / g_hd_oh[dr->tex] : 1.f;
-                                      float sc = sx > sy ? sx : sy;
-                                      if (sc > 1.f){
-                                          float L = enh_blur() * log2f(sc);
-                                          fp.p0 = exp2f(L) / sc;     /* offset scale (0..1] */
-                                          fp.p1 = L;                 /* mip level */
-                                      }
-                                      atomic_fetch_add(&g_hd_blurdraw, 1ull);
-                                  }
-#endif
-                                  memcpy(fp.proj, dr->proj, sizeof fp.proj);
-                                  memcpy(fp.fogv, dr->fogv, sizeof fp.fogv);
-                                  /* same pool index + same small fields: no need to build
-                                   * and compare the 548-byte block */
-                                  if (!(c_fp_valid && dr->psci == c_psci &&
-                                        !memcmp(&fp, &c_fp, offsetof(__typeof__(fp), c)) &&
-                                        !memcmp(fp.fogv, c_fp.fogv, sizeof fp.fogv))){
-                                      memcpy(fp.c, g_pscb[rb][dr->psci], sizeof fp.c);
-                                      if (!c_fp_valid || memcmp(&fp, &c_fp, sizeof fp)){
-                                          memcpy(&c_fp, &fp, sizeof fp); c_fp_valid = 1;
-                                          [enc setFragmentBytes:&fp length:sizeof fp atIndex:0]; }
-                                      c_psci = dr->psci; } }
-                                { unsigned ts[4] = { dr->tex, dr->tex1, dr->tex2, dr->tex3 };
-                                  for (int q4=0;q4<4;q4++){
-                                      if (ts[q4] == c_tex[q4]) continue;
-                                      c_tex[q4] = ts[q4];
-                                      unsigned tt = ts[q4];
-                                      freed_use(tt, 0);
-                                      id<MTLTexture> txn = (tt && tt < MAXTEX && g_tex[tt])
-                                                           ? texrep_pick(tt, g_tex[tt]) : g_white;
-                                      [enc setFragmentTexture:txn atIndex:(NSUInteger)q4];
-                                  } }
-                                atomic_fetch_add(&g_draw_n, 1ull);
-                                if (dr->vsid > 0 && dr->ix_isz){
-                                    id<MTLBuffer> pl = g_pool_fr[rb];
-                                    [enc setVertexBuffer:pl offset:dr->rawoff atIndex:1];
-                                    [enc setVertexBuffer:g_mtlkb  offset:dr->koff   atIndex:2];
-                                    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:dr->count
-                                                     indexType:(dr->ix_isz == 4u) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
-                                                   indexBuffer:pl indexBufferOffset:dr->ix_ib
-                                                 instanceCount:1 baseVertex:dr->ix_base baseInstance:0];
-                                } else if (dr->vsid > 0){
-                                    [enc setVertexBuffer:g_mtlrvb offset:dr->rawoff atIndex:1];
-                                    [enc setVertexBuffer:g_mtlkb  offset:dr->koff   atIndex:2];
-                                    [enc drawPrimitives:MTLPrimitiveTypeTriangle
-                                            vertexStart:0 vertexCount:dr->count];
-                                } else {
-                                    [enc drawPrimitives:MTLPrimitiveTypeTriangle
-                                            vertexStart:dr->first vertexCount:dr->count];
-                                }
-                            }
-                            { long tt = (long)(g_vn[rb]/3);
-                              for (unsigned i = 0; i < g_dn[rb]; i++)
-                                  if (g_dbuf[rb][i].vsid > 0) tt += (long)(g_dbuf[rb][i].count/3);
-                              atomic_fetch_add(&g_tris_drawn, tt); }
-                        }
-                        if (enc){ int pe = rb >= 0 ? hd_ms_end(enc, rb, g_dn[rb], c_ms, c_gb, c_att) : 0;
-                                  [enc endEncoding]; enc = nil;
-                                  if (pe) hd_ms_fallback(cb, d.texture, pe); }
-                        /* if nothing was drawn to the screen, at least clear it */
-                        if (!screen_touched){
-                            MTLRenderPassDescriptor *rp =
-                                [MTLRenderPassDescriptor renderPassDescriptor];
-                            rp.colorAttachments[0].texture = d.texture;
-                            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-                            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-                            rp.colorAttachments[0].clearColor = MTLClearColorMake(
-                                atomic_load(&g_clear_r), atomic_load(&g_clear_g),
-                                atomic_load(&g_clear_b), 1.0);
-                            id<MTLRenderCommandEncoder> e2 =
-                                [cb renderCommandEncoderWithDescriptor:rp];
-                            [e2 endEncoding];
-                        }
-                        pthread_mutex_lock(&g_qlock);
-                        g_ready = -1; g_enc_rb = -1;
-                        pthread_cond_signal(&g_qcond);
-                        pthread_mutex_unlock(&g_qlock);
-                        /* TESTFILL: fill with a known colour to verify the
-                         * capture path.  If the PNG comes out magenta, capture works. */
-                        if (ENVC("TESTFILL")){
-                            MTLRenderPassDescriptor *rp =
-                                [MTLRenderPassDescriptor renderPassDescriptor];
-                            rp.colorAttachments[0].texture = d.texture;
-                            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-                            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-                            rp.colorAttachments[0].clearColor =
-                                MTLClearColorMake(1.0, 0.0, 1.0, 1.0);
-                            id<MTLRenderCommandEncoder> e3 =
-                                [cb renderCommandEncoderWithDescriptor:rp];
-                            [e3 endEncoding];
-                        }
-                        if (g_perflog && atomic_exchange(&g_pl_thumb_req, 0)) pl_thumb(cb, d.texture, fno_pre);
-                        /* frame-rate counter (off by default, fpscounter.m): after the
-                         * game's frame; after the dump copy unless NFSU2_FPS_COUNTER_DUMP=1 */
-                        int fc_px = fpscounter_on() && rb >= 0;
-                        double fc_ppp = atomic_load(&g_cont_w) > 0 ? (double)d.texture.width / atomic_load(&g_cont_w) : 2.0;
-                        unsigned fc_bw = 0, fc_bh = 0;
-                        if (fc_px){ double bs = g_win ? [g_win backingScaleFactor] : 2.0;
-                            fc_bw = (unsigned)lround(atomic_load(&g_cont_w) * bs);
-                            fc_bh = (unsigned)lround(atomic_load(&g_cont_h) * bs); }
-                        if (fc_px && fpscounter_in_dumps()){
-                            fpscounter_draw(cb, d.texture, fc_ppp, fc_bw, fc_bh); fc_px = 0; }
-                        /* Take a readable copy BEFORE presenting: reading back from a
-                         * presented drawable's texture is not reliable. */
-                        if (dumpnow){
-                            /* recreate if the size changed (fullscreen transition) */
-                            if (g_capture && (g_capture.width != d.texture.width ||
-                                              g_capture.height != d.texture.height)) g_capture = nil;
-                            if (!g_capture){
-                                MTLTextureDescriptor *td =
-                                    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
-                                        MTLPixelFormatBGRA8Unorm
-                                        width:d.texture.width height:d.texture.height
-                                        mipmapped:NO];
-                                td.usage = MTLTextureUsageShaderRead;
-                                td.storageMode = MTLStorageModeShared;
-                                g_capture = [g_dev newTextureWithDescriptor:td];
-                            }
-                            if (g_capture){
-                                id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
-                                [bl copyFromTexture:d.texture sourceSlice:0 sourceLevel:0
-                                       sourceOrigin:MTLOriginMake(0,0,0)
-                                         sourceSize:MTLSizeMake(d.texture.width,
-                                                                d.texture.height,1)
-                                          toTexture:g_capture destinationSlice:0
-                                   destinationLevel:0
-                                  destinationOrigin:MTLOriginMake(0,0,0)];
-                                [bl endEncoding];
-                            }
-                        }
-                        if (fc_px) fpscounter_draw(cb, d.texture, fc_ppp, fc_bw, fc_bh);
-                        { struct timespec _e1; clock_gettime(CLOCK_MONOTONIC,&_e1);
-                          unsigned long long dt =
-                              (unsigned long long)(_e1.tv_sec-_e0.tv_sec)*1000000000ull
-                            + (unsigned long long)_e1.tv_nsec - (unsigned long long)_e0.tv_nsec;
-                          atomic_fetch_add(&g_enc_ns, dt);
-                          if (gpuw_in(fno_pre)){ atomic_fetch_add(&g_encw_ns, dt); atomic_fetch_add(&g_encw_n, 1ull); } }
-                        int in_win = gpuw_in(fno_pre);
-                        int hsr_m = -1;
-                        if (g_hsr_ab == 1 && in_win){ long r = fno_pre - g_gpuw_a;
-                            if ((r % 120) >= 30) hsr_m = g_hsr_cur; }
-                        pp_end(cb);
-                        [cb addCompletedHandler:^(id<MTLCommandBuffer> b2){
-                            /* a frame that ended in an error: GPU times come back 0 and spoil the measurements */
-                            if (b2.status == MTLCommandBufferStatusError){
-                                unsigned long ne = atomic_fetch_add(&g_cb_err, 1ul);
-                                if (ne < 5) fprintf(stderr, "metal: COMMAND BUFFER ERROR: %s\n",
-                                                    [[b2.error localizedDescription] UTF8String]); }
-                            fb_release(fbi);        /* GPU done: the set can be reused */
-                            double g = (b2.GPUEndTime - b2.GPUStartTime) * 1e9;
-                            if (g > 0.0 && g < 1e9){
-                                unsigned long long ns = (unsigned long long)g;
-                                if (in_win){ atomic_fetch_add(&g_gpuw_ns, ns); atomic_fetch_add(&g_gpuw_n, 1ull); }
-                                if (ab_mode >= 0 && ab_count){ atomic_fetch_add(&g_ab_ns[ab_mode], ns); atomic_fetch_add(&g_ab_cnt[ab_mode], 1ull); }
-                                if (hsr_m >= 0){ atomic_fetch_add(&g_hsr_ns[hsr_m], ns); atomic_fetch_add(&g_hsr_cnt[hsr_m], 1ull); }
-                                atomic_fetch_add(&g_gpu_ns, ns);
-                                atomic_fetch_add(&g_gpu_n, 1ull);
-                                fpscounter_note_gpu(g / 1e6);
-                                if (g_perflog) perflog_gpu(fno_pre, g);
-                                unsigned long long mx = atomic_load(&g_gpu_max_ns);
-                                while (ns > mx &&
-                                       !atomic_compare_exchange_weak(&g_gpu_max_ns, &mx, ns)) {}
-                            } }];
-                        /* Content-rate pacing (framerate.c): at least the content
-                         * period minus half a refresh after the previous drawable,
-                         * so 60 fps on a 120 Hz panel holds every frame for exactly
-                         * two refreshes.  presentedTime feeds the interval stats. */
-                        { double hfr_present_min_duration(void);
-                          void hfr_note_presented(double);
-                          double md = hfr_present_min_duration();
-                          [d addPresentedHandler:^(id<MTLDrawable> pd){ hfr_note_presented(pd.presentedTime);
-                                                                        fpscounter_note_presented(pd.presentedTime); }];
-                          if (md > 0.0) [cb presentDrawable:d afterMinimumDuration:md];
-                          else [cb presentDrawable:d];
-                          void hfr_note_present_call(void); hfr_note_present_call();
-                          fpscounter_note_present(); }
-                        [cb commit];
-                        long fno = atomic_fetch_add(&g_frames_drawn, 1) + 1;
-                        if (g_perflog){ struct timespec _p1; clock_gettime(CLOCK_MONOTONIC, &_p1);
-                            /* number of distinct textures (+ targets) bound in the frame: the
-                             * kernel cost of a command buffer submit grows with the resource count */
-                            static uint32_t pl_st[MAXTEX]; static uint32_t pl_gen = 0;
-                            unsigned pl_nt = 0; pl_gen++;
-                            for (unsigned q = 0; rb >= 0 && q < g_dn[rb]; q++){
-                                const MDraw *x = &g_dbuf[rb][q];
-                                unsigned ids[5] = { x->tex, x->tex1, x->tex2, x->tex3, TGT_ID(x->target) };
-                                for (int w = 0; w < 5; w++){ unsigned id_ = ids[w];
-                                    if (id_ && id_ < MAXTEX && pl_st[id_] != pl_gen){ pl_st[id_] = pl_gen; pl_nt++; } }
-                            }
-                            perflog_render_frame(fno, pl_nt,
-                                (uint64_t)(_d1.tv_sec - _d0.tv_sec) * 1000000000ull + (uint64_t)_d1.tv_nsec - (uint64_t)_d0.tv_nsec,
-                                (uint64_t)(_p1.tv_sec - _e0.tv_sec) * 1000000000ull + (uint64_t)_p1.tv_nsec - (uint64_t)_e0.tv_nsec,
-                                rb >= 0 ? g_dn[rb] : 0u, rb >= 0 ? g_vn[rb] : 0u); }
-                        /* FPSCSV=<path>: per-frame time + workload.  To see WHERE
-                         * the stutter is without guessing. */
-                        { static FILE *fp = NULL; static int init = 0;
-                          static uint64_t prev = 0;
-                          if (!init){ init = 1; const char *e = ENVC("FPSCSV");
-                              if (e && *e){ fp = fopen(e, "w");
-                                  if (fp) fprintf(fp, "frame,ms,draws,verts,tris\n"); } }
-                          if (fp){ struct timespec _ts;
-                              clock_gettime(CLOCK_MONOTONIC, &_ts);
-                              uint64_t now = (uint64_t)_ts.tv_sec*1000000ull
-                                           + (uint64_t)_ts.tv_nsec/1000ull;
-                              if (prev) fprintf(fp, "%ld,%.2f,%u,%u,%u\n", fno,
-                                    (double)(now - prev)/1000.0,
-                                    rb>=0?g_dn[rb]:0u, rb>=0?g_vn[rb]:0u,
-                                    rb>=0?(g_vn[rb]/3u):0u);
-                              prev = now;
-                              if ((fno % 240) == 0) fflush(fp); } }
-                        if (dumpnow){
-                            [cb waitUntilCompleted];
-                            if (g_capture) dump_texture(g_capture, fno_pre);
-                            g_dump_cur_guest = -1;
-                            { const char *dt = ENVC("DUMPTEX");   /* comma list */
-                              for (const char *q = dt; q && *q; ){
-                                  while (*q==',' || *q==' ') q++;
-                                  if (!*q) break;
-                                  unsigned tn = (unsigned)strtoul(q, 0, 0);
-                                  dump_one_texture(tn, fno_pre*1000 + tn);
-                                  while (*q && *q != ',') q++; } }
-                        }
-                        (void)fno;
-                    }
+                        metal_encode_ready(d.texture,d,_d0,_d1);
+                    }else if(!readback_fail_queued())frame_retry_drawable();
                 }
                 /* SLEEP until a frame is ready (no polling).  The 4 ms
                  * cap is only there to drain the NSEvent queue: when a

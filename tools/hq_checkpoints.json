@@ -1,0 +1,78 @@
+{
+  "game_sha256": "80774c2e5d619b4f120b48d4462896fd504c263399d203a238769cffde1d253c",
+  "module_sha256": "b35247cbd012ed89b011d781014d646c57b16eb085746cbb8aff98673791500f",
+  "points": [
+    {
+      "id": 1,
+      "name": "cartypes",
+      "writer": 25210192,
+      "checkpoint": 25210314,
+      "continuation": 7695021,
+      "fields": [
+        {
+          "address": 7575808,
+          "consumer": 7575760
+        },
+        {
+          "address": 8075385,
+          "consumer": 8075168
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "racernames",
+      "writer": 25204544,
+      "checkpoint": "after_return",
+      "fields": [
+        {
+          "address": 6146097,
+          "consumer": 6146048
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "name": "eohotkeys",
+      "module_sha256": "32bc3ae6c3f36218ae507b666d8fb816c2263fdb7819498286bca11537ec8ff2",
+      "writer": 29379152,
+      "checkpoint": "after_return",
+      "fields": [
+        {
+          "address": 8107266,
+          "consumer": 8106976
+        },
+        {
+          "address": 8065927,
+          "consumer": 8065712
+        },
+        {
+          "address": 8064137,
+          "consumer": 8064048
+        },
+        {
+          "address": 8080764,
+          "consumer": 8080752
+        },
+        {
+          "address": 4411513,
+          "consumer": 4411360
+        },
+        {
+          "address": 4411528,
+          "consumer": 4411360
+        },
+        {
+          "address": 6751190,
+          "consumer": 6751152,
+          "size": 1
+        },
+        {
+          "address": 7293159,
+          "consumer": 7292832,
+          "size": 1
+        }
+      ]
+    }
+  ]
+}

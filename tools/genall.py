@@ -2,10 +2,13 @@
 """Translate all 23k functions to C, split them into shards, generate the function table."""
 import sys, os, struct, collections, time, multiprocessing as mp
 sys.path.insert(0,'tools')
+from generation_manifest import capture_generation, write_generation
+_generation_capture = capture_generation(sys.argv[1]) if __name__=='__main__' else None
 import pefile
 from capstone import *
 from capstone.x86 import *
-from lift import Lifter, Unsupported, _lregs
+from lift import Lifter, Unsupported, NativeBranchError, _lregs, parse_branch_hooks
+from game_code_data import relocation_data_ranges
 
 EXE = sys.argv[1]
 NSHARD = int(sys.argv[2]) if len(sys.argv)>2 else 128
@@ -24,18 +27,22 @@ SYMPFX = os.environ.get('SYMPFX', '')
 # ---------- Phase 1: closed function set ----------
 def discover_all():
     L=Lifter(EXE); pe=pefile.PE(EXE); IB=pe.OPTIONAL_HEADER.ImageBase
+    data_ranges=relocation_data_ranges(EXE,L)
     EP=IB+pe.OPTIONAL_HEADER.AddressOfEntryPoint
     def rd32(a):
         for nm,va,vs,d in L.secs:
             if va<=a<va+len(d)-3: return struct.unpack_from('<I',d,a-va)[0]
     funcs={EP}
     if SEEDS:
-        funcs |= {a for a in (int(x,16) for x in open(SEEDS) if x.strip()) if L.in_text(a)}
+        with open(SEEDS) as source:
+            funcs |= {a for a in (int(x,16) for x in source if x.strip()) if L.in_text(a)}
     fixed=set(funcs)                       # entries no jump table explains
     relref=collections.defaultdict(list)   # pointer -> the fixup slots holding it
-    for a in (int(x,16) for x in open(RELOCS)):
-        v=rd32(a)
-        if v is not None and L.in_text(v): funcs.add(v); relref[v].append(a)
+    with open(RELOCS) as source:
+        for a in (int(x,16) for x in source):
+            v=rd32(a)
+            if v is not None and L.in_text(v) and not any(start<=v<end for start,end in data_ranges):
+                funcs.add(v); relref[v].append(a)
     md=L.md; cov=bytearray(L.TSZ); q=collections.deque(funcs); seen=set(funcs)
     while q:
         va=q.popleft()
@@ -114,7 +121,7 @@ INLINE_MAX = int(os.environ.get('INLINE','0') or 0)
 _INL = {}
 import re as _re
 _INL_CALL = _re.compile(r'\bsub_([0-9a-f]{8})\(c\)')
-_INL_DENY = ('dispatch_indirect', 'DISPATCH_CALL', 'DISPATCH_TAIL', 'unsupported_insn', 'cpuid_shim', 'guest_hook', 'rdtsc_shim', 'cov_hit')
+_INL_DENY = ('dispatch_indirect', 'DISPATCH_CALL', 'DISPATCH_TAIL', 'unsupported_insn', 'cpuid_shim', 'guest_hook', 'guest_branch', 'rdtsc_shim', 'cov_hit')
 # INLINE_LIST=<file>: these functions (hex addresses; # comments) are inlined
 # the same way at their direct call sites, whatever their size, calls
 # included (an inline copy calls its callees as usual): the hot callees of a
@@ -124,17 +131,20 @@ _INL_DENY = ('dispatch_indirect', 'DISPATCH_CALL', 'DISPATCH_TAIL', 'unsupported
 INLINE_LIST = set()
 if os.environ.get('INLINE_LIST'):
     INLINE_LIST = {int(x, 16) for ln in open(os.environ['INLINE_LIST']) for x in ln.split('#')[0].replace(',', ' ').split()}
-_INL_LIST_DENY = ('DISPATCH_TAIL', 'unsupported_insn', 'cpuid_shim', 'guest_hook', 'rdtsc_shim', 'cov_hit')
+_INL_LIST_DENY = ('DISPATCH_TAIL', 'unsupported_insn', 'cpuid_shim', 'guest_hook', 'guest_branch', 'rdtsc_shim', 'cov_hit')
 OVERRIDES = {int(x,16) for x in os.environ.get('OVERRIDE','').replace('0x','').split(',') if x.strip()}
 LREGS = os.environ.get('LREGS', '') == '1'      # lift.py runs tools/lregs.py on every function
+if LREGS and os.environ.get('BRANCH_HOOKS','').strip():
+    raise NativeBranchError('native branches require LREGS=0')
 
 def _init(inl=None):
     global _L, _INL
     if inl: _INL = inl
     hooks = [int(x,16) for x in os.environ.get('HOOKS','').replace('0x','').split(',') if x.strip()]
+    branches=parse_branch_hooks(os.environ.get('BRANCH_HOOKS',''))
     watch = os.environ.get('WATCH','') == '1'
     cov   = os.environ.get('COVERAGE','') == '1'
-    _L = Lifter(EXE, comments=os.environ.get('COMMENTS','') == '1', trap=True, hooks=hooks, watch=watch)
+    _L = Lifter(EXE, comments=os.environ.get('COMMENTS','') == '1', trap=True, hooks=hooks, watch=watch, branch_hooks=branches)
     _L.cov = cov
 
 def _inlprobe(a):
@@ -143,6 +153,8 @@ def _inlprobe(a):
     _L.traps = 0
     try:
         code, tg = _L.lift(a)
+    except NativeBranchError:
+        raise
     except Exception:
         return a, None
     if a in INLINE_LIST:
@@ -162,6 +174,8 @@ def _shard(args):
         try:
             code,tg = L.lift(a)
             left.update(_jt_left(L, L.last_blocks))
+        except NativeBranchError:
+            raise
         except Exception as e:
             stub = f"void sub_{a:08x}(CPU *c){{ unsupported_insn(c,0x{a:x}u,\"lift-error\"); POP32(c->eip); }}"
             parts.append(_lregs().transform(stub) if LREGS else stub)
@@ -275,5 +289,6 @@ if __name__=='__main__':
     print(f"  C source size    : {bytes_/1048576:.1f} MB ({NSHARD} shards)")
     print(f"  traps (unsupported instructions): {traps}")
     print(f"  truncated branch targets    : {trunc}")
+    write_generation(OUT, _generation_capture)
     print("\n  most common trap reasons:")
     for k,v in collections.Counter(kinds).most_common(12): print(f"    {k:16s} {v}")

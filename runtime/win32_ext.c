@@ -1,6 +1,7 @@
 /* Win32 layer - second round: registry, window, synchronization, threads */
 #include <strings.h>
 #include "cpu.h"
+#include "widescreen.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -11,6 +12,8 @@
 #include <unistd.h>
 #include <sys/mount.h>
 #include <stddef.h>
+#include <sys/sysctl.h>
+#include <mach/mach.h>
 
 void dispatch_indirect(CPU*,uint32_t);
 void mem_commit(uint32_t,uint32_t);
@@ -335,7 +338,14 @@ int win32_gil_status(char *buf, size_t n){
     return k;
 }
 #endif
-void guest_lock(CPU *c){ ts_set(TS_GIL, 0); gil_acquire(c); tl_cpu=c; g_cur_cpu=c; reg_cpu(c); gil_took(); ts_set(TS_RUN, 0); }
+void guest_lock(CPU *c){
+    ts_set(TS_GIL,0);gil_acquire(c);tl_cpu=c;g_cur_cpu=c;
+#if NFS_HQ_MODULES
+    int hq_tls_attach(CPU *);
+    if(!hq_tls_attach(c)){fprintf(stderr,"Module TLS attach failed\n");exit(78);}
+#endif
+    reg_cpu(c);gil_took();ts_set(TS_RUN,0);
+}
 void guest_unlock(void){ ts_set(TS_IDLE, 0); gil_gave(); gil_release(); }
 /* Exit path (boot.c): take the lock for good, so no guest thread can start
  * another file or registry write while the process goes down.  A helper
@@ -994,6 +1004,10 @@ static void thread_report(void){
 uint32_t module_nearest_fn(uint32_t addr, const char **mod);   /* module.c */
 static void thread_finish(Obj *o, uint32_t code, CPU *c){
     void com_forget_cpu(CPU *);
+#if NFS_HQ_MODULES
+    void hq_tls_detach(CPU *),hq_crt_thread_detach(void);
+    hq_tls_detach(c);hq_crt_thread_detach();
+#endif
     unreg_cpu(c);
     com_forget_cpu(c);                                /* com.c caches the CPU of the last COM call */
     __sync_fetch_and_add(&g_threads_exited, 1);
@@ -1194,7 +1208,7 @@ static void *timer_thread_main(void *p){
 
 /* --- guest printf (wvsprintfA / wsprintfA): %[-0+ #][width][.prec][hlI]
  * d i u x X o c s % ; arguments are 32-bit stack slots (va_list = guest ptr). */
-static uint32_t guest_vformat(uint32_t out, uint32_t cap, const char *fmt, uint32_t va){
+uint32_t guest_vformat(uint32_t out, uint32_t cap, const char *fmt, uint32_t va){
     char tmp[1100]; uint32_t n = 0;
     for (const char *p = fmt; *p && n < sizeof tmp - 64; p++){
         if (*p != '%'){ tmp[n++] = *p; continue; }
@@ -1423,6 +1437,7 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
               else { dval = g_reg[ri].dw; have_d = 1; }
           } }
         if (sval || have_d) { /* the stored value will be used */ }
+        else if (ws_registry_default(vn,&dval)) have_d=1;
         /* v12na: the registry is now persistent (reg_save), and the game
          * writes NotFirstTime itself on its first start.  A fake
          * NotFirstTime=1 meant the first-start "system check" (0x5CED60 ->
@@ -1959,6 +1974,36 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
     else if (!strcmp(n,"GlobalMemoryStatus")){
         uint32_t p=A(c,0); if(p){ mem_commit(p,32); memset(g_mem+p,0,32);
             MR32(p)=32; MR32(p+4)=50; MR32(p+8)=0x40000000u; MR32(p+12)=0x20000000u; } r=0; }
+    else if (!strcmp(n,"GlobalMemoryStatusEx")){
+        uint32_t p=A(c,0);r=0;
+        void win32_set_last_error(CPU *,uint32_t);
+        if(!p||p>UINT32_MAX-63u||!mem_is_committed(p)||!mem_is_committed(p+63u))
+            win32_set_last_error(c,998u);
+        else if(MR32(p)!=64u)win32_set_last_error(c,87u);
+        else{
+            uint64_t total=0;size_t size=sizeof total;
+            vm_statistics64_data_t stats={0};mach_msg_type_number_t count=HOST_VM_INFO64_COUNT;
+            mach_port_t host=mach_host_self();
+            kern_return_t status=host_statistics64(host,HOST_VM_INFO64,(host_info64_t)&stats,&count);
+            mach_port_deallocate(mach_task_self(),host);
+            if(sysctlbyname("hw.memsize",&total,&size,NULL,0)||!total||status!=KERN_SUCCESS)
+                win32_set_last_error(c,31u);
+            else{
+                uint64_t available=((uint64_t)stats.free_count+stats.inactive_count)*(uint64_t)sysconf(_SC_PAGESIZE);
+                if(available>total)available=total;
+                uint32_t win32_heap_used(void);
+                /* Commit and allocatable virtual memory are bounded by the guest heap arena. */
+                uint64_t limit=0x50000000ull,used=win32_heap_used();
+                if(limit>total)limit=total;
+                uint64_t remaining=used<limit?limit-used:0;
+                MR32(p+4)=(uint32_t)((total-available)*100u/total);
+                MR64(p+8)=total;MR64(p+16)=available;
+                MR64(p+24)=limit;MR64(p+32)=remaining;
+                MR64(p+40)=0x80000000ull;MR64(p+48)=remaining;MR64(p+56)=0;
+                r=1;
+            }
+        }
+    }
     else if (!strcmp(n,"IsBadReadPtr")||!strcmp(n,"IsBadWritePtr")||!strcmp(n,"IsBadCodePtr")) r=0;
     else if (!strcmp(n,"wvsprintfA")){        /* (lpOut, lpFmt, arglist) */
         uint32_t o = A(c,0), f = A(c,1), va = A(c,2);

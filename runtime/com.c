@@ -42,7 +42,7 @@ void metal_begin_frame(void);
 #include "web/wgsl.h"
 #define SHADER_TEXT_CAP (256*1024)
 #else
-#define SHADER_TEXT_CAP (16384)
+#define SHADER_TEXT_CAP (256*1024)
 #endif
 #include "widescreen.h"
 #include "enhance.h"
@@ -143,6 +143,16 @@ static void gbuf_free(uint32_t p){
     gheap_free_c(g_com_cpu, g_gh_gbuf, p); g_gbuf_bytes -= n;
 }
 
+static const Method M_VOLTEX[] = { RES_HEAD,
+ {"SetLOD",2},{"GetLOD",1},{"GetLevelCount",1},{"SetAutoGenFilterType",2},
+ {"GetAutoGenFilterType",1},{"GenerateMipSubLevels",1},{"GetLevelDesc",3},
+ {"GetVolumeLevel",3},{"LockBox",5},{"UnlockBox",2},{"AddDirtyBox",2}
+};
+static const Method M_VOLUME[] = {
+ {"QueryInterface",3},{"AddRef",1},{"Release",1},{"GetDevice",2},
+ {"SetPrivateData",5},{"GetPrivateData",4},{"FreePrivateData",2},
+ {"GetContainer",3},{"GetDesc",2},{"LockBox",4},{"UnlockBox",1}
+};
 typedef struct { const char *name; const Method *m; unsigned n; } Iface;
 static const Iface g_if[] = {
     {"?",              0,         0},
@@ -163,10 +173,12 @@ static const Iface g_if[] = {
     {"IDirectSound",             M_DS,         NEL(M_DS)},
     {"IDirectSoundBuffer",       M_DSBUF,      NEL(M_DSBUF)},
     {"IDirectInputEffect",       M_DIEFF,      NEL(M_DIEFF)},
+    {"IDirect3DVolumeTexture9", M_VOLTEX, NEL(M_VOLTEX)},
+    {"IDirect3DVolume9", M_VOLUME, NEL(M_VOLUME)},
 };
 enum { IF_D3D9=1, IF_DEV, IF_TEX, IF_VB, IF_IB, IF_SURF, IF_SIMPLE,
        IF_VSHADER, IF_VDECL, IF_STATEBLOCK, IF_SWAPCHAIN, IF_QUERY,
-       IF_DI8, IF_DIDEV, IF_DS, IF_DSBUF, IF_DIEFF };
+       IF_DI8, IF_DIDEV, IF_DS, IF_DSBUF, IF_DIEFF, IF_VOLTEX, IF_VOLUME };
 
 static uint64_t g_com_new_n[NEL(g_if)];   /* per interface: objects created */
 static uint64_t g_com_del_n[NEL(g_if)];   /* ... and destroyed (last Release) */
@@ -225,7 +237,11 @@ static uint32_t com_new(uint32_t iface, uint32_t extra){
 /* dinput_pad.c CreateEffect: a new IDirectInputEffect (16 bytes of its own) */
 uint32_t com_new_dieffect(void){ return com_new(IF_DIEFF, 16u); }
 
-#define PSCUBE 256   /* must MATCH metal.m: cube ps variant */
+#ifdef __wasm__
+#define PSCUBE 256   /* existing WebGPU protocol */
+#else
+#define PSCUBE METAL_PS_CUBE_OFFSET
+#endif
 uint64_t g_com_calls=0, g_com_unimpl=0;
 /* per-method call counter: the work list for the render layer */
 #define MSTAT_IF 20
@@ -272,6 +288,8 @@ static uint32_t *g_lk_tid=0; static unsigned *g_lk_cnt=0; static uint64_t *g_lk_
 static uint32_t *g_lock_obj=0; static unsigned *g_lock_cnt=0; static int g_lock_n=0;
 static uint64_t g_snd_bytes=0, g_snd_nonzero=0, g_snd_zero=0, g_snd_play=0;
 static uint32_t g_cur_rt = 0;
+static unsigned g_ws_present_samples;
+static int g_ws_msaa_checked,g_ws_msaa_enabled;
 /* D3DRENDERSTATETYPE values; the defaults are D3D9's initial state */
 /* Resolutions offered in the game's settings menu (desktop last). */
 /* The game's OWN internal resolution table.  Measured experimentally:
@@ -400,8 +418,10 @@ static uint8_t  g_rs_nval[256] = {0};
  * bright light streaks and wrongly dark surfaces. */
 #define MAXSB     512
 #define MAXSBREC  128
-typedef struct { uint32_t magic; uint32_t a[8]; int nargs; } SBRec;
-typedef struct { SBRec r[MAXSBREC]; int n; int used; } SBlock;
+typedef struct { uint32_t magic; uint32_t a[8]; int nargs; void *constants; } SBRec;
+typedef struct SBPre SBPre;
+static void sb_pre_free(SBPre *);
+typedef struct { SBRec r[MAXSBREC]; int n; int used; SBPre *pre; } SBlock;
 static SBlock  g_sb[MAXSB];
 static int     g_sbn = 1;          /* 0 = invalid */
 int     g_sb_rec = 0;       /* block being recorded, 0 = not recording (read by d3dx_hle.c) */
@@ -410,7 +430,9 @@ static uint64_t g_sb_applied = 0, g_sb_captured = 0, g_sb_dropped = 0, g_sb_full
 
 /* Raw state shadows: Capture reads from these (the values the game SET). */
 static uint32_t g_raw_vs = 0, g_raw_ps = 0, g_raw_decl = 0, g_raw_fvf = 0;
-static uint32_t g_raw_tex[8] = {0};
+static uint32_t g_fvf_layout;
+static uint32_t g_raw_tex[16] = {0};
+static uint32_t g_stream_offset[16],g_stream_stride[16];
 /* The D3D DEFAULT of D3DTSS_TEXCOORDINDEX is the stage number, NOT 0.
  * With the table starting at zero, stages 1 and 2 -- the headlight texture
  * and the falloff ramp -- were sampled with the road's own (repeating)
@@ -445,6 +467,10 @@ enum {
     MID_SetFVF,
     MID_SetVertexShaderConstantF,
     MID_SetPixelShaderConstantF,
+    MID_SetPixelShaderConstantB,
+    MID_GetPixelShaderConstantB,
+    MID_GetPixelShaderConstantF,
+    MID_GetContainer, MID_GetVolumeLevel, MID_LockBox, MID_UnlockBox, MID_AddDirtyBox, MID_UpdateTexture,
     MID_SetVertexShaderConstantI,
     MID_SetVertexShaderConstantB,
     MID_SetTransform,
@@ -562,6 +588,7 @@ enum {
     MID_Capture,
     MID_GetFunction,
     MID_GetDeclaration,
+    MID_SetStreamSourceFreq, MID_SetPixelShaderConstantI, MID_GetPixelShaderConstantI,
     MID__count
 };
 static const char *const g_midname[MID__count] = {
@@ -576,6 +603,10 @@ static const char *const g_midname[MID__count] = {
     "SetFVF",
     "SetVertexShaderConstantF",
     "SetPixelShaderConstantF",
+    "SetPixelShaderConstantB",
+    "GetPixelShaderConstantB",
+    "GetPixelShaderConstantF",
+    "GetContainer", "GetVolumeLevel", "LockBox", "UnlockBox", "AddDirtyBox", "UpdateTexture",
     "SetVertexShaderConstantI",
     "SetVertexShaderConstantB",
     "SetTransform",
@@ -693,6 +724,7 @@ static const char *const g_midname[MID__count] = {
     "Capture",
     "GetFunction",
     "GetDeclaration",
+    "SetStreamSourceFreq", "SetPixelShaderConstantI", "GetPixelShaderConstantI",
 };
 static int mid_resolve(const char *nm){
     for (int i = 1; i < MID__count; i++)
@@ -710,14 +742,21 @@ static int sb_recordable(int mid){
         || MID(SetVertexShader)      || MID(SetPixelShader)
         || MID(SetVertexDeclaration) || MID(SetFVF)
         || MID(SetVertexShaderConstantF) || MID(SetPixelShaderConstantF)
-        || MID(SetVertexShaderConstantI) || MID(SetVertexShaderConstantB)
+        || MID(SetVertexShaderConstantI) || MID(SetVertexShaderConstantB) || MID(SetPixelShaderConstantB) || MID(SetPixelShaderConstantI)
         || MID(SetTransform)         || MID(SetMaterial)
         || MID(SetLight)             || MID(LightEnable)
         || MID(SetStreamSource)      || MID(SetIndices)
         || MID(SetViewport)          || MID(SetScissorRect)
-        || MID(SetNPatchMode)        || MID(SetClipPlane);
+        || MID(SetNPatchMode)        || MID(SetClipPlane) || MID(SetStreamSourceFreq);
 }
 static int g_rs_init = 0;
+static void rs_defaults(void){
+    if(g_rs_init)return;
+    g_rs_init=1;
+    g_rs[19]=5;g_rs[20]=6;g_rs[168]=15;g_rs[171]=1;g_rs[22]=3;
+    g_rs[190]=g_rs[191]=g_rs[192]=15;
+    g_rs[161]=1;g_rs[25]=8;g_rs[7]=1;g_rs[14]=1;g_rs[23]=4;g_rs[193]=0xffffffffu;
+}
 /* 19=SRCBLEND 20=DESTBLEND 22=CULLMODE 27=ALPHABLENDENABLE
  * 15=ALPHATESTENABLE 24=ALPHAREF 25=ALPHAFUNC 168=COLORWRITEENABLE 171=BLENDOP */
 /* If g_rs[] has not changed, rs_apply() is pure waste: in a run the game
@@ -727,14 +766,16 @@ static int g_rs_init = 0;
  * is not ready yet are still applied once the device arrives. */
 int g_rs_dirty = 1;
 static uint64_t g_rs_skip = 0, g_rs_run = 0;
+static void depth_bias_push(void){
+#ifndef __wasm__
+    float constant,slope;
+    memcpy(&constant,&g_rs[195],4);memcpy(&slope,&g_rs[175],4);
+    metal_set_depth_bias(constant,slope);
+#endif
+}
 static void rs_apply(void){
     g_rs_run++;
-    if (!g_rs_init){ g_rs_init=1;
-        g_rs[19]=5; g_rs[20]=6; g_rs[27]=0; g_rs[168]=0xF; g_rs[171]=1;
-        g_rs[22]=3;                            /* CULLMODE default: CCW */
-        g_rs[15]=0; g_rs[24]=0; g_rs[25]=8;
-        g_rs[7]=1; g_rs[14]=1; g_rs[23]=4;     /* Z defaults: on */
-        g_rs[193]=0xFFFFFFFFu; }               /* BLENDFACTOR default: white */
+    rs_defaults();
     unsigned key = (g_rs[27]?1u:0u)
                  | ((g_rs[19] & 31u) << 1)
                  | ((g_rs[20] & 31u) << 6)
@@ -745,6 +786,9 @@ static void rs_apply(void){
     if (g_rs[15] && (g_rs[25]==5 || g_rs[25]==6 || g_rs[25]==7))
         aref = (float)(g_rs[24] & 0xFFu) / 255.0f;
     metal_set_blend(key, aref);
+#ifndef __wasm__
+    for(unsigned slot=1;slot<4;slot++)metal_set_color_write(slot,g_rs[189+slot]&15u);
+#endif
     /* D3DRS_BLENDFACTOR (193): when SRCBLEND/DESTBLEND = BLENDFACTOR /
      * INVBLENDFACTOR the blend cross-fades with this CONSTANT colour.
      * In Metal this is encoder state (setBlendColor), not pipeline state. */
@@ -769,6 +813,7 @@ static void rs_apply(void){
       unsigned zf = g_rs[23] ? (g_rs[23] & 7u) : 4u;
       unsigned dm = (g_rs[7] ? 1u : 0u) | (g_rs[14] ? 2u : 0u) | (zf << 2);
       metal_set_depth(dm); }
+    depth_bias_push();
 }
 static uint64_t g_rt_set=0, g_rt_screen=0;
 static uint64_t g_rt_tex=0;
@@ -788,7 +833,7 @@ static int is_cube_tex(uint32_t obj){
 /* ---- reference counting (see com_new) ------------------------------------ */
 void metal_free_texture(unsigned);
 void metal_mirror_forget(uint32_t);
-static uint32_t g_bind_tex[8], g_bind_vb[4], g_bind_ib, g_bind_rt[4], g_bind_ds;
+static uint32_t g_bind_tex[16], g_bind_vb[16], g_bind_ib, g_bind_rt[4], g_bind_ds;
 static uint64_t g_child_uncached = 0;
 static int com_valid(uint32_t o){
     if (!o || (o & 15u) || !mem_is_committed(o - 16u) || !mem_is_committed(o + 3u)) return 0;
@@ -841,23 +886,84 @@ static void bind_set(uint32_t *slot, uint32_t o){
     *slot = o;
     if (old) com_release(old);
 }
-/* Surface (face, level) of texture t.  One cached child per slot at
- * +64..+103 (2D: level; cube: face + 6*level); it shares the texture's
- * count.  GetSurfaceLevel used to create a new object on every call. */
-static uint32_t tex_child(uint32_t t, uint32_t face, uint32_t level, int cube){
-    uint32_t k = cube ? face + 6u * level : level;
-    uint32_t slot = (k < 10u) ? t + 64u + 4u * k : 0u;
-    uint32_t sf = slot ? MR32(slot) : 0u;
-    if (sf && com_valid(sf) && CH_PARENT(sf) == t) return sf;
-    sf = com_new(IF_SURF, 64);
-    if (!sf) return 0;
-    CH_FLAGS(sf) |= CF_CHILD; CH_PARENT(sf) = t; CH_REF(sf) = 0;
-    if (slot) MR32(slot) = sf; else g_child_uncached++;
-    return sf;
+/* Keep legacy level 0..7 buffers and first ten child slots in place. */
+#define TEX_MIPS 16u
+#define TEX_EXTRA 192u
+#define D3DFMT_INTZ 0x5a544e49u
+/* +192 follows all sixteen mip-buffer and child slots. */
+static uint32_t tex_depth_zid(uint32_t texture){
+    return MR32(texture+20)==D3DFMT_INTZ ? MR32(texture+192) : 0;
+}
+static uint32_t tex_buffer_slot(uint32_t texture,unsigned level){
+    return level<8 ? texture+32+level*4 : level<TEX_MIPS ? texture+136+(level-8)*4 : 0;
+}
+static uint32_t tex_child_slot(uint32_t texture,unsigned index,int cube){
+    if(index<10)return texture+64+index*4;
+    return !cube && index<TEX_MIPS ? texture+168+(index-10)*4 : 0;
+}
+static unsigned tex_levels(uint32_t texture){
+    unsigned levels=MR32(texture+24);return levels?levels:1;
+}
+static uint32_t tex_surface_parent(uint32_t surface){
+    if(!com_valid(surface) || !(CH_FLAGS(surface)&CF_CHILD))return 0;
+    uint32_t parent=CH_PARENT(surface);
+    return com_valid(parent) && (CH_IFACE(parent)&0xffffu)==IF_TEX && !is_cube_tex(parent) ? parent : 0;
+}
+typedef struct RectLock {
+    uint32_t owner,level,face,flags;
+    struct RectLock *next;
+} RectLock;
+static RectLock *g_rect_locks;
+/* Texture and surface aliases share lock access, including cube faces. */
+static uint32_t rect_lock_owner(uint32_t self,unsigned *level,unsigned *face){
+    if(com_valid(self) && (CH_FLAGS(self)&CF_CHILD)){
+        uint32_t parent=CH_PARENT(self);
+        if(com_valid(parent) && (CH_IFACE(parent)&0xffffu)==IF_TEX){
+            *level=MR32(self+48);*face=is_cube_tex(parent)?MR32(self+44)-1u:0;
+            return parent;
+        }
+    }
+    return self;
+}
+static uint32_t rect_lock_begin(uint32_t self,unsigned level,unsigned face,uint32_t flags){
+    uint32_t owner=rect_lock_owner(self,&level,&face);
+    for(RectLock *p=g_rect_locks;p;p=p->next)
+        if(p->owner==owner && p->level==level && p->face==face)return 0x8876086cu;
+    RectLock *p=malloc(sizeof *p);if(!p)return 0x8007000eu;
+    *p=(RectLock){owner,level,face,flags,g_rect_locks};g_rect_locks=p;return 0;
+}
+static int rect_lock_end(uint32_t self,unsigned level,unsigned face,uint32_t *flags){
+    uint32_t owner=rect_lock_owner(self,&level,&face);
+    for(RectLock **p=&g_rect_locks;*p;p=&(*p)->next){
+        RectLock *lock=*p;
+        if(lock->owner==owner && lock->level==level && lock->face==face){
+            if(flags)*flags=lock->flags;*p=lock->next;free(lock);return 1;
+        }
+    }
+    return 0;
+}
+static void rect_locks_forget(uint32_t owner){
+    for(RectLock **p=&g_rect_locks;*p;){
+        RectLock *lock=*p;
+        if(lock->owner==owner){*p=lock->next;free(lock);}else p=&lock->next;
+    }
+}
+static uint32_t tex_child(uint32_t t,uint32_t face,uint32_t level,int cube){
+    if(level>=TEX_MIPS || level>=tex_levels(t) || (cube && face>=6))return 0;
+    uint32_t index=cube?face+6u*level:level,slot=tex_child_slot(t,index,cube);
+    uint32_t surface=slot?MR32(slot):0;
+    if(surface && com_valid(surface) && CH_PARENT(surface)==t)return surface;
+    surface=com_new(IF_SURF,64);if(!surface)return 0;
+    CH_FLAGS(surface)|=CF_CHILD;CH_PARENT(surface)=t;CH_REF(surface)=0;
+    MR32(surface+44)=cube?face+1u:0u;
+    MR32(surface+48)=level;
+    if(slot)MR32(slot)=surface;else g_child_uncached++;
+    return surface;
 }
 static uint32_t g_present_no;
 static void com_drop(uint32_t o){
     uint32_t iv = CH_IFACE(o), iface = iv & 0xFFFFu, extra = iv >> 16;
+    rect_locks_forget(o);
     if (ENVC("NFSU2_COMLOG"))                         /* test-only: lifetime trace */
         fprintf(stderr, "[com] destroy %s 0x%08x (frame %u, caller 0x%08x)\n",
                 iface < NEL(g_if) ? g_if[iface].name : "?", o, g_present_no, g_com_cpu ? g_com_cpu->eip : 0u);
@@ -880,27 +986,47 @@ static void sb_destroy(uint32_t o);
  * g_tfq): metal_present waits for the main thread's previous frame, so three
  * presents after the release no recorded frame names the old surface. */
 #define ZID_QUARANTINE 3u
-static uint8_t  g_zid_state[64];                  /* 0 free, 1 live, 2 released */
+/* Texture-owned ids cannot participate in legacy depth-surface sharing. */
+enum { ZID_TEXTURE_LIVE=3, ZID_TEXTURE_RELEASED=4 };
+static uint8_t  g_zid_state[64];                  /* 0 free, 1 surface, 2 released */
+static uint32_t g_zid_owners[64];                 /* legacy surfaces may share one id */
 static uint32_t g_zid_freed_at[64];               /* g_present_no at the release */
 static uint32_t g_zid_next = 2;                    /* where the next search starts */
 static uint32_t g_present_no;
 static void zid_release(uint32_t zid){
     if (zid < 2u || zid >= 64u) return;
-    g_zid_state[zid] = 2; g_zid_freed_at[zid] = g_present_no;
+    if(!g_zid_owners[zid] || --g_zid_owners[zid])return;
+    g_zid_state[zid] = g_zid_state[zid]>=ZID_TEXTURE_LIVE ? ZID_TEXTURE_RELEASED : 2;
+    g_zid_freed_at[zid] = g_present_no;
 }
 static uint32_t zid_take(void){
     uint32_t pick = 0, oldest = 0;
     for (uint32_t k = 0; k < 62u; k++){
         uint32_t z = 2u + (g_zid_next - 2u + k) % 62u;
-        if (g_zid_state[z] == 1) continue;
         uint32_t age = g_present_no - g_zid_freed_at[z];
+        if (g_zid_state[z] == 1 || g_zid_state[z] == ZID_TEXTURE_LIVE ||
+            (g_zid_state[z] == ZID_TEXTURE_RELEASED && age<ZID_QUARANTINE)) continue;
         if (g_zid_state[z] == 0 || age >= ZID_QUARANTINE){ pick = z; break; }
         if (!pick || age > oldest){ pick = z; oldest = age; }   /* none free yet: the longest released */
     }
-    if (!pick) pick = g_zid_next;                  /* 62 live surfaces: share an id (as before) */
+    if (!pick) for(uint32_t k=0;k<62u;k++){
+        uint32_t z=2u+(g_zid_next-2u+k)%62u;
+        if(g_zid_state[z]==1){pick=z;break;}        /* legacy surfaces may share */
+    }
+    if(!pick)return 0;
     g_zid_next = pick + 1u >= 64u ? 2u : pick + 1u;
+    g_zid_owners[pick]++;
     g_zid_state[pick] = 1;
     return pick;
+}
+static uint32_t zid_take_texture(void){
+    for(uint32_t k=0;k<62u;k++){
+        uint32_t z=2u+(g_zid_next-2u+k)%62u;
+        uint32_t age=g_present_no-g_zid_freed_at[z];
+        if(g_zid_state[z] && (g_zid_state[z]==1 || g_zid_state[z]==ZID_TEXTURE_LIVE || age<ZID_QUARANTINE))continue;
+        g_zid_state[z]=ZID_TEXTURE_LIVE;g_zid_owners[z]=1;g_zid_next=z+1u>=64u?2u:z+1u;return z;
+    }
+    return 0;
 }
 /* DirectSound buffers: a duplicate shares the original's PCM block, which
  * is freed when the last buffer using it goes. */
@@ -917,14 +1043,25 @@ static void ds_share(uint32_t data, int d){
 static void com_destroy(uint32_t o){
     uint32_t iface = CH_IFACE(o) & 0xFFFFu;
     switch (iface){
+    case IF_VOLTEX: {
+        if(MR32(o+28) && metal_available())metal_free_texture(MR32(o+28));
+        for(unsigned level=0;level<16;level++){
+            gbuf_free(MR32(o+32+level*4));uint32_t child=MR32(o+128+level*4);
+            if(child && com_valid(child) && CH_PARENT(child)==o)com_drop(child);
+        }
+        break;
+    }
     case IF_TEX: {
         uint32_t tid = MR32(o + 28u);
         if (tid && metal_available()) metal_free_texture(tid);
-        for (uint32_t k = 0; k < 8u; k++){ gbuf_free(MR32(o + 32u + 4u*k)); MR32(o + 32u + 4u*k) = 0; }
+        if(tex_depth_zid(o))zid_release(tex_depth_zid(o));
+        for(unsigned level=0;level<TEX_MIPS;level++){
+            uint32_t slot=tex_buffer_slot(o,level);gbuf_free(MR32(slot));MR32(slot)=0;
+        }
         if (CH_FLAGS(o) & CF_CUBE)
             for (uint32_t k = 0; k < 8u; k++){ gbuf_free(MR32(o + 104u + 4u*k)); MR32(o + 104u + 4u*k) = 0; }
-        for (uint32_t k = 0; k < 10u; k++){
-            uint32_t sf = MR32(o + 64u + 4u*k);
+        for(unsigned k=0;k<((CH_FLAGS(o)&CF_CUBE)?10u:TEX_MIPS);k++){
+            uint32_t sf=MR32(tex_child_slot(o,k,(CH_FLAGS(o)&CF_CUBE)!=0));
             if (sf && com_valid(sf) && CH_PARENT(sf) == o){ gbuf_free(MR32(sf + 32u)); com_drop(sf); }
         }
         break; }
@@ -938,7 +1075,8 @@ static void com_destroy(uint32_t o){
         gbuf_free(MR32(o + 32u));
         break;
     case IF_STATEBLOCK: sb_destroy(o); break;
-    case IF_QUERY: case IF_SWAPCHAIN: break;
+    case IF_QUERY: metal_query_destroy(MR32(o+8)); break;
+    case IF_SWAPCHAIN: break;
     case IF_DSBUF: {
         /* the game silences buffers by releasing them (see Release); the
          * mixer forgets the slot first, then the PCM block can go */
@@ -970,7 +1108,9 @@ static void sb_destroy(uint32_t o){
     int bi = mem_is_committed(o + 11u) ? (int)MR32(o + 8u) : 0;
     if (bi <= 0 || bi >= MAXSB) return;
     SBlock *B = &g_sb[bi];
+    sb_pre_free(B->pre);B->pre=0;
     for (int k = 0; k < B->n; k++){
+        free(B->r[k].constants);B->r[k].constants=NULL;
         int oa = sb_objarg(rec_mid(B->r[k].magic));
         if (oa && B->r[k].a[oa]){ uint32_t x = B->r[k].a[oa]; B->r[k].a[oa] = 0; com_release(x); }
     }
@@ -991,8 +1131,37 @@ static uint32_t dev_surface_kind(uint32_t *slot, uint32_t iface){
 static uint32_t buf_serial(void){ static uint32_t n = 0; return (++n) << 12; }
 
 static uint64_t g_st_ok=0, g_st_null=0, g_st_zero=0, g_st_other=0;
-static uint32_t g_tex_stage[4] = {0,0,0,0};
-static float    g_psc[32][4];                    /* ps constants c0..c31 */
+static uint32_t g_tex_stage[16];
+static float    g_psc[224][4];                    /* ps constants c0..c31 */
+static int32_t g_psbool[16];
+static int32_t g_psint[16][4];
+/* Recorded constants own their bytes; guest upload buffers may be reused. */
+static void *sb_constant_file(int mid,unsigned *limit,unsigned *width){
+    *width=16;*limit=16;
+    if(MID(SetVertexShaderConstantF)){*limit=256;return g_vsk.f;}
+    if(MID(SetPixelShaderConstantF)){*limit=224;return g_psc;}
+    if(MID(SetVertexShaderConstantI))return g_vsk.i;
+    if(MID(SetPixelShaderConstantI))return g_psint;
+    *width=4;
+    if(MID(SetVertexShaderConstantB))return g_vsk.b;
+    if(MID(SetPixelShaderConstantB))return g_psbool;
+    return NULL;
+}
+typedef struct {int mid;uint32_t key,bytes,value[26];} SBAux;
+static SBAux *g_sb_aux;
+static unsigned g_sb_aux_count;
+struct SBPre {
+    unsigned type;
+    uint32_t rs[256],tss[8][40],smp[16][20],tex[16];
+    uint32_t vs,ps,decl,fvf,fvf_layout,vb[16],offset[16],stride[16],ib;
+    VSConst vsk;
+    float psc[224][4];
+    int32_t psbool[16];
+    int32_t psint[16][4];
+    SBAux *aux;
+    unsigned aux_count;
+    int initialized;
+};
 static uint32_t g_psc_max = 0;                   /* highest index seen + 1 */
 static uint32_t g_psc_drop = 0;                  /* writes above 32 (dropped) */
 static int      g_cur_ps_id = 0;                 /* active ps id */
@@ -1052,6 +1221,23 @@ static uint32_t z_surface(uint32_t zid){
              MR32(sf+52)=zid; MR32(sf+56)=ZSURF_MAGIC; }
     return sf;
 }
+/* The standalone September 2026 fix's before-EndScene callbacks. No guest
+ * state changes: AA clears affect the active RT, then gamma copies it to BB. */
+void com_widescreen_postfx(unsigned gamma,unsigned border){
+    if((!gamma&&!border)||gamma>2||border>2||!g_dev||!metal_available())return;
+    unsigned source=g_cur_rt;
+    uint32_t surface=g_bind_rt[0];
+    if(surface && mem_is_committed(surface+47))source|=(MR32(surface+44)&7u)<<16;
+    if(border && !g_ws_msaa_checked){
+        rs_defaults();
+        g_ws_msaa_enabled=metal_widescreen_samples(source)>1 ||
+            metal_widescreen_samples(0)>1 || g_ws_present_samples || g_rs[161];
+        g_ws_msaa_checked=1;
+    }
+    if(!g_ws_msaa_enabled)border=0;
+    if(gamma||border)metal_widescreen_postfx(source,gamma,border);
+}
+
 /* --- device loss / re-creation -----------------------------------------
  * When the window mode changes (full screen <-> window) the drawing
  * resolution must change too; the game's render targets depend on the
@@ -1100,6 +1286,201 @@ static const uint32_t *g_arg_ovr = 0;
 static uint32_t A(CPU*c,int i){
     if (g_arg_ovr) return g_arg_ovr[i & 7];
     return MR32(c->esp + 4u*(uint32_t)i);
+}
+
+/* Predefined blocks use owned snapshots, independent of the recorded-call limit.
+ * Scopes follow Microsoft's Saving Pixel/Vertex/All States stateblock tables. */
+static int sb_rs_scope(unsigned state,unsigned type){
+    static const unsigned vertex[]={22,28,34,35,36,37,38,48,136,137,139,140,141,142,143,
+        145,146,147,148,151,152,154,155,156,157,158,159,160,161,162,163,166,167,
+        170,172,173,178,179,180,181,182,183,184};
+    static const unsigned pixel[]={7,8,9,14,15,16,19,20,23,24,25,26,27,28,29,36,37,38,
+        52,53,54,55,56,57,58,59,60,128,129,130,131,132,133,134,135,142,145,146,
+        147,148,168,171,174,175,176,185,186,187,188,189,190,191,192,193,194,195,
+        198,199,200,201,202,203,204,205,206,207,208,209};
+    if(type==1)return 1;
+    const unsigned *states=type==2?pixel:vertex;
+    unsigned n=type==2?NEL(pixel):NEL(vertex);
+    for(unsigned i=0;i<n;i++)if(states[i]==state)return 1;
+    return 0;
+}
+static unsigned sb_aux_bytes(int mid){
+    if(MID(SetTransform))return 64;
+    if(MID(SetMaterial))return 68;
+    if(MID(SetLight))return 104;
+    if(MID(SetClipPlane) || MID(SetScissorRect))return 16;
+    if(MID(SetViewport))return 24;
+    if(MID(LightEnable) || MID(SetNPatchMode) || MID(SetStreamSourceFreq))return 4;
+    return 0;
+}
+static int sb_aux_scope(int mid,unsigned type){
+    return type==1 || (type==3 && (MID(SetLight) || MID(LightEnable) || MID(SetNPatchMode) || MID(SetStreamSourceFreq)));
+}
+static int sb_light_in(const SBPre *p,uint32_t key){
+    for(unsigned i=0;i<p->aux_count;i++)if(p->aux[i].key==key &&
+        (p->aux[i].mid==MID_SetLight || p->aux[i].mid==MID_LightEnable))return 1;
+    return 0;
+}
+static int sb_aux_captured(const SBPre *p,const SBAux *entry){
+    if(!sb_aux_scope(entry->mid,p->type))return 0;
+    if(p->initialized && (entry->mid==MID_SetLight || entry->mid==MID_LightEnable))return sb_light_in(p,entry->key);
+    return 1;
+}
+static int sb_aux_applied(const SBPre *p,const SBAux *entry){
+    if(!sb_aux_scope(entry->mid,p->type))return 0;
+    if(entry->mid==MID_SetLight || entry->mid==MID_LightEnable)return sb_light_in(p,entry->key);
+    return 1;
+}
+static SBAux *sb_aux_find(int mid,uint32_t key){
+    for(unsigned i=0;i<g_sb_aux_count;i++)if(g_sb_aux[i].mid==mid && g_sb_aux[i].key==key)return &g_sb_aux[i];
+    return NULL;
+}
+static uint32_t sb_aux_store(CPU *c,int mid){
+    unsigned bytes=sb_aux_bytes(mid);
+    int scalar=MID(LightEnable) || MID(SetNPatchMode) || MID(SetStreamSourceFreq);
+    int keyed=MID(SetTransform) || MID(SetLight) || MID(SetClipPlane) || MID(LightEnable) || MID(SetStreamSourceFreq);
+    uint32_t key=keyed?A(c,1):0,data=A(c,keyed?2:1);
+    if(!scalar && (!data || !mem_is_committed(data) || (uint64_t)data+bytes>GSZ || !mem_is_committed(data+bytes-1)))return 0x8876086cu;
+    SBAux *entry=sb_aux_find(mid,key);
+    if(!entry){
+        SBAux *next=realloc(g_sb_aux,(g_sb_aux_count+1)*sizeof *next);if(!next)return 0x8007000eu;
+        g_sb_aux=next;entry=&g_sb_aux[g_sb_aux_count++];memset(entry,0,sizeof *entry);entry->mid=mid;entry->key=key;entry->bytes=bytes;
+    }
+    if(scalar)entry->value[0]=data;else memcpy(entry->value,g_mem+data,bytes);
+    return 0;
+}
+static int sb_aux_get(CPU *c,const char *name,uint32_t *result){
+    int setter=0,keyed=0;
+    if(NMEQ(name,"GetTransform")){setter=MID_SetTransform;keyed=1;}
+    else if(NMEQ(name,"GetMaterial"))setter=MID_SetMaterial;
+    else if(NMEQ(name,"GetLight")){setter=MID_SetLight;keyed=1;}
+    else if(NMEQ(name,"GetLightEnable")){setter=MID_LightEnable;keyed=1;}
+    else if(NMEQ(name,"GetClipPlane")){setter=MID_SetClipPlane;keyed=1;}
+    else if(NMEQ(name,"GetViewport"))setter=MID_SetViewport;
+    else if(NMEQ(name,"GetScissorRect"))setter=MID_SetScissorRect;
+    else if(NMEQ(name,"GetStreamSourceFreq")){setter=MID_SetStreamSourceFreq;keyed=1;}
+    else if(NMEQ(name,"GetNPatchMode"))setter=MID_SetNPatchMode;
+    else return 0;
+    SBAux *entry=sb_aux_find(setter,keyed?A(c,1):0);
+    uint32_t value[26]={0};unsigned bytes=sb_aux_bytes(setter);
+    if(entry)memcpy(value,entry->value,bytes);
+    else if(setter==MID_SetTransform){for(unsigned i=0;i<4;i++)value[5*i]=0x3f800000u;}
+    else if(setter==MID_SetViewport){value[2]=g_bb_w;value[3]=g_bb_h;value[5]=0x3f800000u;}
+    else if(setter==MID_SetStreamSourceFreq)value[0]=1;
+    if(setter==MID_SetNPatchMode){
+        float f;memcpy(&f,value,4);c->top=(c->top-1)&7;c->st[c->top]=f;*result=0;
+    }else{
+        uint32_t output=A(c,keyed?2:1);*result=output?0:0x8876086cu;
+        if(output && (uint64_t)output+bytes<=GSZ){mem_commit(output,bytes);memcpy(g_mem+output,value,bytes);}
+        else *result=0x8876086cu;
+    }
+    return 1;
+}
+static int device_state_get(CPU *c,const char *name,uint32_t *result){
+    uint32_t value=0,output=0,bytes=4,object=0;
+    const void *source=&value;*result=0x8876086cu;
+    if(NMEQ(name,"GetRenderState")){
+        if(A(c,1)>=256)return 1;rs_defaults();value=g_rs[A(c,1)];output=A(c,2);
+    }else if(NMEQ(name,"GetSamplerState")){
+        if(A(c,1)>=16 || A(c,2)>=20)return 1;value=g_smp_raw[A(c,1)][A(c,2)];output=A(c,3);
+    }else if(NMEQ(name,"GetTextureStageState")){
+        if(A(c,1)>=8 || A(c,2)>=40)return 1;value=g_tss_raw[A(c,1)][A(c,2)];output=A(c,3);
+    }else if(NMEQ(name,"GetTexture")){
+        if(A(c,1)>=16)return 1;object=value=g_raw_tex[A(c,1)];output=A(c,2);
+    }else if(NMEQ(name,"GetStreamSource")){
+        unsigned stream=A(c,1);if(stream>=16 || !A(c,2) || !A(c,3) || !A(c,4))return 1;
+        for(unsigned i=2;i<=4;i++)if((uint64_t)A(c,i)+4>GSZ)return 1;
+        for(unsigned i=2;i<=4;i++)mem_commit(A(c,i),4);
+        MR32(A(c,2))=g_bind_vb[stream];MR32(A(c,3))=g_stream_offset[stream];MR32(A(c,4))=g_stream_stride[stream];
+        if(g_bind_vb[stream])com_addref(g_bind_vb[stream]);*result=0;return 1;
+    }else if(NMEQ(name,"GetVertexShader")){object=value=g_raw_vs;output=A(c,1);
+    }else if(NMEQ(name,"GetPixelShader")){object=value=g_raw_ps;output=A(c,1);
+    }else if(NMEQ(name,"GetVertexDeclaration")){object=value=g_raw_decl;output=A(c,1);
+    }else if(NMEQ(name,"GetIndices")){object=value=g_ib_obj;output=A(c,1);
+    }else if(NMEQ(name,"GetFVF")){value=g_cur_fvf;output=A(c,1);
+    }else if(!strncmp(name,"GetVertexShaderConstant",23)){
+        unsigned start=A(c,1),count=A(c,3);output=A(c,2);int floats=NMEQ(name,"GetVertexShaderConstantF"),booleans=NMEQ(name,"GetVertexShaderConstantB");
+        unsigned limit=floats?256:16;if(start>=limit || !count || count>limit-start)return 1;
+        bytes=count*(booleans?4:16);source=floats?(const void*)g_vsk.f[start]:booleans?(const void*)(g_vsk.b+start):(const void*)g_vsk.i[start];
+    }else return 0;
+    if(!output || (uint64_t)output+bytes>GSZ)return 1;
+    mem_commit(output,bytes);memcpy(g_mem+output,source,bytes);if(object)com_addref(object);*result=0;return 1;
+}
+static int sb_aux_restore(const SBPre *p){
+    if(p->type==2)return 1;
+    unsigned count=p->aux_count;
+    for(unsigned i=0;i<g_sb_aux_count;i++)if(!sb_aux_applied(p,&g_sb_aux[i]))count++;
+    SBAux *next=count?malloc(count*sizeof *next):NULL;if(count && !next)return 0;
+    unsigned n=0;
+    for(unsigned i=0;i<g_sb_aux_count;i++)if(!sb_aux_applied(p,&g_sb_aux[i]))next[n++]=g_sb_aux[i];
+    if(p->aux_count)memcpy(next+n,p->aux,p->aux_count*sizeof *next);
+    free(g_sb_aux);g_sb_aux=next;g_sb_aux_count=count;return 1;
+}
+static void sb_pre_refs(SBPre *p,int add){
+    uint32_t objects[36];unsigned n=0;
+    if(p->type!=2){objects[n++]=p->vs;objects[n++]=p->decl;}
+    if(p->type!=3)objects[n++]=p->ps;
+    if(p->type==1){
+        for(int i=0;i<16;i++)objects[n++]=p->tex[i];
+        for(int i=0;i<16;i++)objects[n++]=p->vb[i];
+        objects[n++]=p->ib;
+    }
+    for(unsigned i=0;i<n;i++)if(objects[i]){if(add)com_addref(objects[i]);else com_release(objects[i]);}
+}
+static int sb_pre_capture(SBPre *p){
+    unsigned count=0;for(unsigned i=0;i<g_sb_aux_count;i++)if(sb_aux_captured(p,&g_sb_aux[i]))count++;
+    SBAux *aux=count?malloc(count*sizeof *aux):NULL;if(count && !aux)return 0;
+    unsigned n=0;for(unsigned i=0;i<g_sb_aux_count;i++)if(sb_aux_captured(p,&g_sb_aux[i]))aux[n++]=g_sb_aux[i];
+    sb_pre_refs(p,0);
+    free(p->aux);p->aux=aux;p->aux_count=count;
+    rs_defaults();
+    memcpy(p->rs,g_rs,sizeof p->rs);memcpy(p->tss,g_tss_raw,sizeof p->tss);
+    memcpy(p->smp,g_smp_raw,sizeof p->smp);memcpy(p->tex,g_raw_tex,sizeof p->tex);
+    p->vs=g_raw_vs;p->ps=g_raw_ps;p->decl=g_raw_decl;p->fvf=g_cur_fvf;p->fvf_layout=g_fvf_layout;p->ib=g_ib_obj;
+    memcpy(p->vb,g_bind_vb,sizeof p->vb);memcpy(p->offset,g_stream_offset,sizeof p->offset);memcpy(p->stride,g_stream_stride,sizeof p->stride);
+    p->vsk=g_vsk;memcpy(p->psc,g_psc,sizeof p->psc);memcpy(p->psbool,g_psbool,sizeof p->psbool);
+    memcpy(p->psint,g_psint,sizeof p->psint);
+    sb_pre_refs(p,1);
+    p->initialized=1;
+    return 1;
+}
+static void sb_pre_free(SBPre *p){if(p){sb_pre_refs(p,0);free(p->aux);free(p);}}
+int com_call(CPU *,uint32_t);
+static void sb_set(CPU *c,const char *name,const uint32_t args[8]){
+    for(unsigned slot=0;slot<g_if[IF_DEV].n;slot++)if(!strcmp(g_if[IF_DEV].m[slot].name,name)){
+        g_arg_ovr=args;com_call(c,COM_MAGIC|(IF_DEV<<16)|slot);return;
+    }
+}
+static int sb_pre_apply(CPU *c,const SBPre *p){
+    if(!sb_aux_restore(p))return 0;
+    const uint32_t *saved_args=g_arg_ovr;int saved_replay=g_sb_replay,saved_record=g_sb_rec;
+    g_sb_replay=1;g_sb_rec=0;
+    for(unsigned i=0;i<256;i++)if(sb_rs_scope(i,p->type))g_rs[i]=p->rs[i];
+    for(unsigned stage=0;stage<8;stage++)for(unsigned state=0;state<40;state++)
+        if(p->type!=3 || state==11 || state==24)g_tss_raw[stage][state]=p->tss[stage][state];
+    for(unsigned stage=0;stage<16;stage++)for(unsigned state=0;state<20;state++)
+        if(p->type==1 || (p->type==3?state==13:state>=1 && state<=12))g_smp_raw[stage][state]=p->smp[stage][state];
+    uint32_t args[8]={g_dev};
+    if(p->type!=2){
+        g_vsk=p->vsk;args[1]=p->vs;sb_set(c,"SetVertexShader",args);
+        args[1]=p->decl;sb_set(c,"SetVertexDeclaration",args);args[1]=p->fvf;sb_set(c,"SetFVF",args);
+        g_fvf_layout=p->fvf_layout;
+    }
+    if(p->type!=3){
+        memcpy(g_psc,p->psc,sizeof g_psc);memcpy(g_psbool,p->psbool,sizeof g_psbool);
+        memcpy(g_psint,p->psint,sizeof g_psint);
+        args[1]=p->ps;sb_set(c,"SetPixelShader",args);
+    }
+    if(p->type==1){
+        for(unsigned stage=0;stage<16;stage++){args[1]=stage;args[2]=p->tex[stage];sb_set(c,"SetTexture",args);}
+        for(unsigned stream=0;stream<16;stream++){
+            args[1]=stream;args[2]=p->vb[stream];args[3]=p->offset[stream];args[4]=p->stride[stream];sb_set(c,"SetStreamSource",args);
+        }
+        args[1]=p->ib;sb_set(c,"SetIndices",args);
+    }
+    g_rs_dirty=1;if(metal_available()){rs_apply();g_rs_dirty=0;}
+    g_arg_ovr=saved_args;g_sb_replay=saved_replay;g_sb_rec=saved_record;
+    return 1;
 }
 
 /* --- run a guest callback as stdcall --------------------
@@ -1165,11 +1546,11 @@ static inline uint64_t now_ns(void){
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
     return (uint64_t)ts.tv_sec*1000000000ull + (uint64_t)ts.tv_nsec;
 }
-/* GPU shader id for a (vertex shader, vertex declaration) pair.  The
- * same bytecode can be used with different declarations, so the key is
- * the two together. */
+/* A declaration may be recreated for every quad. Cache the input fetch
+ * mapping consumed by the translator, rather than its guest handle.
+ * Stride and texture-coordinate selection are per-draw VSPar constants. */
 #define MAXGVS 256
-static struct { uint32_t vs, decl; int gid, state; } g_gvs[MAXGVS];
+static struct { uint32_t vs; int dcl[16][2]; int gid, state; } g_gvs[MAXGVS];
 static int g_gvsn = 0, g_gvs_next = 1;
 static int g_gvs_nk[MAXGVS];
 static int g_gpuvs = -1;
@@ -1177,20 +1558,20 @@ static uint64_t g_gpuvs_draws = 0, g_gpuvs_fail = 0, g_gpuvs_drop = 0;
 
 static int gpuvs_id(const VSProg *prog, uint32_t vs, uint32_t decl,
                     const DElem *el, int nel){
-    for (int i = 0; i < g_gvsn; i++)
-        if (g_gvs[i].vs == vs && g_gvs[i].decl == decl)
-            return g_gvs[i].state > 0 ? g_gvs[i].gid : -1;
-    if (g_gvsn >= MAXGVS || g_gvs_next >= MAXGVS) return -1;
-    int slot = g_gvsn++;
-    g_gvs[slot].vs = vs; g_gvs[slot].decl = decl;
-    g_gvs[slot].state = -1; g_gvs[slot].gid = 0;
-
     int dcl[16][2];
     for (int i = 0; i < 16; i++){ dcl[i][0] = -1; dcl[i][1] = 0; }
     for (int k = 0; k < nel; k++){
         int rg = el[k].reg;
         if (rg >= 0 && rg < 16){ dcl[rg][0] = (int)el[k].off; dcl[rg][1] = (int)el[k].type; }
     }
+    for (int i = 0; i < g_gvsn; i++)
+        if (g_gvs[i].vs == vs && !memcmp(g_gvs[i].dcl, dcl, sizeof dcl))
+            return g_gvs[i].state > 0 ? g_gvs[i].gid : -1;
+    if (g_gvsn >= MAXGVS || g_gvs_next >= MAXGVS) return -1;
+    int slot = g_gvsn++;
+    g_gvs[slot].vs = vs; memcpy(g_gvs[slot].dcl, dcl, sizeof dcl);
+    g_gvs[slot].state = -1; g_gvs[slot].gid = 0;
+
     int gid = g_gvs_next;
     /* GPUVSMASK: which translated shaders are allowed (bit0=vs_1).
      * For bisecting an image bug shader by shader. */
@@ -1268,19 +1649,26 @@ static int gpuvs_id(const VSProg *prog, uint32_t vs, uint32_t decl,
  * (Hor+).  Telling them apart: oPos.w = dot(v, c3); c3.w=0 in perspective,
  * c3.w=1 in the orthographic (UI) matrix.  The UI is left alone. */
 static float g_aspfix = 1.f;
+void com_clear_movie_borders(void){
+    if(metal_available()){
+        void metal_clear_target_ex(unsigned,unsigned,float);
+        metal_clear_target_ex(0xff000000u,1u,1.f);
+    }
+}
 /* Hor+ factor (for clip-space x); the HD composite pass uses it to bring
  * the camera into the same space as the geometry drawn on screen. */
 float com_aspfix(void){ return ws_persp_x(); }
 #if NFS_ENHANCED
-static VSProg *g_psprog[256];
+static VSProg *g_psprog[PSCUBE];
 /* Reflection-separation variant: base ps (cube=1 for the cube variant),
  * reflection stage k, Metal id vid.  1 on success. */
 int com_ps_refl_variant(int base, int cube, int k, int vid){
-    if (base <= 0 || base >= 256 || !g_psprog[base]) return 0;
+    if (base <= 0 || base >= PSCUBE || !g_psprog[base]) return 0;
     static char msl[32768];
     if (ps_to_msl_ex2(g_psprog[base], vid, msl, sizeof msl, cube ? 1u : 0u, k) <= 0) return 0;
     void metal_register_ps(int, const char *);
     metal_register_ps(vid, msl);
+    metal_set_ps_outputs(vid,ps_color_output_mask(g_psprog[base]));
     fprintf(stderr, "[HD] reflection variant: ps %d%s stage %d -> %d\n",
             base, cube ? " (cube)" : "", k, vid);
     return 1;
@@ -1329,7 +1717,8 @@ static void res_pick(uint32_t gw, uint32_t gh, uint32_t *dw, uint32_t *dh){
          * (RT resizing and GetDisplayMode look at them). */
         g_req_w = g_req_h = 0; g_aspfix = 1.f;
         ws_set_mapping(1.f);
-        { void metal_set_ui_aspect(float, float); metal_set_ui_aspect(1.f, 1.f); }
+        ws_set_resolution(gw,gh);
+        { void metal_set_ui_aspect(float, float); metal_set_ui_aspect(ws_ui_x(), ws_ui_y()); }
         return;
     }
     g_req_w = gw; g_req_h = gh;
@@ -1346,6 +1735,7 @@ static void res_pick(uint32_t gw, uint32_t gh, uint32_t *dw, uint32_t *dh){
     /* widescreen.c decides what the renderer and the game hooks do with
      * the ratio; the mouse maps onto the 4:3 HUD the same way. */
     ws_set_mapping(g_aspfix);
+    ws_set_resolution(aw,ah);
     { void metal_set_ui_aspect(float, float); metal_set_ui_aspect(ws_ui_x(), ws_ui_y()); }
     fprintf(stderr,"com: device resolution %ux%u -> %ux%u (aspfix=%.4f)\n",
             gw, gh, aw, ah, (double)g_aspfix);
@@ -1394,7 +1784,7 @@ static void ws_log_draw(const char *kind, const VSConst *vsk, int cx, int cw){
 /* this draw's 2D UI band (aspect_apply), 1 = none */
 static float g_ui_clip = 1.f;
 static const VSConst *aspect_apply(const VSConst *vsk, const VSProg *prog){
-    if (g_aspfix == 1.f || !prog) return vsk;
+    if (!prog) return vsk;
     unsigned vs = g_cur_vs;
     if (vs >= MAXVS) return vsk;
     if (!g_pos_seen[vs]){
@@ -1533,20 +1923,21 @@ static const VSConst *fixmat_apply(const VSConst *vsk){
  *          9=MAXMIPLEVEL 10=MAXANISOTROPY
  * Previously all of it was ignored and everything was drawn linear+mip-linear. */
 static void smp_push(void){
-    void metal_set_samplers(const unsigned k[4]);
-    unsigned k[4];
-    for (int st = 0; st < 4; st++){
+    void metal_set_samplers(const unsigned k[16]);
+    unsigned k[16];
+    for (int st = 0; st < 16; st++){
         unsigned mn = g_smp_raw[st][6], mg = g_smp_raw[st][5], mp = g_smp_raw[st][7];
-        unsigned au = g_smp_raw[st][1], av = g_smp_raw[st][2], an = g_smp_raw[st][10];
+        unsigned au = g_smp_raw[st][1], av = g_smp_raw[st][2], aw=g_smp_raw[st][3], an = g_smp_raw[st][10];
         if (mn < 1u || mn > 3u) mn = 2u;          /* invalid/unset -> LINEAR */
         if (mg < 1u || mg > 3u) mg = 2u;
         if (mp > 2u) mp = 0u;
         if (au < 1u || au > 5u) au = 1u;          /* -> WRAP */
         if (av < 1u || av > 5u) av = 1u;
+        if(aw<1u || aw>5u)aw=1u;
         if (an < 1u) an = 1u; if (an > 16u) an = 16u;
         unsigned al = 0; while ((1u << al) < an) al++;
         k[st] = (mn & 3u) | ((mg & 3u) << 2) | ((mp & 3u) << 4)
-              | ((au & 7u) << 6) | ((av & 7u) << 9) | ((al & 7u) << 12);
+              | ((au & 7u) << 6) | ((av & 7u) << 9) | ((al & 7u) << 12) | ((aw & 7u)<<18);
     }
     metal_set_samplers(k);
 }
@@ -1606,6 +1997,9 @@ static void draw_lines(const TVert *tv, uint32_t nv, uint32_t pt){
     unsigned nq = 0;
     uint32_t nseg = (pt == 2u) ? nv / 2u : nv - 1u;
     metal_set_cull(1u);                      /* lines are never culled */
+#ifndef __wasm__
+    metal_set_depth_bias(0,0);               /* D3D bias applies only to triangles. */
+#endif
     for (uint32_t s = 0; s < nseg; s++){
         const TVert *a = &tv[(pt == 2u) ? 2u * s : s], *b = a + 1;
         if (a->w <= 0.f || b->w <= 0.f) continue;
@@ -1626,6 +2020,7 @@ static void draw_lines(const TVert *tv, uint32_t nv, uint32_t pt){
     }
     if (nq) metal_draw_tv(q, nq, 4u, g_cur_tex);
     metal_set_cull(g_rs[22] ? g_rs[22] : 3u);
+    depth_bias_push();
 }
 
 /* dip_indexed -> draw_up: this draw's vertices are to be read by index from
@@ -1633,15 +2028,38 @@ static void draw_lines(const TVert *tv, uint32_t nv, uint32_t pt){
  * it returns 0 and the caller falls back to the old (index expansion) path. */
 static struct { uint32_t n, vbo, ibo, isz; int32_t base; uint64_t gh; } g_ix;
 static uint64_t g_dip_ix = 0, g_dip_ixfb[6];
+/* The bundled Rain module uses exactly these two fixed-function stages. */
+static int fixed_function_mode(void){
+    if(g_fvf_layout!=0x244u || g_cur_ps_id || g_tss_raw[1][1]<=1)return 0;
+    static const uint32_t stages[2][6]={{4,0,2,4,0,2},{4,2,1,2,1,0}};
+    for(unsigned stage=0;stage<2;stage++){
+        for(unsigned state=1;state<=(stage?5:6);state++)
+            if(g_tss_raw[stage][state]!=stages[stage][state-1])return -1;
+        if(g_tss_raw[stage][11]!=stage || g_tss_raw[stage][24])return -1;
+    }
+    if(g_tss_raw[2][1]>1)return -1;
+    return 1;
+}
 static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
     uint64_t _t0 = now_ns();
+    int ff=fixed_function_mode();if(ff<0)return 0;
+#ifndef __wasm__
+    metal_set_fixed_function((unsigned)ff);
+#endif
+    int transformed=g_fvf_layout==0x244u;
+    unsigned width=g_bb_w,height=g_bb_h;
+    if(transformed){
+        if(stride<36 || nv>4096 || !width || !height)return 0;
+        if(g_cur_rt){void metal_tex_size(unsigned,unsigned*,unsigned*);metal_tex_size(g_cur_rt,&width,&height);}
+        if(!width || !height)return 0;
+    }
     static TVert tv[4096];
     const VSConst *vsk = &g_vsk;
     if (g_fixmat < 0){ const char *e6 = ENVC("FIXMAT");
         g_fixmat = (e6 && *e6 && *e6 != '0') ? 1 : 0; }
     if (g_gpuvs < 0){ const char *e8 = ENVC("GPUVS");
         g_gpuvs = !e8 || *e8 != '0'; }
-    const VSProg *prog = (g_cur_vs && g_cur_vs < MAXVS) ? g_vsprog[g_cur_vs] : 0;
+    const VSProg *prog = (!transformed && g_cur_vs && g_cur_vs < MAXVS) ? g_vsprog[g_cur_vs] : 0;
     vsk = fixmat_apply(vsk);
     g_ui_clip = 1.f;
     vsk = aspect_apply(vsk, prog);
@@ -1730,7 +2148,8 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
                                 unsigned, int, const float*, unsigned);
             void metal_set_stage_tex(unsigned,unsigned,unsigned);
             void metal_set_ps(int, const float *);
-            metal_set_stage_tex(g_tex_stage[1], g_tex_stage[2], g_tex_stage[3]);
+            metal_set_stage_textures(g_tex_stage);
+            metal_set_ps_bool(g_psbool);
             metal_set_ps(g_cur_ps_id, &g_psc[0][0]);
             texproj_push(); smp_push();
             if (g_ix.n){
@@ -1760,6 +2179,22 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
     for (uint32_t i = 0; i < nv; i++){
         uint32_t o = vp + i*stride;
         TVert *out = &tv[i];
+        if(transformed){
+            if(!mem_is_committed(o+35))return 0;
+            float rhw=MRF32(o+12);if(!isfinite(rhw)||rhw<=0)return 0;
+            float w=1.f/rhw;memset(out,0,sizeof *out);
+            /* D3D9 pixel centers are integer; Metal's are half-integer. */
+            out->x=((MRF32(o)+.5f)*2.f/width-1.f)*w;
+            out->y=(1.f-(MRF32(o+4)+.5f)*2.f/height)*w;
+            out->z=MRF32(o+8)*w;out->w=w;
+            float color[4];decl_fetch(o+16,4,color);memcpy(&out->r,color,sizeof color);
+            for(unsigned stage=0;stage<8;stage++){
+                unsigned coord=g_tss_raw[stage][11]&0xffffu;
+                if(coord>1)coord=0;
+                out->t[stage][0]=MRF32(o+20+coord*8);out->t[stage][1]=MRF32(o+24+coord*8);out->t[stage][3]=1;
+            }
+            continue;
+        }
         if (prog && nel){
             /* DIAGNOSTIC (FIXMAT=1): the game's WVP matrix arrives as diag(0,0,1,1) --
              * X/Y scale zero.  While the root cause is hunted, put in a sensible
@@ -1808,7 +2243,7 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
                        so.pos[2]=v[0][2]; so.pos[3]=1.f;
                        so.col[0][0]=so.col[0][1]=so.col[0][2]=so.col[0][3]=1.f; }
             else { uint64_t _v0 = now_ns();
-                   vs_run(prog, vsk, (const float (*)[4])v, &so);
+                   if(!vs_run(prog, vsk, (const float (*)[4])v, &so))return 0;
                    g_t_vs_ns += now_ns() - _v0; }
             out->x=so.pos[0]; out->y=so.pos[1]; out->z=so.pos[2]; out->w=so.pos[3];
             out->r=so.col[0][0]; out->g=so.col[0][1];
@@ -1817,9 +2252,10 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
             out->b1=so.col[1][2]; out->a1=so.col[1][3];
             /* On the GPU path the vertex shader makes this selection; the CPU
              * path must apply the SAME permutation or the two paths diverge. */
-            for (int ts = 0; ts < 4; ts++){
-                unsigned ci = g_tss_raw[ts][11] & 0xFFFFu;
-                if (ci > 3u) ci = (unsigned)ts;
+            memcpy(out->col_extra,so.col[2],sizeof out->col_extra);
+            for (int ts = 0; ts < 8; ts++){
+                unsigned ci = vs_version(prog)>=0x0300 ? (unsigned)ts : g_tss_raw[ts][11] & 0xFFFFu;
+                if (ci > 7u) ci = (unsigned)ts;
                 for (int tc = 0; tc < 4; tc++) out->t[ts][tc] = so.tex[ci][tc];
             }
         } else {
@@ -1831,7 +2267,8 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
             out->w=(p_type==3)?pos[3]:1.f;
             out->r=col[0]; out->g=col[1]; out->b=col[2]; out->a=col[3];
             out->r1=0.f; out->g1=0.f; out->b1=0.f; out->a1=0.f;
-            for (int ts = 0; ts < 4; ts++){
+            memset(out->col_extra,0,sizeof out->col_extra);
+            for (int ts = 0; ts < 8; ts++){
                 out->t[ts][0]=uv[0]; out->t[ts][1]=uv[1];
                 out->t[ts][2]=0.f;   out->t[ts][3]=1.f;
             }
@@ -1862,7 +2299,8 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
       } }
     { void metal_set_stage_tex(unsigned,unsigned,unsigned);
       void metal_set_ps(int, const float *);
-      metal_set_stage_tex(g_tex_stage[1], g_tex_stage[2], g_tex_stage[3]);
+      metal_set_stage_textures(g_tex_stage);
+            metal_set_ps_bool(g_psbool);
       metal_set_ps(g_cur_ps_id, &g_psc[0][0]);
       texproj_push(); smp_push();
       if (ENVC("PSC0")){ static int n5=0;
@@ -2029,8 +2467,8 @@ void dxrec_end(void){ if (g_dxrec_depth > 0) g_dxrec_depth--; }
 static uint32_t dxrec_datalen(int mid, const uint32_t *a){
     if (MID(SetVertexShaderConstantF)){ uint32_t n = a[2]; if (a[0] >= 256u) return 0;
         if (a[0] + n > 256u) n = 256u - a[0]; return n*16u; }
-    if (MID(SetPixelShaderConstantF)){ uint32_t n = a[2]; if (a[0] >= 32u) return 0;
-        if (a[0] + n > 32u) n = 32u - a[0]; return n*16u; }
+    if (MID(SetPixelShaderConstantF)){ uint32_t n = a[2]; if (a[0] >= 224u) return 0;
+        if (n > 224u - a[0]) n = 224u - a[0]; return n*16u; }
     return 0;
 }
 /* a[]: the arguments after this; d: constant data (dlen bytes). */
@@ -2043,10 +2481,10 @@ static int dxrec_call_redundant(int mid, const uint32_t *a, const uint8_t *d, ui
         return !(a[0] < 8u && a[1] < 40u) || g_tss_raw[a[0]][a[1]] == a[2];
     if (MID(SetTexture)){
         uint32_t stg = a[0], to = a[1];
-        if (stg >= 8u) return 1;
+        if (stg >= 16u) return 1;
         uint32_t der = (to && mem_is_committed(to+28)) ? MR32(to+28) : 0;
         if (g_raw_tex[stg] != to) return 0;
-        if (stg < 4u && g_tex_stage[stg] != der) return 0;
+        if (stg < 16u && g_tex_stage[stg] != der) return 0;
         if (stg == 0 && g_cur_tex != der) return 0;
         return 1;
     }
@@ -2299,15 +2737,35 @@ int com_call(CPU *c, uint32_t magic){
      * is only written into the block. */
     if (g_sb_rec && iface==IF_DEV && !g_sb_replay && sb_recordable(mid)){
         SBlock *B = &g_sb[g_sb_rec];
+        unsigned limit,width;void *constants=NULL;
+        if(sb_constant_file(mid,&limit,&width)){
+            uint32_t start=A(c,1),pointer=A(c,2),count=A(c,3);
+            if(start<limit && !count){c->eax=0;c->esp+=4u*(uint32_t)nargs;return 1;}
+            uint64_t bytes=(uint64_t)count*width;
+            uint32_t status=0;
+            if(start>=limit || count>limit-start || !count || !pointer ||
+               (uint64_t)pointer+bytes>GSZ || !mem_is_committed(pointer) ||
+               !mem_is_committed(pointer+(uint32_t)bytes-1))status=0x8876086cu;
+            else if(B->n>=MAXSBREC || !(constants=malloc((size_t)bytes)))status=0x8007000eu;
+            if(status){c->eax=status;c->esp+=4u*(uint32_t)nargs;return 1;}
+            memcpy(constants,g_mem+pointer,(size_t)bytes);
+            if(MID(SetPixelShaderConstantB))for(unsigned q=0;q<count;q++)
+                ((int32_t*)constants)[q]=((int32_t*)constants)[q]!=0;
+        }
         if (B->n < MAXSBREC){
             SBRec *R = &B->r[B->n++];
-            R->magic = magic; R->nargs = nargs;
+            R->magic = magic; R->nargs = nargs;R->constants=constants;
             for (int i2 = 0; i2 < 8; i2++) R->a[i2] = (i2 < nargs) ? A(c,i2) : 0u;
             { int oa = sb_objarg(mid); if (oa && R->a[oa]) com_addref(R->a[oa]); }
         } else g_sb_dropped++;
         c->eax = 0;
         c->esp += 4u*(uint32_t)nargs;
         return 1;
+    }
+
+    if(iface==IF_DEV && sb_aux_bytes(mid)){
+        uint32_t status=sb_aux_store(c,mid);
+        if(status){c->eax=status;if(!g_sb_replay)c->esp+=4u*(uint32_t)nargs;return 1;}
     }
 
     /* --- common: IUnknown --- */
@@ -2403,6 +2861,7 @@ int com_call(CPU *c, uint32_t magic){
              * no effect -- the game recreates the device with the new size,
              * and we handed back the same device and ignored the size. */
             uint32_t ppp=A(c,5);
+            g_ws_msaa_checked=0;g_ws_present_samples=ppp && mem_is_committed(ppp+19)?MR32(ppp+16):0;
             /* x87 state, as Direct3D 9 leaves it: without
              * D3DCREATE_FPU_PRESERVE (0x2) the calling thread's control
              * word becomes single precision, round to nearest, all
@@ -2487,6 +2946,7 @@ int com_call(CPU *c, uint32_t magic){
     }
     /* --- IDirect3DDevice9 --- */
     else if (iface==IF_DEV){if (MID(SetRenderState)){
+            rs_defaults();
             uint32_t st=A(c,1), val=A(c,2);
             if (st < 256u){
                 if (g_rs[st] != val){ g_rs[st] = val; g_rs_dirty = 1;
@@ -2525,10 +2985,10 @@ int com_call(CPU *c, uint32_t magic){
                             A(c,1), A(c,2), g_cur_vs); }
             }
             uint32_t stg=A(c,1), to=A(c,2);
-            if (stg < 8u){ g_raw_tex[stg] = to; bind_set(&g_bind_tex[stg], to); }
+            if (stg < 16u){ g_raw_tex[stg] = to; bind_set(&g_bind_tex[stg], to); }
             /* Track all stages: car paint/reflection may be in the upper
              * stages; for now for measurement only. */
-            if (stg < 4u)
+            if (stg < 16u)
                 g_tex_stage[stg] = (to && mem_is_committed(to+28)) ? MR32(to+28) : 0;
             if (stg==0){
                 g_cur_tex = (to && mem_is_committed(to+28)) ? MR32(to+28) : 0;
@@ -2548,12 +3008,15 @@ int com_call(CPU *c, uint32_t magic){
             } else g_st_other++;
             r=0; }
         else if (!strncmp(nm,"Draw",4)){
-            g_draw++;
+            r=0;g_draw++;
             { static const char *seen[8]; static int ns=0;
               int f=0; for(int q=0;q<ns;q++) if(seen[q]==nm) f=1;   /* names come from the g_if table: the pointer suffices */
               if(!f && ns<8){ seen[ns++]=nm;
                   fprintf(stderr,"  [draw-name] \"%s\"\n", nm); } }
-            if (MID(DrawIndexedPrimitive)){
+            if(fixed_function_mode()<0){
+                fprintf(stderr,"com: unsupported FVF0x244 fixed-function texture stages\n");r=0x8876086cu;
+            }
+            else if (MID(DrawIndexedPrimitive)){
                 /* (this, Type, BaseVertexIndex, MinIndex, NumVertices,
                  *  StartIndex, PrimitiveCount) */
                 uint32_t pt=A(c,1), basev=A(c,2), starti=A(c,5), nprim=A(c,6);
@@ -2663,7 +3126,7 @@ int com_call(CPU *c, uint32_t magic){
                     }
                 }
             }
-            r=0; }
+        }
         else if (MID(SetVertexShader)){
             uint32_t h=A(c,1); g_raw_vs = h;
             g_cur_vs = (h && mem_is_committed(h+15)) ? MR32(h+12) : 0;
@@ -2985,21 +3448,42 @@ int com_call(CPU *c, uint32_t magic){
         else if (MID(SetStreamSource)){
             /* (this, StreamNumber, pStreamData, OffsetInBytes, Stride) */
             if (A(c,1)==0u){ g_ss_vb=A(c,2); g_ss_off=A(c,3); g_ss_stride=A(c,4); }
-            if (A(c,1) < 4u) bind_set(&g_bind_vb[A(c,1)], A(c,2));
+            if (A(c,1) < 16u){
+                g_stream_offset[A(c,1)]=A(c,3);g_stream_stride[A(c,1)]=A(c,4);
+                bind_set(&g_bind_vb[A(c,1)], A(c,2));
+            }
             r=0; }
         else if (MID(SetIndices)){ g_ib_obj=A(c,1); bind_set(&g_bind_ib, A(c,1)); r=0; }
         else if (MID(SetPixelShaderConstantF)){
             /* (this, StartRegister, pConstantData, Vector4fCount) */
             uint32_t sr2=A(c,1), pd2=A(c,2), n2=A(c,3);
             if (sr2+n2 > g_psc_max) g_psc_max = sr2+n2;
-            if (sr2+n2 > 32u) g_psc_drop++;
-            for (uint32_t q4=0; q4<n2 && sr2+q4<32u; q4++){
+            if (sr2>=224u || n2>224u-sr2) g_psc_drop++;
+            for (uint32_t q4=0; q4<n2 && sr2<224u && q4<224u-sr2; q4++){
                 uint32_t off = pd2 + 16u*q4;
                 if (!pd2 || !mem_is_committed(off+15)) break;
                 for (int c4=0;c4<4;c4++) g_psc[sr2+q4][c4] = MRF32(off+4u*(uint32_t)c4);
             }
             r=0; }
 
+        else if(MID(SetPixelShaderConstantB) || MID(GetPixelShaderConstantB)){
+            uint32_t start=A(c,1),pointer=A(c,2),count=A(c,3);
+            if(start>=16 || count>16-start || !pointer || !mem_is_committed(pointer+count*4-1))r=0x8876086cu;
+            else {for(uint32_t q=0;q<count;q++){
+                if(MID(SetPixelShaderConstantB))g_psbool[start+q]=MR32(pointer+q*4)!=0;
+                else MR32(pointer+q*4)=g_psbool[start+q];
+            }r=0;}
+        }
+        else if(MID(GetPixelShaderConstantF)){
+            uint32_t start=A(c,1),pointer=A(c,2),count=A(c,3);
+            if(start>=224 || count>224-start || !pointer || !mem_is_committed(pointer+count*16-1))r=0x8876086cu;
+            else {memcpy(g_mem+pointer,g_psc[start],count*16);r=0;}
+        }
+        else if(MID(SetPixelShaderConstantI) || MID(GetPixelShaderConstantI)){
+            uint32_t start=A(c,1),pointer=A(c,2),count=A(c,3);
+            if(start>=16 || count>16-start || !pointer || !count || !mem_is_committed(pointer) || !mem_is_committed(pointer+count*16-1))r=0x8876086cu;
+            else {if(MID(SetPixelShaderConstantI))memcpy(g_psint[start],g_mem+pointer,count*16);else memcpy(g_mem+pointer,g_psint[start],count*16);r=0;}
+        }
         else if      (MID(TestCooperativeLevel)){
             g_tcl_n++;
             /* Device loss (fullscreen switch): as on D3D9 the game releases
@@ -3174,7 +3658,9 @@ int com_call(CPU *c, uint32_t magic){
             }
             /* (this, RenderTargetIndex, pRenderTarget) */
             uint32_t idx=A(c,1), surf=A(c,2);
-            if (idx < 4u) bind_set(&g_bind_rt[idx], surf);
+            if (idx >= 4u || (surf && mem_is_committed(surf+23) && MR32(surf+20)==D3DFMT_INTZ)) r=0x8876086cu;
+            else {
+            bind_set(&g_bind_rt[idx], surf);
             if (idx==0 && metal_available()){
                 uint32_t tid = (surf && mem_is_committed(surf+35)) ? MR32(surf+28) : 0;
                 { static uint64_t org[8]; static int shown=0;
@@ -3191,7 +3677,12 @@ int com_call(CPU *c, uint32_t magic){
                 metal_set_render_target(tid | ((face & 7u) << 16));
                 if (tid) g_rt_set++; else g_rt_screen++;
             }
-            r=0; }
+            else if (metal_available()){
+                uint32_t tid=(surf && mem_is_committed(surf+35))?MR32(surf+28):0;
+                uint32_t face=(surf && mem_is_committed(surf+47))?MR32(surf+44):0;
+                metal_set_render_target_at(idx,tid | ((face & 7u) << 16));
+            }
+            r=0; } }
         else if (MID(SetTransform)){
             static int nt=0;
             uint32_t ty=A(c,1), mp=A(c,2);
@@ -3238,8 +3729,12 @@ int com_call(CPU *c, uint32_t magic){
                 g_vsk.b[sr+k]=(int32_t)MR32(o);
             }
             r=0; }
-        else if (MID(SetVertexDeclaration)){ g_cur_decl=A(c,1); g_raw_decl=g_cur_decl; r=0; }
+        else if (MID(SetVertexDeclaration)){ g_cur_decl=A(c,1); g_raw_decl=g_cur_decl; g_fvf_layout=0; r=0; }
         else if (MID(Reset)){
+            metal_query_reset();
+            g_ws_msaa_checked=0;g_ws_present_samples=A(c,1) && mem_is_committed(A(c,1)+19)?MR32(A(c,1)+16):0;
+            memset(g_psbool,0,sizeof g_psbool);
+            memset(g_psint,0,sizeof g_psint);free(g_sb_aux);g_sb_aux=NULL;g_sb_aux_count=0;
             /* (this, D3DPRESENT_PARAMETERS*)
              * The game resets the device when resolution/graphics detail changes.
              * This method had NEVER been implemented; changing a setting crashed. */
@@ -3296,22 +3791,40 @@ int com_call(CPU *c, uint32_t magic){
             g_cur_zid = 1;
             if (metal_available()){ void metal_set_zsurf(unsigned); metal_set_zsurf(1);
                                     metal_set_render_target(0); } }
-            g_cur_tex = 0; g_cur_rt = 0; g_cur_ps_id = 0;
-            for (int q6=0;q6<4;q6++) g_tex_stage[q6]=0;
+            g_cur_tex = 0; g_cur_rt = 0; g_cur_ps_id = 0; g_fvf_layout=0;
+            for (int q6=0;q6<16;q6++) g_tex_stage[q6]=0;
             /* v12na: Reset also unbinds every texture, stream, index buffer,
              * render target and Z surface (D3D9), so the device's references
              * go and the game's releases can free them. */
             if (com_frees()){
-                for (int q8 = 0; q8 < 8; q8++){ g_raw_tex[q8] = 0; bind_set(&g_bind_tex[q8], 0); }
-                for (int q8 = 0; q8 < 4; q8++){ bind_set(&g_bind_vb[q8], 0); bind_set(&g_bind_rt[q8], 0); }
+                for (int q8 = 0; q8 < 16; q8++){ g_raw_tex[q8] = 0; bind_set(&g_bind_tex[q8], 0); }
+                for(int q8=0;q8<16;q8++){bind_set(&g_bind_vb[q8],0);g_stream_offset[q8]=g_stream_stride[q8]=0;}
+                for (int q8 = 0; q8 < 4; q8++)bind_set(&g_bind_rt[q8], 0);
                 bind_set(&g_bind_ib, 0); bind_set(&g_bind_ds, 0);
                 g_ss_vb = 0; g_ib_obj = 0;
             }
             r=0; }
-        else if (MID(SetFVF)){ g_cur_fvf=A(c,1); g_raw_fvf=g_cur_fvf; r=0; }
+        else if (MID(SetFVF)){ g_cur_fvf=A(c,1); g_raw_fvf=g_cur_fvf; g_fvf_layout=g_cur_fvf; r=0; }
         else if (MID(CreateTexture)){
             /* (this,W,H,Levels,Usage,Format,Pool,ppTex,pShared) */
             uint32_t w=A(c,1), h=A(c,2), lev=A(c,3), usage=A(c,4), fmt=A(c,5), pool=A(c,6);
+#ifndef __wasm__
+            if(fmt==D3DFMT_INTZ){
+                uint32_t pp=A(c,7);if(pp)MR32(pp)=0;
+                if(!pp || !w || !h || w>8192 || h>8192 || lev!=1 || usage!=2 || pool!=0){r=0x8876086cu;goto texture_create_done;}
+                uint32_t t=com_new(IF_TEX,TEX_EXTRA);
+                if(!t){r=0x8007000eu;goto texture_create_done;}
+                uint32_t zid=zid_take_texture();
+                if(!zid){com_drop(t);r=0x8007000eu;goto texture_create_done;}
+                int gpu=metal_available();uint32_t tid=gpu?metal_create_depth_texture(w,h,zid):0;
+                if(gpu && !tid){g_zid_state[zid]=0;g_zid_owners[zid]=0;com_drop(t);r=0x8007000eu;goto texture_create_done;}
+                MR32(t+4)=w;MR32(t+8)=h;MR32(t+12)=usage;MR32(t+16)=pool;
+                MR32(t+20)=fmt;MR32(t+24)=1;MR32(t+28)=tid;MR32(t+192)=zid;
+                if(ENVC("RTIDLOG")){static unsigned shown;if(shown<16){shown++;
+                    fprintf(stderr,"  [INTZ-id] texture=%08x mid=%u zid=%u %ux%u\n",t,tid,zid,w,h);}}
+                MR32(pp)=t;r=0;goto texture_create_done;
+            }
+#endif
             /* With NFSRES active the game creates its post-processing
              * targets at the resolution IT believes in (1280x1024).  The
              * scene is drawn at 1920x1080, then copied into that smaller
@@ -3324,8 +3837,12 @@ int com_call(CPU *c, uint32_t magic){
                     fprintf(stderr,"  [RT-tex] %ux%u -> %ux%u (NFSRES)\n", w,h,g_bb_w,g_bb_h); }
                 w = g_bb_w; h = g_bb_h;
             }
-            uint32_t pp=A(c,7); uint32_t t=com_new(IF_TEX,160);   /* +64..+103: child surfaces */
-            MR32(t+4)=w; MR32(t+8)=h; MR32(t+20)=fmt; MR32(t+24)=lev?lev:1u;
+            uint32_t pp=A(c,7),maximum=1;
+            for(uint32_t extent=w>h?w:h;extent>1;extent>>=1)maximum++;
+            if(!lev)lev=maximum;
+            if(!w || !h || w>8192 || h>8192 || lev>maximum || lev>TEX_MIPS){if(pp)MR32(pp)=0;r=0x8876086cu;goto texture_create_done;}
+            uint32_t t=com_new(IF_TEX,TEX_EXTRA);
+            MR32(t+4)=w;MR32(t+8)=h;MR32(t+12)=usage;MR32(t+16)=pool;MR32(t+20)=fmt;MR32(t+24)=lev;
             /* HD build: reflection targets grow in Metal while the game keeps
              * seeing the old size (not compiled in the original build). */
             uint32_t mw = w, mh = h, mlev = lev ? lev : 1u;
@@ -3363,18 +3880,19 @@ int com_call(CPU *c, uint32_t magic){
                            case 23: fn2="R5G6B5"; break; case 25: fn2="A1R5G5B5"; break;
                            case 26: fn2="A4R4G4B4"; break; case 28: fn2="A8"; break;
                            case 0x31545844: fn2="DXT1"; break; case 0x33545844: fn2="DXT3"; break;
-                           case 0x35545844: fn2="DXT5"; break; case 41: fn2="L8"; break; }
+                           case 0x35545844: fn2="DXT5"; break; case 41: fn2="P8"; break; case 50: fn2="L8"; break; }
               if (fmt<64) fmt_hist[fmt]++;
               if (VB() && sh<12){ sh++;
                 fprintf(stderr,"  [tex] %ux%u lev=%u usage=0x%x fmt=%u(%s) pool=%u\n",
                         w,h,lev,usage,fmt,fn2,pool); } }
-            if(pp) MR32(pp)=t; r=0; }
+            if(pp)MR32(pp)=t;r=0;
+          texture_create_done:; }
         else if (MID(CreateCubeTexture)){
             /* (this, EdgeLength, Levels, Usage, Format, Pool, ppCubeTexture, pShared)
              * Used to return an empty COM object: no size/format, no Metal
              * texture -> the reflection path read garbage values. */
             uint32_t edge=A(c,1), lev=A(c,2), usage=A(c,3), fmt=A(c,4), pp=A(c,6);
-            uint32_t t2=com_new(IF_TEX,160);        /* wide enough for the face buffers */
+            uint32_t t2=com_new(IF_TEX,TEX_EXTRA);        /* wide enough for the face buffers */
             if (!edge || edge > 4096u) edge = 256u;
             MR32(t2+4)=edge; MR32(t2+8)=edge; MR32(t2+20)=fmt?fmt:22u;
             MR32(t2+24)=lev?lev:1u;
@@ -3406,7 +3924,44 @@ int com_call(CPU *c, uint32_t magic){
             }
             if(pp) MR32(pp)=sf; r=0;
           cube_done:; }
-        else if (MID(CreateVolumeTexture)){ uint32_t pp=A(c,8); if(pp) MR32(pp)=com_new(IF_TEX,160); r=0; }   /* same layout as 2D (child slots) */
+        else if (MID(CreateVolumeTexture)){
+            uint32_t w=A(c,1),h=A(c,2),d=A(c,3),levels=A(c,4),format=A(c,6),output=A(c,8);
+            if(output)MR32(output)=0;
+            if(!output || !w || !h || !d || w>2048 || h>2048 || d>2048 || (format!=21 && format!=22 && format!=28 && format!=50))r=0x8876086cu;
+            else {
+                uint32_t maximum=1,extent=w;if(h>extent)extent=h;if(d>extent)extent=d;
+                while(extent>1){extent>>=1;maximum++;}if(!levels)levels=maximum;
+                if(levels>maximum || levels>16)r=0x8876086cu;
+                else {
+                    unsigned texture=metal_available()?metal_create_texture_volume(w,h,d,levels,format):0;
+                    if(!texture)r=0x8876086au;
+                    else {
+                        uint32_t object=com_new(IF_VOLTEX,256);
+                        if(!object){metal_free_texture(texture);r=0x8007000eu;}
+                        else {MR32(object+4)=w;MR32(object+8)=h;MR32(object+12)=d;MR32(object+16)=A(c,7);MR32(object+20)=format;MR32(object+24)=levels;MR32(object+28)=texture;MR32(output)=object;r=0;}
+                    }
+                }
+            }
+        }
+        else if(MID(UpdateTexture)){
+            uint32_t source=A(c,1),destination=A(c,2);
+            r=0x8876086cu;
+            if(com_valid(source) && com_valid(destination) && (CH_IFACE(source)&0xffff)==IF_VOLTEX && (CH_IFACE(destination)&0xffff)==IF_VOLTEX &&
+               MR32(source+4)==MR32(destination+4) && MR32(source+8)==MR32(destination+8) && MR32(source+12)==MR32(destination+12) && MR32(source+20)==MR32(destination+20)){
+                r=0;unsigned count=MR32(destination+24);if(count>MR32(source+24))r=0x8876086cu;
+                for(unsigned level=0;!r && level<count;level++){
+                    unsigned w=MR32(source+4)>>level,h=MR32(source+8)>>level,d=MR32(source+12)>>level;
+                    if(!w)w=1;if(!h)h=1;if(!d)d=1;
+                    unsigned format=MR32(source+20),pitch=w*((format==21 || format==22)?4:1),slice=pitch*h;
+                    if((uint64_t)slice*d>=0x20000000u || MR32(source+192+level*4) || MR32(destination+192+level*4)){r=0x8876086cu;break;}
+                    unsigned input=MR32(source+32+level*4),output=MR32(destination+32+level*4);
+                    if(!output){output=gbuf_alloc(slice*d);MR32(destination+32+level*4)=output;}
+                    if(!output){r=0x8007000eu;break;}
+                    if(input)memmove(g_mem+output,g_mem+input,slice*d);else memset(g_mem+output,0,slice*d);
+                    if(metal_available() && !metal_upload_texture_volume(MR32(destination+28),level,g_mem+output,pitch,slice))r=0x8876086cu;
+                }
+            }
+        }
         else if (MID(CreateVertexBuffer)){
             uint32_t pp=A(c,5); uint32_t b=com_new(IF_VB,64);
             MR32(b+4)=A(c,1); MR32(b+8)=gbuf_alloc(A(c,1)?A(c,1):64);
@@ -3421,10 +3976,12 @@ int com_call(CPU *c, uint32_t magic){
         else if (MID(CreateRenderTarget)){
             /* (this,W,H,Format,MultiSample,MSQuality,Lockable,ppSurface,pShared) */
             uint32_t w2=A(c,1), h2=A(c,2), f2=A(c,3), pp=A(c,7);
+            if(f2==D3DFMT_INTZ){if(pp)MR32(pp)=0;r=0x8876086cu;goto render_target_create_done;}
             uint32_t sf=com_new(IF_SURF,64);
             MR32(sf+4)=w2; MR32(sf+8)=h2; MR32(sf+20)=f2; MR32(sf+40)=3;
             if (metal_available()) MR32(sf+28)=metal_create_texture_ex(w2,h2,1,f2,1);
-            if(pp) MR32(pp)=sf; r=0; }
+            if(pp) MR32(pp)=sf; r=0;
+          render_target_create_done:; }
         else if (MID(CreateDepthStencilSurface)){
             uint32_t pp=A(c,7); uint32_t sf=com_new(IF_SURF,64);
             MR32(sf+4)=A(c,1); MR32(sf+8)=A(c,2); MR32(sf+20)=A(c,3); MR32(sf+40)=5;
@@ -3432,9 +3989,11 @@ int com_call(CPU *c, uint32_t magic){
              * Never a live surface's id, and a released one only three
              * presents later (zid_take); the texture is reset below. */
             uint32_t zid = zid_take();
+            if(!zid){com_drop(sf);if(pp)MR32(pp)=0;r=0x8007000eu;goto depth_surface_create_done;}
             MR32(sf+52) = zid; MR32(sf+56) = ZSURF_MAGIC;
             if (metal_available()){ void metal_z_forget(unsigned); metal_z_forget(zid); }
-            if(pp) MR32(pp)=sf; r=0; }
+            if(pp) MR32(pp)=sf; r=0;
+          depth_surface_create_done:; }
         else if (MID(CreateOffscreenPlainSurface)){ uint32_t pp=A(c,5); if(pp) MR32(pp)=com_new(IF_SURF,64); r=0; }
         else if (MID(GetBackBuffer)){ uint32_t pp=A(c,4); uint32_t sf=bb_surface();
             if (sf) com_addref(sf);
@@ -3511,6 +4070,11 @@ int com_call(CPU *c, uint32_t magic){
             if(pp) MR32(pp)=h; r=0; }
         else if (MID(CreateVertexShader)||MID(CreatePixelShader)){
             uint32_t fn=A(c,1), pp=A(c,2);
+#ifndef __wasm__
+            if(MID(CreatePixelShader) && g_psn>=METAL_PS_BASE_LIMIT-1){
+                if(pp)MR32(pp)=0;r=0x8007000eu;goto shader_create_done;
+            }
+#endif
             uint32_t h=com_new(IF_VSHADER,32);
             CH_FLAGS(h) |= CF_DEVICE;                   /* kept: see CreateVertexDeclaration */
             /* scan the shader token stream: up to the 0x0000FFFF END token */
@@ -3559,6 +4123,11 @@ int com_call(CPU *c, uint32_t magic){
 #endif
                     if (pl > 0){
                         metal_register_ps(id, msl);
+#ifndef __wasm__
+                        int types[16];for(int stage=0;stage<16;stage++)types[stage]=ps_sampler_type(pp3,stage);
+                        metal_set_ps_model(id,vs_version(pp3),types);
+                        metal_set_ps_outputs(id,ps_color_output_mask(pp3));
+#endif
                         MR32(h+12) = (uint32_t)id;
                     }
                     /* CUBE VARIANT (id + PSCUBE): in D3D9, ps_1_x does not
@@ -3575,9 +4144,9 @@ int com_call(CPU *c, uint32_t magic){
                         if (cl > 0) metal_register_ps(id + PSCUBE, msl);
                     }
 #else
-                    if (id < PSCUBE &&
+                    if (id < PSCUBE && vs_version(pp3)<0x0300 &&
                         ps_to_msl_ex(pp3, id + PSCUBE, msl, sizeof msl, 1u) > 0)
-                        metal_register_ps(id + PSCUBE, msl);
+                        {metal_register_ps(id + PSCUBE, msl);int types[16]={0};types[0]=3;metal_set_ps_model(id+PSCUBE,vs_version(pp3),types);metal_set_ps_outputs(id+PSCUBE,ps_color_output_mask(pp3));}
 #endif
 #if NFS_ENHANCED
                     /* HD: the reflection-split variant is generated at draw
@@ -3610,7 +4179,12 @@ int com_call(CPU *c, uint32_t magic){
                     }
                 }
             }
-            if(pp) MR32(pp)=h; r=0; }
+            if(MID(CreatePixelShader) && copy && sz>=8 && (MR32(copy)&0xffffu)>=0x0300 && !MR32(h+12)){
+                gbuf_free(copy);com_drop(h);if(pp)MR32(pp)=0;r=0x8876086cu;
+            }else {if(pp)MR32(pp)=h;r=0;}
+          shader_create_done:;
+        }
+
         else if (MID(BeginStateBlock)){
             /* D3D9: a nested Begin is INVALID (the second returns
              * D3DERR_INVALIDCALL).  The game does it (845 and 846 back to
@@ -3626,12 +4200,28 @@ int com_call(CPU *c, uint32_t magic){
                 r=0;
             } }
         else if (MID(CreateStateBlock)){
-            /* Captures a predefined set (D3DSBT_ALL etc.).  Never used in
-             * the trace; we leave an empty block. */
-            uint32_t pp=A(c,2);
-            if(pp){ uint32_t o=com_new(IF_STATEBLOCK,32); MR32(o+8)=0; MR32(pp)=o; }
-            r=0; }
-        else if (MID(CreateQuery)){ uint32_t pp=A(c,2); if(pp) MR32(pp)=com_new(IF_QUERY,32); r=0; }
+            uint32_t type=A(c,1),pp=A(c,2);if(pp)MR32(pp)=0;
+            r=0x8876086cu;
+            if(pp && type>=1 && type<=3 && !g_sb_rec){
+                int slot=0;for(int i=1;i<g_sbn;i++)if(!g_sb[i].used){slot=i;break;}
+                if(!slot && g_sbn<MAXSB)slot=g_sbn++;
+                SBPre *snapshot=slot?calloc(1,sizeof *snapshot):NULL;
+                uint32_t object=snapshot?com_new(IF_STATEBLOCK,32):0;
+                if(snapshot)snapshot->type=type;
+                if(object && sb_pre_capture(snapshot)){
+                    g_sb[slot].used=1;g_sb[slot].n=0;g_sb[slot].pre=snapshot;
+                    MR32(object+8)=slot;MR32(pp)=object;r=0;
+                }else {if(object)com_drop(object);free(snapshot);r=0x8007000eu;}
+            }
+        }
+        else if (MID(CreateQuery)){
+            uint32_t type=A(c,1),pp=A(c,2);if(pp)MR32(pp)=0;
+            if(type!=9 || !metal_available())r=0x8876086au;
+            else if(!pp)r=0;
+            else{unsigned handle=metal_query_create();uint32_t object=handle?com_new(IF_QUERY,16):0;
+                if(!object){if(handle)metal_query_destroy(handle);r=0x8007000eu;}
+                else{MR32(object+4)=type;MR32(object+8)=handle;MR32(pp)=object;r=0;}}
+        }
         else if (MID(EndStateBlock)){
             uint32_t pp=A(c,1);
             uint32_t o=com_new(IF_STATEBLOCK,32);
@@ -3644,6 +4234,8 @@ int com_call(CPU *c, uint32_t magic){
             if (sc) com_addref(sc);
             if(pp) MR32(pp)=sc; r=0; }
         else if (MID(GetNumberOfSwapChains)) r=1;
+        else if(sb_aux_get(c,nm,&r)){}
+        else if(device_state_get(c,nm,&r)){}
         else if (!strncmp(nm,"Get",3) && nargs>=2){
             /* fill the output parameter with a safe default */
             uint32_t p=A(c,nargs-1); uint32_t sz=4;
@@ -3663,6 +4255,53 @@ int com_call(CPU *c, uint32_t magic){
             if (MID(GetViewport) && p){ MR32(p+8)=1280; MR32(p+12)=720; MRF32(p+20)=1.0f; }
             r=0; }
         else r=0;                        /* remaining Set* -> D3D_OK */
+    }
+    else if(iface==IF_VOLTEX || iface==IF_VOLUME){
+        uint32_t self=A(c,0),texture=iface==IF_VOLUME?CH_PARENT(self):self;
+        uint32_t level=iface==IF_VOLUME?MR32(self+44):A(c,1);
+        unsigned width=MR32(texture+4),height=MR32(texture+8),depth=MR32(texture+12),format=MR32(texture+20);
+        unsigned levels=MR32(texture+24);
+        r=0x8876086cu;
+        if(MID(GetDevice)){uint32_t output=A(c,1);if(output){MR32(output)=g_dev;com_addref(g_dev);r=0;}}
+        else if(MID(GetContainer) && iface==IF_VOLUME){uint32_t output=A(c,2);if(output){MR32(output)=texture;com_addref(texture);r=0;}}
+        else if(MID(GetType))r=iface==IF_VOLTEX?4u:2u;
+        else if(MID(GetLevelCount))r=levels;
+        else if(MID(GetLevelDesc) || MID(GetDesc)){
+            uint32_t output=A(c,iface==IF_VOLUME?1:2);
+            if(output && level<levels){mem_commit(output,28);MR32(output)=format;MR32(output+4)=2;MR32(output+8)=0;MR32(output+12)=MR32(texture+16);
+                MR32(output+16)=(width>>level)?width>>level:1;MR32(output+20)=(height>>level)?height>>level:1;MR32(output+24)=(depth>>level)?depth>>level:1;r=0;}
+        }
+        else if(MID(GetVolumeLevel)){
+            uint32_t output=A(c,2);if(output)MR32(output)=0;
+            if(output && level<levels && level<16){
+                uint32_t child=MR32(texture+128+level*4);
+                if(!child){child=com_new(IF_VOLUME,64);if(child){CH_FLAGS(child)|=CF_CHILD;CH_PARENT(child)=texture;CH_REF(child)=0;MR32(child+44)=level;MR32(texture+128+level*4)=child;}}
+                if(child){com_addref(texture);MR32(output)=child;r=0;}else r=0x8007000eu;
+            }
+        }
+        else if(MID(LockBox)){
+            uint32_t output=A(c,iface==IF_VOLUME?1:2),box=A(c,iface==IF_VOLUME?2:3),flags=A(c,iface==IF_VOLUME?3:4);
+            if(output && level<levels && level<16 && !MR32(texture+192+level*4)){
+                unsigned w=width>>level,h=height>>level,d=depth>>level;if(!w)w=1;if(!h)h=1;if(!d)d=1;
+                unsigned bpp=(format==21 || format==22)?4:1,pitch=w*bpp,slice=pitch*h;
+                uint32_t left=0,top=0,front=0,right=w,bottom=h,back=d;
+                if(box){left=MR32(box);top=MR32(box+4);right=MR32(box+8);bottom=MR32(box+12);front=MR32(box+16);back=MR32(box+20);}
+                if(left<right && right<=w && top<bottom && bottom<=h && front<back && back<=d && (uint64_t)slice*d<0x20000000u){
+                    uint32_t buffer=MR32(texture+32+level*4);if(!buffer){buffer=gbuf_alloc(slice*d);MR32(texture+32+level*4)=buffer;}
+                    if(buffer){MR32(texture+192+level*4)=flags|0x80000000u;mem_commit(output,12);MR32(output)=pitch;MR32(output+4)=slice;MR32(output+8)=buffer+front*slice+top*pitch+left*bpp;r=0;}
+                    else r=0x8007000eu;
+                }
+            }
+        }
+        else if(MID(UnlockBox)){
+            if(level<levels && level<16 && MR32(texture+192+level*4)){
+                uint32_t flags=MR32(texture+192+level*4),buffer=MR32(texture+32+level*4);MR32(texture+192+level*4)=0;
+                unsigned w=width>>level,h=height>>level;if(!w)w=1;if(!h)h=1;unsigned pitch=w*((format==21 || format==22)?4:1);
+                r=0;
+                if(!(flags&0x10u) && MR32(texture+28) && metal_available() && !metal_upload_texture_volume(MR32(texture+28),level,g_mem+buffer,pitch,pitch*h))r=0x8876086cu;
+            }
+        }
+        else if(MID(AddDirtyBox))r=0; /* UnlockBox already uploads every changed slice. */
     }
     /* --- resources --- */
     else if (iface==IF_TEX || iface==IF_VB || iface==IF_IB || iface==IF_SURF){
@@ -3689,37 +4328,54 @@ int com_call(CPU *c, uint32_t magic){
             uint32_t face  = is_cube ? A(c,1) : 0u;
             uint32_t level = is_cube ? A(c,2) : ((iface==IF_TEX) ? A(c,1) : 0u);
             uint32_t plr   = is_cube ? A(c,3) : ((iface==IF_TEX) ? A(c,2) : A(c,1));
-            uint32_t w = self?MR32(self+4):256, h = self?MR32(self+8):256;
-            uint32_t fmt = self?MR32(self+20):21u;
+            uint32_t flags = is_cube ? A(c,5) : ((iface==IF_TEX) ? A(c,4) : A(c,3));
+            if(!plr){r=0x8876086cu;goto lock_rect_done;}
+            mem_commit(plr,8);MR32(plr)=MR32(plr+4)=0;
+            if(self && MR32(self+20)==D3DFMT_INTZ){r=0x8876086cu;goto lock_rect_done;}
+            uint32_t owner=self,parent=iface==IF_SURF?tex_surface_parent(self):0;
+            if(parent){owner=parent;level=MR32(self+48);}
+            if((iface==IF_TEX || parent) && (level>=TEX_MIPS || level>=tex_levels(owner))){r=0x8876086cu;goto lock_rect_done;}
+            uint32_t w=owner?MR32(owner+4):256,h=owner?MR32(owner+8):256;
+            uint32_t fmt=owner?MR32(owner+20):21u;
             if(!w) w=256; if(!h) h=256;
             if(w>8192) w=8192; if(h>8192) h=8192;
-            if(level>7) level=7;
-            uint32_t pitch = metal_available() ? metal_level_pitch(w,level,fmt) : 0;
-            uint32_t rows  = metal_available() ? metal_level_rows(h,level,fmt)  : 0;
+            uint32_t pitch=metal_level_pitch(w,level,fmt);
+            uint32_t rows=metal_level_rows(h,level,fmt);
             if(!pitch){ uint32_t lw=w>>level; if(!lw)lw=1; pitch=lw*4u; }
             if(!rows){  uint32_t lh=h>>level; if(!lh)lh=1; rows=lh; }
             uint32_t slot = self ? (is_cube ? (self + 104u + 4u*(face & 7u))
-                                            : (self + 32u + 4u*level)) : 0;
+                                            : (iface==IF_TEX || parent ? tex_buffer_slot(owner,level) : self+32u)) : 0;
             uint32_t buf = slot ? MR32(slot) : 0;
-            if(!buf){ buf = gbuf_alloc(pitch*rows + 64u); if(slot) MR32(slot)=buf; }
+            if(!buf){buf=gbuf_alloc(pitch*rows);if(slot)MR32(slot)=buf;}
+            if(!buf){r=0x8007000eu;goto lock_rect_done;}
+            r=rect_lock_begin(self,level,face,flags);if(r)goto lock_rect_done;
             /* a render target the game made lockable (CreateRenderTarget):
              * what the GPU drew there, the cover shoot's picture (gpu_web.c) */
             if (iface==IF_SURF && self && MR32(self+40)==3u && MR32(self+28) && metal_available()){
                 int metal_read_texture(unsigned, void *, unsigned, unsigned);
-                metal_read_texture(MR32(self+28), g_mem+buf, pitch, rows);
+                if(!metal_read_texture(MR32(self+28),g_mem+buf,pitch,rows)){
+                    rect_lock_end(self,level,face,NULL);r=0x8876086cu;goto lock_rect_done;
+                }
             }
-            if(plr){ mem_commit(plr,8); MR32(plr)=pitch; MR32(plr+4)=buf; }
-            r=0; }
+            MR32(plr)=pitch;MR32(plr+4)=buf;
+            r=0;
+          lock_rect_done:; }
         else if (MID(UnlockRect)){
             /* 2D: (Level)  |  CUBE: (FaceType, Level)  |  Surface: () */
             int is_cube2 = (iface==IF_TEX && is_cube_tex(self));
             uint32_t face2 = is_cube2 ? A(c,1) : 0u;
             uint32_t level = is_cube2 ? A(c,2) : ((iface==IF_TEX) ? A(c,1) : 0u);
-            if(level>7) level=7;
-            uint32_t w = self?MR32(self+4):0, h = self?MR32(self+8):0;
-            uint32_t fmt = self?MR32(self+20):21u, mid = self?MR32(self+28):0;
-            uint32_t buf = self ? (is_cube2 ? MR32(self + 104u + 4u*(face2 & 7u))
-                                            : MR32(self + 32u + 4u*level)) : 0;
+            uint32_t owner=self,parent=iface==IF_SURF?tex_surface_parent(self):0;
+            if(parent){owner=parent;level=MR32(self+48);}
+            if((iface==IF_TEX || parent) && (level>=TEX_MIPS || level>=tex_levels(owner))){r=0x8876086cu;goto unlock_rect_done;}
+            uint32_t lock_flags=0;
+            if(!rect_lock_end(self,level,face2,&lock_flags)){r=0x8876086cu;goto unlock_rect_done;}
+            if(lock_flags&0x10u){r=0;goto unlock_rect_done;}
+            uint32_t w=owner?MR32(owner+4):0,h=owner?MR32(owner+8):0;
+            uint32_t fmt=owner?MR32(owner+20):21u,mid=owner?MR32(owner+28):0;
+            uint32_t slot=self?(is_cube2?self+104u+4u*(face2&7u):(iface==IF_TEX || parent?tex_buffer_slot(owner,level):self+32u)):0;
+            uint32_t buf=slot?MR32(slot):0;
+            if(!buf){r=0x8876086cu;goto unlock_rect_done;}
             gheap_check_block(c, buf, "LOCK BUFFER OVERRUN (UnlockRect)");   /* NFSU2_HEAPCHECK only */
             if (metal_available() && mid && buf && w && h)
                 metal_upload_texture(mid, level, g_mem+buf,
@@ -3739,7 +4395,8 @@ int com_call(CPU *c, uint32_t magic){
                     fprintf(stderr,"\n");
                 }
             }
-            r=0; }
+            r=0;
+          unlock_rect_done:; }
         else if (MID(Unlock) && (iface==IF_VB || iface==IF_IB)){
             gheap_check_block(c, self ? MR32(self+8) : 0u, "LOCK BUFFER OVERRUN (Unlock)");
             r=0; }
@@ -3758,14 +4415,18 @@ int com_call(CPU *c, uint32_t magic){
             /* v12na: the texture's own (cached) surface; it shares the texture's
              * reference count, as in D3D9 */
             uint32_t face3 = cube3 ? (A(c,1) < 6u ? A(c,1) : 0u) : 0u, lvl3 = cube3 ? A(c,2) : A(c,1);
+            if(lvl3>=TEX_MIPS || lvl3>=tex_levels(self0)){if(pp)MR32(pp)=0;r=0x8876086cu;goto surf_done;}
             uint32_t sf = tex_child(self0, face3, lvl3, cube3);
             if (!sf){ if(pp) MR32(pp)=0; r=0x8007000Eu; goto surf_done; }
             com_addref(self0);
             MR32(sf+40)=2;
             uint32_t self=A(c,0);
             if (self && mem_is_committed(self+31)){
-                MR32(sf+4)=MR32(self+4); MR32(sf+8)=MR32(self+8);
-                MR32(sf+20)=MR32(self+20); MR32(sf+28)=MR32(self+28);
+                unsigned width=MR32(self+4)>>lvl3,height=MR32(self+8)>>lvl3;
+                MR32(sf+4)=width?width:1;MR32(sf+8)=height?height:1;
+                MR32(sf+12)=MR32(self+12);MR32(sf+16)=MR32(self+16);
+                MR32(sf+20)=MR32(self+20);MR32(sf+28)=MR32(self+28);
+                if(tex_depth_zid(self)){MR32(sf+52)=tex_depth_zid(self);MR32(sf+56)=ZSURF_MAGIC;}
             }
             if(pp) MR32(pp)=sf; r=0;
           surf_done:; }
@@ -3777,22 +4438,26 @@ int com_call(CPU *c, uint32_t magic){
              * Width/height USED TO be written to 16/20 (i.e. the
              * MultiSample fields) -> the game read a size of 0, computed a
              * garbage pointer at high detail and crashed. */
+            unsigned level=iface==IF_TEX?A(c,1):0;
+            if(iface==IF_TEX && (level>=TEX_MIPS || level>=tex_levels(self))){r=0x8876086cu;goto level_desc_done;}
             uint32_t p=A(c,nargs-1);
             if(p){ mem_commit(p,32); memset(g_mem+p,0,32);
                 uint32_t fw = self?MR32(self+4):256, fh = self?MR32(self+8):256;
                 uint32_t ff = self?MR32(self+20):0;
-                if (!fw) fw = 640; if (!fh) fh = 480;
+                if(!fw)fw=640;if(!fh)fh=480;
+                fw>>=level;fh>>=level;if(!fw)fw=1;if(!fh)fh=1;
                 if (!ff) ff = 22;                    /* D3DFMT_X8R8G8B8 */
                 MR32(p)    = ff;                     /* Format          */
-                MR32(p+4)  = (iface==IF_TEX) ? 3u : 1u;  /* Type: TEXTURE/SURFACE */
-                MR32(p+8)  = 0;                      /* Usage           */
-                MR32(p+12) = 0;                      /* Pool: DEFAULT   */
+                MR32(p+4)  = 1u;  /* Type: TEXTURE/SURFACE */
+                MR32(p+8)  = self && (iface==IF_TEX || iface==IF_SURF)?MR32(self+12):0; /* Usage */
+                MR32(p+12) = self && (iface==IF_TEX || iface==IF_SURF)?MR32(self+16):0; /* Pool */
                 MR32(p+16) = 0;                      /* MultiSampleType */
                 MR32(p+20) = 0;                      /* MS Quality      */
                 MR32(p+24) = fw;                     /* Width           */
                 MR32(p+28) = fh;                     /* Height          */
             }
-            r=0; }
+            r=0;
+          level_desc_done:; }
         else r=0;
     }
     /* --- DirectSound --- */
@@ -4282,9 +4947,16 @@ int com_call(CPU *c, uint32_t magic){
         if (di_tr) fprintf(stderr, " -> 0x%08x\n", r);
     }
     else if (iface==IF_QUERY){
-        if      (MID(GetDevice)){ uint32_t p=A(c,1); if(p) MR32(p)=g_dev; com_addref(g_dev); r=0; }   /* D3D9: a reference */
+        uint32_t self=A(c,0);
+        if      (MID(GetDevice)){ uint32_t p=A(c,1); if(p){MR32(p)=g_dev;com_addref(g_dev);r=0;}else r=0x8876086cu; }   /* D3D9: a reference */
+        else if (MID(GetType)) r=MR32(self+4);
         else if (MID(GetDataSize)) r=4;
-        else if (MID(GetData)){ uint32_t p=A(c,1); if(p){mem_commit(p,4);MR32(p)=0;} r=0; }
+        else if (!strcmp(nm,"Issue"))r=metal_query_issue(MR32(self+8),A(c,1));
+        else if (MID(GetData)){
+            uint32_t p=A(c,1),size=A(c,2),flags=A(c,3),value=0;
+            if((p && size!=4) || (!p && size!=0) || flags>1)r=0x8876086cu;
+            else{r=metal_query_get_data(MR32(self+8),flags,p?&value:NULL);if(!r && p)MR32(p)=value;}
+        }
         else r=0;
     }
     else if (iface==IF_SWAPCHAIN){
@@ -4299,14 +4971,22 @@ int com_call(CPU *c, uint32_t magic){
     }
     else if (iface==IF_VSHADER || iface==IF_VDECL || iface==IF_STATEBLOCK || iface==IF_SIMPLE){
         if (iface==IF_STATEBLOCK && MID(Apply)){
+            if(g_sb_rec){r=0x8876086cu;goto stateblock_done;}
             uint32_t self5=A(c,0);
             int bi = (self5 && mem_is_committed(self5+11)) ? (int)MR32(self5+8) : 0;
             if (bi > 0 && bi < MAXSB && g_sb[bi].used){
                 SBlock *B = &g_sb[bi];
+                if(B->pre){r=sb_pre_apply(c,B->pre)?0:0x8007000eu;if(!r)g_sb_applied++;goto stateblock_done;}
                 const uint32_t *save_ovr = g_arg_ovr;
                 int save_rep = g_sb_replay, save_rec = g_sb_rec;
                 g_sb_replay = 1; g_sb_rec = 0;
                 for (int k = 0; k < B->n; k++){
+                    SBRec *R=&B->r[k];
+                    if(R->constants){
+                        unsigned limit,width;void *file=sb_constant_file(rec_mid(R->magic),&limit,&width);
+                        memcpy((uint8_t*)file+R->a[1]*width,R->constants,R->a[3]*width);
+                        continue;
+                    }
                     g_arg_ovr = B->r[k].a;
                     com_call(c, B->r[k].magic);
                 }
@@ -4315,6 +4995,7 @@ int com_call(CPU *c, uint32_t magic){
             }
             r=0; }
         else if (iface==IF_STATEBLOCK && MID(Capture)){
+            if(g_sb_rec){r=0x8876086cu;goto stateblock_done;}
             /* Rewrite every state in the block with its CURRENT value.  This
              * is how the game builds its save/restore idiom: record once,
              * Capture before changing, then Apply. */
@@ -4322,6 +5003,7 @@ int com_call(CPU *c, uint32_t magic){
             int bi = (self6 && mem_is_committed(self6+11)) ? (int)MR32(self6+8) : 0;
             if (bi > 0 && bi < MAXSB && g_sb[bi].used){
                 SBlock *B = &g_sb[bi];
+                if(B->pre){r=sb_pre_capture(B->pre)?0:0x8007000eu;if(!r)g_sb_captured++;goto stateblock_done;}
                 for (int k = 0; k < B->n; k++){
                     SBRec *R = &B->r[k];
                     uint32_t mm = R->magic & 0xFFFFu;
@@ -4334,14 +5016,18 @@ int com_call(CPU *c, uint32_t magic){
                         md = g_midc[ifc][mm];
                         if (!md) md = g_midc[ifc][mm] = (int16_t)mid_resolve(g_if[ifc].m[mm].name);
                     } else md = mid_resolve(g_if[ifc].m[mm].name);
-                    if      (md == MID_SetRenderState){
+                    if(R->constants){
+                        unsigned limit,width;void *file=sb_constant_file(md,&limit,&width);
+                        memcpy(R->constants,(uint8_t*)file+R->a[1]*width,R->a[3]*width);
+                    }
+                    else if (md == MID_SetRenderState){
                         if (R->a[1] < 256u) R->a[2] = g_rs[R->a[1]]; }
                     else if (md == MID_SetTextureStageState){
                         if (R->a[1] < 8u && R->a[2] < 40u) R->a[3] = g_tss_raw[R->a[1]][R->a[2]]; }
                     else if (md == MID_SetSamplerState){
                         if (R->a[1] < 16u && R->a[2] < 20u) R->a[3] = g_smp_raw[R->a[1]][R->a[2]]; }
                     else if (md == MID_SetTexture){
-                        if (R->a[1] < 8u && R->a[2] != g_raw_tex[R->a[1]]){
+                        if (R->a[1] < 16u && R->a[2] != g_raw_tex[R->a[1]]){
                             uint32_t old = R->a[2];
                             R->a[2] = g_raw_tex[R->a[1]];
                             if (R->a[2]) com_addref(R->a[2]);
@@ -4362,6 +5048,7 @@ int com_call(CPU *c, uint32_t magic){
             if (psize){ mem_commit(psize,4); MR32(psize)=sz; }
             r=0; }
         else r=0;
+      stateblock_done:;
     }
     else r=0;
 
@@ -4633,11 +5320,18 @@ static void fill_caps(uint32_t p){
     { /* Shader version settable from the environment (SM=0 -> fixed function) */
       const char *sm = ENVC("D3D_SM");
       uint32_t vs=0xFFFE0200u, ps=0xFFFF0200u;
+      const char *mode=ENVC("NFSMW_MODE");if(mode && !strcmp(mode,"full")){vs=0xfffe0300u;ps=0xffff0300u;}
       if (sm){ int v=atoi(sm);
         if (v==0){ vs=0; ps=0; }
         else if (v==11){ vs=0xFFFE0101u; ps=0xFFFF0101u; }
         else if (v==14){ vs=0xFFFE0101u; ps=0xFFFF0104u; }
       }
-      MR32(p+0xC4)=vs; MR32(p+0xC8)=256; MR32(p+0xCC)=ps; }
+      MR32(p+0xC4)=vs; MR32(p+0xC8)=256; MR32(p+0xCC)=ps;
+      if((ps&0xffffu)>=0x0300){
+          MR32(p+0xfc)=24;MR32(p+0x100)=32; /* VS20 dynamic depth, temps */
+          MR32(p+0x108)=0x1b;MR32(p+0x10c)=24;MR32(p+0x110)=32;MR32(p+0x118)=512;
+          MR32(p+0x120)=65535;MR32(p+0x124)=65535;MR32(p+0x128)=32768;MR32(p+0x12c)=32768;
+      }
+    }
     MRF32(p+0xD0)=8.0f; MR32(p+0xD4)=0x00000051;
 }

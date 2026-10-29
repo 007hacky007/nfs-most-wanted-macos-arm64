@@ -23,7 +23,8 @@ import pefile
 
 
 def main(src, base, outdir, genout, prefix):
-    raw = open(src, 'rb').read()
+    with open(src, 'rb') as source:
+        raw = source.read()
     sha = hashlib.sha256(raw).hexdigest()
     pe = pefile.PE(data=raw)
     pref = pe.OPTIONAL_HEADER.ImageBase

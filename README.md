@@ -1,68 +1,245 @@
-# Most Wanted native Metal port
+# Most Wanted for Apple Silicon
 
-Local native prototype of the supplied PC v1.3 game for Apple Silicon, with a Direct3D 9 to Metal runtime adapted from the sibling NFSU2 project. Game instructions are compiled into ARM64; the runtime does not use Wine, Rosetta, or an x86 interpreter. The original backup stays unchanged.
+Build a local macOS version of Need for Speed Most Wanted (2005) from your own
+Windows game copy. **This repository contains no EA game code or game assets.**
+You must supply the game. Extracted files, downloaded patches and locally
+generated game code remain in ignored build directories.
 
-Observed working: original menus, Quick Race, throttle/steering, pause/restart/return, profile creation/reload, native audio and music, complete attract movie, opening story movie, and the following in-engine scene/career race. The packaged app completed a race session beyond ten minutes and then restarted, returned to the menu, and quit normally. Full-career and every-car coverage remain unverified; unknown generated audio code stops for a native rebuild. Evidence and acceptance results are in [the implementation plan](docs/superpowers/plans/2026-10-28-native-metal.md).
+The port compiles the game into ARM64 and renders through Metal. Its macOS
+launcher offers resolution and three game modes: Standard, HQ visuals only,
+and Full HQ. The build targets **Most Wanted (2005) PC v1.3, USA English
+Black Edition**. Use the verified original four-CD data described below; the
+builder installs the official 1.3 update automatically.
 
-## Run the local app
+## Build your app
 
-Open `out/Most Wanted.app` and select the extracted `game` folder. Click the title screen to continue. Use arrows and Enter in menus, arrows to drive, and Esc to pause. The window close button and Cmd-Q request a normal game shutdown.
-
-The app keeps saves under `~/Library/Application Support/NFSMW/Saves` and its latest log at `~/Library/Logs/NFSMW/last-run.log`. It reads the selected game folder without writing into it. Network play is disabled. A generic `NAME` profile was used for local verification; the game can create additional aliases.
-
-## Build locally
-
-Requires an Apple Silicon Mac, Xcode command-line tools, Python 3, and `cabextract`. The input folder must contain the four supplied MODE1/2352 discs and the update ZIP.
-
-```sh
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python tools/install_game.py game_backup game
-./gen.sh
-./build.sh
-./pack.sh
-```
-
-The supported executable SHA-256 is `80774c2e5d619b4f120b48d4462896fd504c263399d203a238769cffde1d253c`. The installer extracts and verifies the required x86 D3DX DLL from the original DirectX cabinet. It does not run Windows installers or bundled utilities.
-
-Development launch:
+You need an Apple Silicon Mac, internet access and about 60 GB of free space
+for the build. Install the Xcode command-line tools and build dependencies
+once. The second command uses Homebrew and supplies Python 3.12 or later:
 
 ```sh
-WINDOW=1 NFSRES=1280x960 ALARM=0 out/nfsmw_boot game/speed.exe
+xcode-select --install
+brew install python cmake boost xz cabextract rust
 ```
 
-`ALARM` is the command-line development time limit in seconds; zero disables it. Command-line saves and registry data go under `out/profile/`. `NFSMW_SAVEDIR` overrides the save directory. `NOFOCUS=2` makes a test window invisible; omit it for normal play. `NFSU2_MUTE=1` silences speakers while keeping native mixing and audio capture active.
-
-The sandbox used by development tools can hide Metal and audio devices; run the engine normally to access the actual hardware.
-
-## Generated audio callbacks
-
-The original game generates small x86 callbacks at runtime. This port uses precompiled native templates for observed callback shapes. An unknown callback stops with a diagnostic and a local code capture; it does not invoke an x86 interpreter.
-
-To compile a captured callback into the next native build:
+Open Terminal in this repository and run one command:
 
 ```sh
-.venv/bin/python tools/lift_callbacks.py --capture --arena
-./build.sh
-./pack.sh
+./build.sh "./my-game-copy"
 ```
 
-The capture tool accepts bounded callbacks with internal forward branches. It rejects backward/indirect branches, external branch targets, and internal/indirect calls. Relative call operands are read from the current callback so the native template remains correct at another guest address. All other instruction bytes must match, and every crossed memory page must be committed. `--arena` collects additional validated audio callbacks from the captured code area. Captures and generated code remain in ignored local directories and must be regenerated from your own game.
+The source can be:
 
-For a new build, `tools/profile_callbacks.py --script tests/input/menu.txt` can collect startup templates automatically. After creating an alias, use `tests/input/quickrace.txt` to exercise race loading. These are bring-up inputs; inspect the resulting game screen rather than assuming a timed script reached its target. An app capture is stored under `~/Library/Application Support/NFSMW/out`; copy its `missing-code*` files into the workspace's `out/` before rebuilding.
+- A folder containing extracted game files, including `speed.exe`, `CARS`,
+  `GLOBAL`, `MOVIES`, `SOUND` and `TRACKS`.
+- A folder containing all four supported ISO disc images.
+- A folder containing the supported BIN/CUE disc set.
+- All four images supplied as separate arguments, for example
+  `./build.sh "./disc 1.iso" "./disc 2.iso" "./disc 3.iso" "./disc 4.iso"`.
 
-## Checks
+Image filenames and argument order do not matter. BIN/CUE support covers
+single-track MODE1/2048 and MODE1/2352 data discs. Keep each CUE beside its BIN.
+Audio tracks, multiple tracks and nonzero track offsets are not supported.
+
+The script creates its Python environment, extracts and checks your game files,
+downloads and verifies the patches, builds native extraction tools, generates
+the game and mod code locally, and signs the app for local use. Windows
+installers are read as data and are never executed. The initial download
+includes the 3.34 GB HQ package; the launcher lets you choose whether to use
+its visual assets or full mod behavior. Verified downloads are cached.
+
+When the build finishes, open **`out/Most Wanted.app`**. Your verified game copy
+is bundled inside the app, so you can move it to Applications. Choose a
+resolution and game mode, then click Play. Your source copy is preserved.
+A failed build preserves the previous app; diagnostic logs remain under `out/`.
+
+## Supported game copy
+
+**Expected data edition:** the USA English Black Edition four-CD PC release
+of Need for Speed Most Wanted (2005). **Prepared and tested game version:**
+**v1.3**. This does not refer to Most Wanted (2012), a console release or an
+arbitrary executable labeled 1.3.
+
+An extracted copy can contain the verified original disc files or their
+official 1.3 replacements. The builder always applies the pinned official
+1.3 patch and prepares the supported runtime itself. You do not need to
+install patches or find a replacement executable manually. Other regions,
+DVD editions, repacks, incomplete copies and unknown modified files are not
+accepted by the current checksum profile.
+
+Compatibility is determined by the **extracted files and executable bytes**,
+not filenames, version strings or a whole-ISO/BIN checksum. Every required
+file is checked by size and SHA-256. The profile describes 1,406 required game
+asset files plus `speed.exe`, with additional checks for recognized optional
+files such as the supplied D3DX DLL. All accepted per-file alternatives are in
+[tools/game_checksums.json](tools/game_checksums.json). See
+[checksums and byte sizes](#checksums-and-byte-sizes) below.
+
+### What has been tested
+
+| Input or runtime | Verification performed |
+| --- | --- |
+| USA English Black Edition, four ISO discs | Complete fresh extraction, per-file checks, official 1.3 patching, HQ preparation, native translation and signed app build |
+| Same four-disc payload in BIN/CUE | Actual disc extraction and extracted-file checks passed; uses the same remaining build pipeline, without a separate complete BIN-to-app build |
+| Extracted, officially patched 1.3 installation | Actual file staging and checksum checks passed; a separate complete folder-to-app build has not been run |
+| Original disc executable and assets | Verified from the four-disc source and upgraded to 1.3 during the complete ISO build; the unpatched executable is not the runtime target |
+| Prepared v1.3 Standard and HQ visuals | Menus, driving, pause/restart, sound/music, opening videos and following in-engine cutscene exercised in native runs |
+| Prepared v1.3 Full HQ, HQ package 1.20.9 | Added-car driving, original module initialization, videos/cutscene and race controls exercised; final signed app with bundled files also drove and steered an automatic IS300 at 1280x720 |
+
+These checks cover the identified edition and files. They do not establish
+support for another release just because it reports the same version number.
+
+Extra saves or configuration files in a supplied installation are not imported.
+The builder copies only recognized game files. A damaged or incompatible
+required file stops the build instead of producing a partially patched app.
+
+## Patches
+
+Patch payloads are downloaded during your build and are not included in this
+repository. Exact URLs, sizes and SHA-256 pins are recorded in
+[tools/patch_sources.py](tools/patch_sources.py).
+
+| Patch | Version and source | Use |
+| --- | --- | --- |
+| Official update | 1.3, [EA original](https://largedownloads.ea.com/pub/patches/nfsmwpatch1.3.exe), with the checksum-matching [NFSPlanet mirror](https://dl1.nfsplanet.com/nfsmw/patches/nfsmwpatch1.3.exe) as fallback | All modes |
+| WidescreenFix | [ThirteenAG's release](https://github.com/ThirteenAG/WidescreenFixesPack/releases/tag/nfsmw), pinned asset 558912001 | Native resolution, aspect, HUD and movie handling |
+| Most Wanted HQ | 1.20.9, [author's ModDB download](https://www.moddb.com/downloads/start/233611) | Optional visual assets or full mod mode |
+
+Full HQ selects English, modern shaders, Xbox 360 lighting, standard difficulty
+and the original playlist with HQ audio. Movies and in-engine cinematics stay
+enabled. It includes native integrations for X360Stuff 4.1, XboxRainDroplets,
+Unlimiter 3.3.0.1338, ExtraOptions 10.0.1.1337, XenonEffects, MWFixes,
+FEShadows 2.1, HDContentSupport 2.0, HDReflections 2.0, HUDAdapter,
+MotionBlurController 1.0.0.100, SpeedReflect 1.2, TexWizard and ZPatchMW.
+Visuals-only mode keeps standard gameplay, car list, shaders, audio and videos
+while applying HQ world and existing-car visual files.
+
+The build also obtains pinned native innoextract source from its upstream fork.
+The required Microsoft D3DX9_26 DLL comes from the verified disc or the HQ
+package's Microsoft redistributable. These inputs remain local to the build.
+
+## Checksums and byte sizes
+
+All sizes below are exact decimal byte counts. **None is a checksum or size
+of a complete ISO, BIN or CUE file.** Different image containers can hold the
+same accepted payload. Folder inputs do not need the disc ZIP files: their
+extracted contents are checked directly.
+
+### Accepted source executable
+
+One of these exact `speed.exe` identities must accompany the verified game
+data. Changing a filename or version label does not make another executable
+compatible. The prepared identity allows reuse of a previously prepared copy;
+it is not an instruction to download a replacement executable.
+
+| Accepted source `speed.exe` | Exact size (bytes) | SHA-256 of the executable file |
+| --- | ---: | --- |
+| Original USA English Black Edition disc executable (unpatched) | 7250800 | `2cf8bdbf8095fa9e10ea552695404ae9c95b5b0367a7c830520c65a57896220a` |
+| Official USA 1.3 replacement | 7254894 | `e8019e0d7b706beba5ec648a50108a9a13346695eba9ebe58b6d796260d3c4eb` |
+| Verified prepared runtime from an earlier local build | 6029312 | `80774c2e5d619b4f120b48d4462896fd504c263399d203a238769cffde1d253c` |
+
+To check an extracted executable manually on macOS:
 
 ```sh
-.venv/bin/python -m unittest discover -s tests -v
-.venv/bin/python tools/isatest.py
-clang -O1 -Wno-unused-label -Iruntime gen/isatest.c runtime/mem.c -lm -o out/isatest
-out/isatest
-out/nfsmw_boot --test-kernel
-clang -O1 -Iruntime tests/shader_ps20.c runtime/vsemu.c -lm -o out/shader-ps20-test
-out/shader-ps20-test
+shasum -a 256 "./my-game-copy/speed.exe"
+stat -f '%z' "./my-game-copy/speed.exe"
 ```
 
-`tests/abi.c` and `tests/msvcrt.c` provide additional native ABI/CRT harnesses. Runtime verification logs and game-frame captures stay under ignored `out/` paths.
+### Original disc payloads
 
-The donor source's personal-use terms are preserved in [LICENSE](LICENSE), with its imported notice in [third_party/nfsu2-web-LICENSE](third_party/nfsu2-web-LICENSE). Nothing has been published.
+These checks cover the complete named ZIP files stored inside the four discs,
+before their contents are extracted. Disc roles are identified from these
+payloads, so image filenames and ordering do not matter. After extraction,
+the builder checks every required output file separately; after patching,
+it verifies all seven official replacements.
+
+| Disc role | File inside the disc | Exact size (bytes) | SHA-256 of that ZIP file |
+| --- | --- | ---: | --- |
+| 1 | `0compressed.zip` | 612595273 | `d3a3179f4b794bab7cf633b1313b597d40934bb17a83d3e02b91af368624ee99` |
+| 2 | `1compressed.zip` | 731641113 | `1ae6c9410f726afeec9a27fb8e9abd5864f53849eb65c2187f6747893ac7dd97` |
+| 3 | `2compressed.zip` | 731635509 | `3fb6436c719cb01ec7002df41413dd163f57afff80f9cfb8f7e2c1c31f4c616c` |
+| 4 | `3compressed.zip` | 169410767 | `b77b352d5cfa5ceae2b103d7989ed2ac7a86c58f430a3335687fb82b8723ee7a` |
+
+### Downloaded patches
+
+These pins cover the complete downloaded files, before extraction or decoding.
+The official download is an EXE container; the other two downloads are ZIPs.
+
+| Downloaded file | Exact size (bytes) | SHA-256 of the downloaded file |
+| --- | ---: | --- |
+| `nfsmwpatch1.3.exe` | 12777356 | `4c858e9b63ae2f856af7f1c090d5ce3d8c75246e9c0f7018ff57efb87addd0ef` |
+| `NFSMostWanted.WidescreenFix.zip` | 8911715 | `7be912197ac19134d5a64dfe61225e4ef85d612c4f64b96045727c3bf6735df4` |
+| `MW_HQ_1.20.9.zip` | 3337473092 | `1ff919737829ca46179c90740d32f6fed6797ad6b88a8daeaa6ecf255d184963` |
+
+### Prepared game files
+
+The builder creates and verifies these PE files locally. The repository does
+not supply them, and you do not need to prepare them yourself. The canonical
+file is the v1.3 translation input with original resources; Full HQ selects its
+own verified mod resources while using the supported native game code.
+
+| Prepared file | Exact size (bytes) | SHA-256 of the file |
+| --- | ---: | --- |
+| `.nfsmw/runtime.exe` (Standard/visuals translation input) | 6029312 | `80774c2e5d619b4f120b48d4462896fd504c263399d203a238769cffde1d253c` |
+| `.nfsmw/full/speed.exe` (HQ 1.20.9 game/resource image) | 5992448 | `8393f3487e3e024d6c2196d8adcd3f5b1b38077a893d9161a6f9ac61d587fa19` |
+
+## Playing
+
+- Original menus, profile creation and reload, Quick Race, and the opening
+  Career sequence have been exercised.
+- Driving, steering, pause, restart and return to the menu work in native runs.
+- Music, engine and menu audio, attract video, opening story video and the
+  following in-engine cutscene have been verified.
+- The launcher provides 4:3, 16:9, 16:10 and other supported resolutions.
+- Keyboard and game-controller input use native macOS interfaces.
+
+Click the title screen to continue. Use arrows and Enter in menus, arrows to
+drive, and Esc to pause. The window close button and Cmd-Q request a normal
+game shutdown.
+
+Saves live under `~/Library/Application Support/NFSMW/Saves`. HQ visuals and
+Full HQ use separate `HQVisuals` and `HQFull` save folders. The latest app log
+is `~/Library/Logs/NFSMW/last-run.log`.
+
+This remains an experimental port. A complete Career playthrough, every car
+and track, and every controller have not been tested. Full HQ is demanding;
+the opening cutscene and driven races in development tests ran at roughly
+18-31 FPS at 1920x1080. Network play is disabled.
+The shader-ID collision responsible for black water has a tested Metal fix;
+a clear view of the repaired water surface in a live race is still unverified.
+
+The donor project's personal-use terms are preserved in [LICENSE](LICENSE).
+Additional notices are under [third_party/](third_party/). The app you build
+contains your game files and locally generated game code.
+
+## How native is it?
+
+The build translates supported x86 game and D3DX instructions into C, then
+Apple Clang compiles that C into an ARM64 Mach-O executable. Generated game
+code comes from your verified files during the build. The repository contains
+the translator, handwritten runtime adapters and metadata rather than
+decompiled EA functions.
+
+This is ahead-of-time binary translation, not a source-level rewrite. It keeps
+the original 32-bit memory layout, register and flag state, x87 behavior and
+calling conventions where the original code requires them. Native adapters
+implement Win32, DirectInput and DirectSound calls. Direct3D 9 resources,
+rendering state and shaders are translated to Metal. Cocoa supplies the
+launcher and window, and CoreAudio supplies sound output. The game does not
+run through Wine, Rosetta or a runtime x86 interpreter.
+
+Full HQ combines handwritten native adaptations with ahead-of-time compilation
+of the original supplied ASI modules. The build runs bounded headless native
+initializers to derive finite code-patch states, then compiles guarded ARM64
+variants. Original module writers perform those writes; preparation models
+only the host interfaces needed to reach them without a live race or graphics
+device. The original audio banks are also inspected at build time to prepare
+native templates for their generated callbacks. An unknown code state stops
+with a diagnostic and requires a native rebuild; it never falls back to
+interpreting or executing x86 code.
+
+The supported canonical runtime is reconstructed locally from the verified
+HQ code image and official 1.3 resources. Its SHA-256 is
+`80774c2e5d619b4f120b48d4462896fd504c263399d203a238769cffde1d253c`.
+Standard and visuals-only modes use original shader resources. Full HQ uses
+its selected original mod resources and compiled modules.

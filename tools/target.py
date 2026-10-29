@@ -1,12 +1,13 @@
 """Fingerprinted Most Wanted target and validated hidden relocation recovery."""
 from pathlib import Path
+import hashlib
 import json
 import struct
 import pefile
 try:
-    from .install_game import EXE_SHA, D3DX_SHA, verify_binary
+    from .install_game import EXE_SHA, HQ_EXE_SHA, OFFICIAL_EXE_SHA, D3DX_SHA, verify_binary
 except ImportError:
-    from install_game import EXE_SHA, D3DX_SHA, verify_binary
+    from install_game import EXE_SHA, HQ_EXE_SHA, OFFICIAL_EXE_SHA, D3DX_SHA, verify_binary
 
 D3DX_BASE = 0x02000000
 
@@ -82,10 +83,26 @@ def recover_relocations(pe):
     return sorted(slots)
 
 
+def select_image(game):
+    game = Path(game)
+    image = game / 'speed.exe'
+    data = image.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    if digest == OFFICIAL_EXE_SHA:
+        image = game / '.nfsmw/runtime.exe'
+        data = image.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+    if digest not in (EXE_SHA, HQ_EXE_SHA):
+        raise ValueError('unsupported native runtime image SHA-256')
+    verify_binary(data, digest)
+    return image
+
+
 def prepare(game):
     game = Path(game)
-    exe = (game / 'speed.exe').read_bytes()
-    verify_binary(exe, EXE_SHA)
+    image = select_image(game)
+    exe = image.read_bytes()
+    exe_sha = hashlib.sha256(exe).hexdigest()
     dll = (game / 'd3dx9_26.dll').read_bytes()
     verify_binary(dll, D3DX_SHA)
     pe = pefile.PE(data=exe)
@@ -93,9 +110,10 @@ def prepare(game):
     check_module_range(D3DX_BASE, dpe.OPTIONAL_HEADER.SizeOfImage)
     slots = recover_relocations(pe)
     Path('out').mkdir(exist_ok=True)
+    Path('out/target-image.txt').write_text(str(image) + '\n')
     Path('out/relocs.txt').write_text('\n'.join(f'{a:08x}' for a in slots) + '\n')
     text = next(s for s in pe.sections if s.Name.rstrip(b'\0') == b'.text')
-    target = {'sha256': EXE_SHA, 'base': pe.OPTIONAL_HEADER.ImageBase,
+    target = {'sha256': exe_sha, 'base': pe.OPTIONAL_HEADER.ImageBase,
               'image_size': pe.OPTIONAL_HEADER.SizeOfImage,
               'entry': pe.OPTIONAL_HEADER.ImageBase + pe.OPTIONAL_HEADER.AddressOfEntryPoint,
               'text': pe.OPTIONAL_HEADER.ImageBase + text.VirtualAddress,
@@ -106,7 +124,7 @@ def prepare(game):
         '#ifndef NFSMW_TARGET_H\n#define NFSMW_TARGET_H\n' +
         '\n'.join(f'#define MW_{key.upper()} 0x{target[key]:08x}u'
                   for key in ('base', 'image_size', 'entry', 'text', 'text_size', 'd3dx_base')) +
-        f'\n#define MW_EXE_SHA "{EXE_SHA}"\n#define MW_D3DX_SHA "{D3DX_SHA}"\n#endif\n')
+        f'\n#define MW_EXE_SHA "{exe_sha}"\n#define MW_D3DX_SHA "{D3DX_SHA}"\n#endif\n')
     print(f'Most Wanted: {len(slots)} validated relocations; entry {target["entry"]:#x}')
     return target
 

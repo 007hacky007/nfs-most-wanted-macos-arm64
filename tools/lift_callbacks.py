@@ -3,6 +3,10 @@
 import hashlib
 import json
 import struct
+import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from capstone import Cs,CS_ARCH_X86,CS_MODE_32,CS_GRP_JUMP
 from capstone.x86 import X86_OP_IMM
@@ -11,6 +15,11 @@ try:
 except ImportError:
     from lift import RawLifter
 
+
+GENERATION_PROFILE = {'RETEIP': '1', 'LREGS': '0', 'JTSWITCH': '0', 'FLAGOPT': '1',
+                      'FTOL2INL': '0', 'X87PC': '1', 'X87OPT': '0'}
+GENERATION_UNSET = ('FLAGABI', 'INLINE_LIST', 'INLINE_MAX', 'OVERRIDE', 'HOOKS',
+                    'BRANCH_HOOKS', 'CODE_RVA_START')
 
 def callback(data,base):
     md=Cs(CS_ARCH_X86,CS_MODE_32);md.detail=True
@@ -51,14 +60,17 @@ def arena_callbacks(data,base):
         offset+=len(prefix)
 
 
-def emit(records,output):
+def _emit_local(records,output):
     output=Path(output);output.parent.mkdir(parents=True,exist_ok=True)
     parts=['/* Generated native callback templates. Original bytes stay local. */',
            '#include "cpu.h"','#include <stdint.h>']
     for record in records:
         data=bytes.fromhex(record['bytes']);base=record['base'];key=record['key']
-        lifter=RawLifter(data,base=base,comments=False)
-        code,_=lifter.lift(base)
+        lifter=RawLifter(data,base=base,comments=False,x87pc=True)
+        try:code,_=lifter.lift(base)
+        except Exception as error:raise ValueError('native callback cannot be lifted') from error
+        if lifter.traps or getattr(lifter,'truncated',0) or 'unsupported_insn(' in code or '__builtin_trap(' in code:
+            raise ValueError('unsupported or truncated native callback body')
         code=code.replace(f'void sub_{base:08x}(CPU *restrict c) {{',
                           f'static void callback_{key}(CPU *restrict c,uint32_t entry) {{')
         for offset,size,imm,target in record['calls']:
@@ -85,9 +97,31 @@ def emit(records,output):
     if not output.exists() or output.read_text()!=text:output.write_text(text)
 
 
+def emit(records, output):
+    # Some lifter options are read at import time. A fresh, pinned process
+    # prevents inherited build experiments from changing callback semantics.
+    environment = dict(os.environ)
+    for name in GENERATION_UNSET:
+        environment.pop(name, None)
+    environment.update(GENERATION_PROFILE)
+    with tempfile.TemporaryDirectory(prefix='native-callbacks-') as temporary:
+        source = Path(temporary) / 'records.json'
+        source.write_text(json.dumps(records))
+        result = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                                 '--emit-records', str(source), str(Path(output).resolve())],
+                                env=environment, capture_output=True, text=True)
+        if result.returncode:
+            raise ValueError('native callback generation failed: ' + result.stderr.strip())
+
+
 def main():
+    if len(sys.argv) == 4 and sys.argv[1] == '--emit-records':
+        if (any(os.environ.get(name) != value for name, value in GENERATION_PROFILE.items()) or
+                any(name in os.environ for name in GENERATION_UNSET)):
+            raise ValueError('callback worker requires the pinned generation profile')
+        _emit_local(json.loads(Path(sys.argv[2]).read_text()), Path(sys.argv[3]))
+        return
     root=Path('out/callbacks');root.mkdir(parents=True,exist_ok=True)
-    import sys
     if '--capture' in sys.argv:
         data=Path('out/missing-code.bin').read_bytes()
         base=int(Path('out/missing-code-address.txt').read_text(),16)

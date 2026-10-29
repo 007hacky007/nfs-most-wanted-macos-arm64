@@ -1,4 +1,3 @@
 #!/bin/sh
 set -eu
-cd "$(dirname "$0")"
-exec .venv/bin/python tools/build_native.py "$@"
+exec python3 "${0%/*}/tools/build_app.py" "$@"

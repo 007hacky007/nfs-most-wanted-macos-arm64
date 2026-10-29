@@ -41,6 +41,8 @@ int  gamepad_env_flag(const char *nm, int dflt);
 void gamepad_init(void);
 /* Snapshot of the virtual pad after dead zones; returns s->connected. */
 int  gamepad_read(PadState *s);
+/* Per-axis cutoff without rescaling; a negative fraction restores radial filtering. */
+void gamepad_set_stick_deadzones(float left, float right);
 
 /* autotest: a synthetic controller (connects on first use) */
 void gamepad_synth_connect(int on);

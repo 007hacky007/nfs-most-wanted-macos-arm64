@@ -42,6 +42,16 @@ extern const ImpEnt g_dx_imp[]; extern const uint32_t g_dx_imp_count;
 static ImpEnt *g_imps; static uint32_t g_nimps;
 static uint32_t *g_d3dx_exports;
 #include "module.h"
+#if NFS_HQ_MODULES
+#include "hq_capture.h"
+#include "hq_prepare.h"
+#include "hq_import.h"
+#include "hq_crt.h"
+#include "hq_sync.h"
+#include "hq_xenon_math.h"
+int hq_kernel_call(CPU *,const char *,uint32_t *);
+int hq_kernel_export_allowed(const char *);
+#endif
 int modheap_owns(uint32_t h); uint32_t modheap_create(void); int modheap_destroy(uint32_t h);
 uint32_t modheap_alloc(uint32_t h, uint32_t n, uint32_t flags); int modheap_free(uint32_t h, uint32_t u);
 uint32_t modheap_realloc(uint32_t h, uint32_t u, uint32_t n, uint32_t flags); uint32_t modheap_size(uint32_t h, uint32_t u);
@@ -401,6 +411,22 @@ static int module_known(uint32_t p){
     }
     return 0;
 }
+#if NFS_HQ_MODULES
+uint32_t win32_command_line(void){return g_cmdline;}
+uint32_t win32_module_name_handle(const char *name){
+    if(!name)return MW_BASE;
+    if(module_known_name(name))return module_by_name(name);
+    const char *base=name;
+    for(const char *p=name;*p;p++)if(*p=='\\'||*p=='/')base=p+1;
+    if(!strcasecmp(base,"speed.exe")||!strcasecmp(base,"speed2.exe"))return MW_BASE;
+    size_t length=strlen(base);
+    for(uint32_t i=0;i<g_nimps;i++){
+        const char *dll=g_imps[i].dll;size_t dl=strlen(dll);
+        if(!strcasecmp(base,dll)||(!strchr(base,'.')&&dl==length+4&&!strncasecmp(base,dll,length)&&!strcasecmp(dll+length,".dll")))return MW_BASE;
+    }
+    return 0;
+}
+#endif
 /* RaiseException(code, flags, nargs, args): log everything useful. */
 static void raise_exception_report(CPU *c){
     uint32_t code = ARG(c,0), fl = ARG(c,1), na = ARG(c,2), pa = ARG(c,3);
@@ -478,6 +504,10 @@ static uint32_t real_ms(void){ return (uint32_t)(real_us() / 1000ull) + 1000u; }
 int win32_call(CPU *c, uint32_t idx){
     if (idx >= g_nimps) return 0;
     const ImpEnt *e = &g_imps[idx];
+    #if NFS_HQ_MODULES
+    hq_prepare_import(c,e->name);
+    if(hq_import_forward(c,e->dll,e->name))return 1;
+    #endif
     if (!strcasecmp(e->dll, "d3dx9_26.dll")){
         uint32_t err = 0, h = module_by_name("d3dx9_26.dll");
         if (!h) h = module_load(c, "d3dx9_26.dll", &err);
@@ -498,7 +528,7 @@ int win32_call(CPU *c, uint32_t idx){
     }
 
     { void win32_thread_term_check(CPU*); win32_thread_term_check(c); }   /* TerminateThread */
-    int prev_mod = tl_imp_mod; tl_imp_mod = idx >= g_imp_count;
+    int prev_mod = tl_imp_mod; tl_imp_mod = module_of_import(idx);
     stat_[idx].calls++; g_win32_calls++;
     guest_fair_yield();          /* give the other guest threads a turn */
     POP32(c->eip);                      /* take the return address */
@@ -506,9 +536,8 @@ int win32_call(CPU *c, uint32_t idx){
     const char *n = e->name;
     uint32_t r = 0;
 
-    /* QueryPerformanceCounter is the most frequent call (frame limiter); to
-     * skip the name chain's ~20 strcmps the import index is cached on the
-     * first match. */
+    /* Cache the latest QPC import to skip the name chain. Each module has
+     * its own import index for this API. */
     static uint32_t qpc_idx = 0xFFFFFFFFu;
     /* server.dll runs on real time.  The HLE's GetTickCount is the frame-paced
      * virtual clock, which nearly stops while the game does not present (loads,
@@ -517,6 +546,12 @@ int win32_call(CPU *c, uint32_t idx){
      * Its time() comes from GetSystemTimeAsFileTime: real UTC as well (the
      * HLE's own is a counter that advances per call, which would end
      * StopServer's 10 s wait after 1,000 polls instead of 10 s). */
+#if NFS_HQ_MODULES
+    if(hq_kernel_call(c,n,&r)) {}
+    else if(hq_crt_dll(e->dll))handled=hq_xenon_math_call(c,n,&r)||hq_crt_call(c,n,&r);
+    else if(hq_sync_call(c,n,&r)) {}
+    else
+#endif
     if (idx >= g_imp_count && !strcmp(n,"GetTickCount")) r = real_ms();
     else if (idx >= g_imp_count && !strcmp(n,"GetSystemTimeAsFileTime")){
         uint32_t p = ARG(c,0);
@@ -524,8 +559,7 @@ int win32_call(CPU *c, uint32_t idx){
             uint64_t ft = ((uint64_t)ts.tv_sec + 11644473600ull) * 10000000ull + (uint64_t)ts.tv_nsec / 100u;
             mem_commit(p, 8); MR32(p) = (uint32_t)ft; MR32(p+4) = (uint32_t)(ft >> 32); }
         r = 0; }
-    else if (idx == qpc_idx || (qpc_idx == 0xFFFFFFFFu && !strcmp(n,"QueryPerformanceCounter") && (qpc_idx = idx, 1))
-             || (idx >= g_imp_count && !strcmp(n,"QueryPerformanceCounter"))){
+    else if (idx == qpc_idx || (!strcmp(n,"QueryPerformanceCounter") && (qpc_idx = idx, 1))){
         if (ENVC("QPCWHO")) qpc_who(c);
         if (c->eip == 0x43bdfeu) qpc_spin_sleep(c);
         uint64_t v = host_qpc(); uint32_t p=ARG(c,0);
@@ -677,7 +711,11 @@ int win32_call(CPU *c, uint32_t idx){
         else if (pname > 0xffff){                  /* by name (not ordinal) */
             const char *want = (const char*)(g_mem + pname);
             for (uint32_t i=0;i<g_nimps;i++)
-                if (!strcmp(g_imps[i].name, want)){ r = IMP_MAGIC + i; break; }
+                if (
+#if NFS_HQ_MODULES
+                    hq_kernel_export_allowed(want)&&
+#endif
+                    !strcmp(g_imps[i].name, want)){ r = IMP_MAGIC + i; break; }
             { static int sh=0;
               if (ENVC("VERBOSE") && !r && sh<12){ sh++; fprintf(stderr,"      [dll] GetProcAddress(\"%s\") NOT FOUND\n", want); } }
         } }
@@ -815,6 +853,9 @@ int win32_call(CPU *c, uint32_t idx){
     }
 
     if (!handled){
+#if NFS_HQ_MODULES
+        hq_capture(c,"import",c->eip);
+#endif
         fprintf(stderr, "Unsupported import: %s!%s from %08x\n", e->dll, n, c->eip);
         guest_backtrace(c, 20); exit(78);
     }
@@ -825,11 +866,17 @@ int win32_call(CPU *c, uint32_t idx){
 }
 
 void win32_init(void){
-    g_nimps = g_imp_count + g_dx_imp_count;
+    g_nimps=g_imp_count;
+    for(int id=1;id<=module_count();id++){
+        uint32_t count;module_imports(id,&count);g_nimps+=count;
+    }
     g_imps = calloc(g_nimps ? g_nimps : 1, sizeof *g_imps);
     g_d3dx_exports=calloc(g_nimps?g_nimps:1,sizeof *g_d3dx_exports);
     memcpy(g_imps, g_imp, g_imp_count * sizeof *g_imps);
-    if (g_dx_imp_count) memcpy(g_imps + g_imp_count, g_dx_imp, g_dx_imp_count * sizeof *g_imps);
+    for(int id=1;id<=module_count();id++){
+        uint32_t count;const void *imports=module_imports(id,&count);
+        if(count)memcpy(g_imps+module_imp_first(id),imports,count*sizeof *g_imps);
+    }
     stat_ = calloc(g_nimps ? g_nimps : 1, sizeof *stat_);
     heap_init();
     g_hk = calloc(g_nimps ? g_nimps : 1, 1);

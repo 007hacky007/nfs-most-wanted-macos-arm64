@@ -13,6 +13,7 @@ static unsigned scan_for(unsigned vk){
     switch(vk){
     case 8:return 0x0e;case 9:return 0x0f;case 13:return 0x1c;case 16:case 0xa0:return 0x2a;
     case 0xa1:return 0x36;case 17:case 0xa2:return 0x1d;case 0xa3:return 0x9d;
+    case 19:return 0xc5;case 0x91:return 0x46;
     case 18:case 0xa4:return 0x38;case 0xa5:return 0xb8;case 20:return 0x3a;
     case 27:return 1;case 32:return 0x39;case 33:return 0xc9;case 34:return 0xd1;
     case 35:return 0xcf;case 36:return 0xc7;case 37:return 0xcb;case 38:return 0xc8;
@@ -45,6 +46,14 @@ static int pressed(unsigned vk){
     return (vk==16&&kbd_key_down(0x36))||(vk==17&&kbd_key_down(0x9d))||(vk==18&&kbd_key_down(0xb8));
 }
 
+static uint64_t async_seen[256];
+static uint64_t press_count(unsigned vk){
+    unsigned scan=scan_for(vk);uint64_t count=scan?kbd_key_presses(scan):0;
+    if(vk==16)count+=kbd_key_presses(0x36);
+    if(vk==17)count+=kbd_key_presses(0x9d);
+    if(vk==18)count+=kbd_key_presses(0xb8);
+    return count;
+}
 int win_keyboard_call(CPU *c,const char *name,uint32_t *result){
     uint32_t a=MR32(c->esp),b=MR32(c->esp+4);*result=0;
     if(!strcmp(name,"GetKeyboardLayout"))*result=0x04090409u;
@@ -55,6 +64,11 @@ int win_keyboard_call(CPU *c,const char *name,uint32_t *result){
     }
     else if(!strcmp(name,"GetKeyState")||!strcmp(name,"GetAsyncKeyState")){
         *result=pressed(a)?0x8000:0;
+        if(!strcmp(name,"GetAsyncKeyState")&&a<256u){
+            uint64_t count=press_count(a);
+            if(count!=async_seen[a])*result|=1u;
+            async_seen[a]=count;
+        }
     }
     else if(!strcmp(name,"GetKeyboardState")){
         if(a){mem_commit(a,256);for(unsigned vk=0;vk<256;vk++)MR8(a+vk)=pressed(vk)?0x80:0;*result=1;}

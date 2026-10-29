@@ -1,4 +1,4 @@
-/* D3D9 vertex shader (vs_1_1 / vs_2_x) bytecode interpreter.
+/* D3D9 vertex shader (vs_1_1 / vs_2_x / vs_3_0) bytecode interpreter.
  *
  * Why interpret on the CPU: NFSU2 does all its drawing with
  * DrawPrimitiveUP, 4 vertices per draw. At that scale, vertex processing
@@ -19,7 +19,7 @@ typedef struct {
 
 typedef struct {
     float pos[4];        /* oPos  - clip space */
-    float col[2][4];     /* oD0, oD1 */
+    float col[6][4];     /* COLOR0..COLOR5 (SM2: oD0/oD1) */
     float tex[8][4];     /* oT0..oT7 */
     float fog, psize;
 } VSOut;
@@ -41,7 +41,9 @@ int  vs_run(const VSProg *p, const VSConst *k, const float v[16][4], VSOut *o);
 int  ps_to_msl(const VSProg *p, int id, char *out, size_t cap);
 int  ps_to_msl_ex(const VSProg *p, int id, char *out, size_t cap, unsigned cubemask);
 int  ps_to_msl_ex2(const VSProg *p, int id, char *out, size_t cap, unsigned cubemask, int reflk);
+int  ps_sampler_type(const VSProg *p, unsigned stage);
 int  ps_uses_colorout(const VSProg *p);
+unsigned ps_color_output_mask(const VSProg *p); /* bits 0..3; legacy r0 = bit 0 */
 
 /* Translate the vertex shader to MSL.  decl[i] = (byte offset, D3DDECLTYPE),
  * or offset < 0 if that input is unused.  The generated function is "vs_<id>". */

@@ -2,6 +2,10 @@
 #include <errno.h>
 #include <pthread.h>
 #include "cpu.h"
+#if NFS_HQ_MODULES
+#include "hq_capture.h"
+const char *guest_fn_name_from_host(const void *);
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #ifndef __wasm__
@@ -213,6 +217,9 @@ static void segv(int sig, siginfo_t *si, void *uc){
     }
     if (g_in_handler){ fprintf(stderr,"\n*** a second fault inside the handler - exiting\n"); _exit(4); }
     g_in_handler = 1;
+#if NFS_HQ_MODULES
+    uint32_t fault_guest=0;const char *fault_name=NULL;
+#endif
     /* The GUEST FUNCTION that faulted: resolved from the host PC.  The stack
      * trace only gives the callers; this tells exactly where the fault was. */
     { void *fpc = 0;
@@ -221,6 +228,11 @@ static void segv(int sig, siginfo_t *si, void *uc){
       if (u2 && u2->uc_mcontext) fpc = (void*)(uintptr_t)u2->uc_mcontext->__ss.__pc;
 #endif
       uint32_t ffn = fpc ? guest_fn_from_host(fpc) : 0;
+#if NFS_HQ_MODULES
+      fault_guest=ffn;fault_name=fpc?guest_fn_name_from_host(fpc):NULL;
+      if(fault_name)fprintf(stderr,"\n*** FAULT IN NATIVE BODY: %s (guest %08x)\n",fault_name,ffn);
+      else
+#endif
       if (ffn) fprintf(stderr,"\n*** FAULT IN GUEST FUNCTION: sub_%08x\n", ffn);
     }
     uint8_t *p = (uint8_t*)si->si_addr;
@@ -244,6 +256,9 @@ static void segv(int sig, siginfo_t *si, void *uc){
     }
     if (g_cur_cpu && g_backtrace_fn) g_backtrace_fn(g_cur_cpu, 12);
     if (g_itrace_dump_fn && getenv("ITRACE")) g_itrace_dump_fn(atoi(getenv("ITRACE")));
+#if NFS_HQ_MODULES
+    if(g_cur_cpu)hq_capture_fault(g_cur_cpu,p>=g_mem&&p<g_mem+GSZ?(uint32_t)(p-g_mem):UINT32_MAX,fault_guest,fault_name);
+#endif
     if (g_report_fn) g_report_fn();
     _exit(3);
 }
@@ -288,6 +303,10 @@ int mem_load_pe(const char *path){
     uint8_t *sh    = nt + 24 + optsz;
     mem_init();
     mem_commit(base, imgsz);                 /* the whole image range */
+    uint32_t headers=*(uint32_t*)(nt+24+60);
+    if(headers>(uint32_t)sz||headers>imgsz){free(buf);return -1;}
+    memcpy(g_mem+base,buf,headers);
+
     for (int i=0;i<nsec;i++){
         uint8_t *s = sh + i*40;
         char nm[9]={0}; memcpy(nm,s,8);

@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 """x86-32 -> C lifter.  Translates a function into C that runs on the CPU state."""
-import sys, struct, collections
+import sys, struct, collections, hashlib
 import pefile
 from capstone import *
 from capstone.x86 import *
+
+class GuestDisassembler(Cs):
+    def disasm(self, *args, **kwargs):
+        for ins in super().disasm(*args, **kwargs):
+            # The guest CPU exposes no MPX state. BND retains normal branch
+            # semantics, including the original prefixed instruction length.
+            if ins.mnemonic.startswith('bnd '):
+                ins._raw.mnemonic = ins.mnemonic[4:].encode('ascii')
+            # CET tracking is not exposed; retain the decoded DS operand.
+            if ins.mnemonic in ('notrack call','notrack jmp'):
+                ins._raw.mnemonic = ins.mnemonic[8:].encode('ascii')
+            yield ins
 
 R32 = {X86_REG_EAX:'eax',X86_REG_ECX:'ecx',X86_REG_EDX:'edx',X86_REG_EBX:'ebx',
        X86_REG_ESP:'esp',X86_REG_EBP:'ebp',X86_REG_ESI:'esi',X86_REG_EDI:'edi'}
@@ -220,7 +232,8 @@ def _retpast():
     """tools/retpast.txt, next to this file: callees that can return past their caller"""
     import os as _os
     p = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'retpast.txt')
-    return {int(x, 16) for ln in open(p) for x in ln.split('#')[0].replace(',', ' ').split()}
+    with open(p) as source:
+        return {int(x, 16) for ln in source for x in ln.split('#')[0].replace(',', ' ').split()}
 _LREGS = None
 def _lregs():
     """tools/lregs.py (LREGS=1), next to this file"""
@@ -294,6 +307,7 @@ def flag_liveness(blocks, addrs, in_text):
     return after
 
 class Unsupported(Exception): pass
+class NativeBranchError(Unsupported): pass
 
 import os as _os_pc
 _X87PC = _os_pc.environ.get('X87PC', '') == '1'   # see "x87 FPU" in lift_insn
@@ -366,21 +380,60 @@ class X87Region:
         self.reset()
         return out
 
+def parse_branch_hooks(text):
+    """Read bounded static source:target pairs supplied by the native generator."""
+    branches={}
+    for pair in text.split(','):
+        if not pair.strip():continue
+        values=pair.split(':')
+        if len(values)!=2:raise ValueError('expected native branch source:target')
+        source,target=(int(value,16) for value in values)
+        if source in branches or not 0<=source<=0xffffffff or not 0<=target<=0xffffffff:
+            raise ValueError('duplicate or invalid native branch')
+        branches[source]=target
+    return branches
+
+
+# The MW _exit wrapper passes retflag=0 to the shared doexit routine, whose
+# final path calls this ExitProcess leaf. The shared routine itself can return.
+_MW_EXIT_CHAIN=((0x007ca340,0x007ca355,'96229a1520663232f476684b618a013cd629997c5b947cf9489f4832391196e3'),
+                (0x007ca3a0,0x007ca4d0,'8331ef61e0fb56d43be3c91fc46585d419256cee7a9e384559178451c11c44ba'),
+                (0x007ca4d0,0x007ca517,'42d10afd09cf20e0d98f64b61f7153e3f31a35b6a818479abacb635dea3b9025'))
+
+
+def _mw_noreturn_functions(lifter):
+    if lifter.IB!=0x00400000 or 0x008901c4 not in lifter.noreturn_imports:return set()
+    for start,end,digest in _MW_EXIT_CHAIN:
+        if not(lifter.in_text(start)and lifter.in_text(end-1)):return set()
+        code=lifter.TDATA[start-lifter.TVA:end-lifter.TVA]
+        if hashlib.sha256(code).hexdigest()!=digest:return set()
+    return {0x007ca340,0x007ca4d0}
+
+
 class RawLifter:
     """Lift over a raw byte buffer: for the instruction semantics tests."""
-    def __init__(self, data, base=0x00401000, comments=True):
+    def __init__(self, data, base=0x00401000, comments=True, hooks=None, branch_hooks=None, x87pc=None):
         self.comments=comments; self.trap=False; self.traps=0
-        self.trap_kinds=collections.Counter(); self.hooks=set(); self.watch=False
+        self.x87pc=_X87PC if x87pc is None else bool(x87pc)
+        self.trap_kinds=collections.Counter(); self.hooks=set(hooks or ()); self.watch=False
+        self.branch_hooks=dict(branch_hooks or {})
+        if self.hooks.intersection(self.branch_hooks):
+            raise ValueError('branch and observer hooks cannot share a site')
         self.cov=False; self.retpast=set()
+        self.noreturn_imports=set(); self.noreturn_functions=set()
         self.secs=[('.text', base, len(data), bytes(data))]
         self.TVA=base; self.TSZ=len(data); self.TDATA=bytes(data)
-        self.md=Cs(CS_ARCH_X86,CS_MODE_32); self.md.detail=True
+        self.md=GuestDisassembler(CS_ARCH_X86,CS_MODE_32); self.md.detail=True
     in_text = lambda self,a: self.TVA<=a<self.TVA+self.TSZ
 
 class Lifter:
-    def __init__(self, pe_path, comments=True, trap=False, hooks=None, watch=False):
+    def __init__(self, pe_path, comments=True, trap=False, hooks=None, watch=False, branch_hooks=None, x87pc=None):
         self.comments=comments; self.trap=trap; self.traps=0; self.trap_kinds=collections.Counter()
+        self.x87pc=_X87PC if x87pc is None else bool(x87pc)
         self.hooks=set(hooks or ()); self.watch=watch
+        self.branch_hooks=dict(branch_hooks or {})
+        if self.hooks.intersection(self.branch_hooks):
+            raise ValueError('branch and observer hooks cannot share a site')
         self.cov=False
         pe = pefile.PE(pe_path); self.IB = pe.OPTIONAL_HEADER.ImageBase
         self.secs=[]
@@ -395,10 +448,24 @@ class Lifter:
             if not 0 <= skip < self.TSZ:
                 raise ValueError('code start outside .text')
             self.TVA, self.TSZ, self.TDATA = start, self.TSZ - skip, self.TDATA[skip:]
-        self.md=Cs(CS_ARCH_X86,CS_MODE_32); self.md.detail=True
+        self.md=GuestDisassembler(CS_ARCH_X86,CS_MODE_32); self.md.detail=True
         # this module's callees from tools/retpast.txt (a call to one may not come back to the next instruction)
         self.retpast={a for a in _retpast() if self.in_text(a)}
+        self.noreturn_imports={entry.address for library in getattr(pe,'DIRECTORY_ENTRY_IMPORT',())
+            if library.dll.lower()==b'kernel32.dll' for entry in library.imports if entry.name==b'ExitProcess'}
+        self.noreturn_functions=_mw_noreturn_functions(self)
     def in_text(self,a): return self.TVA<=a<self.TVA+self.TSZ
+
+    def is_noreturn_call(self, instruction):
+        """Only proved process-exit imports and validated function chains."""
+        if instruction.mnemonic!='call' or len(instruction.operands)!=1:return False
+        operand=instruction.operands[0]
+        if operand.type==X86_OP_IMM:return operand.imm in self.noreturn_functions
+        if operand.type==X86_OP_MEM:
+            memory=operand.mem
+            return (not(memory.base or memory.index)and memory.segment not in (X86_REG_FS,X86_REG_GS)
+                    and memory.disp&0xffffffff in self.noreturn_imports)
+        return False
 
     # ---------- operand -> C expression ----------
     def ea(self, m, extra=0):
@@ -541,6 +608,7 @@ class Lifter:
                     if m=='call':
                         o=i.operands[0]
                         if o.type==X86_OP_IMM: calls.add(o.imm)
+                        if self.is_noreturn_call(i): break
                     if m == 'int3':
                         # A single int3 = assertion/debug break -> treat it as a no-op, GO ON.
                         # A run of 0xCC = padding between functions -> stop.
@@ -697,7 +765,7 @@ class Lifter:
                 if t == 0x0075bed4 and _FTOL2INL:
                     # FTOL2INL=1: the CRT's _ftol2 in place (cpu.h FTOL2_INL), not a call
                     return [f"PUSH32(0x{i.address+i.size:x}u); FTOL2_INL(c);"]
-                if t in self.retpast:
+                if t in self.retpast and not self.is_noreturn_call(i):
                     # a callee that may return past this function (tools/retpast.txt):
                     # when the address it returned to is not this call's, this
                     # function's own return address is gone too; return as well
@@ -725,7 +793,7 @@ class Lifter:
         # X87R(x87_r2(a, b, r)) is emitted as X87R2(a, b, r): one test on the
         # fast path instead of two (cpu.h).
         def PCR(e):
-            if not _X87PC: return e
+            if not self.x87pc: return e
             if e.startswith('x87_r2(') and e.endswith(')'): return 'X87R2(' + e[len('x87_r2('):]
             return f"X87R({e})"
         ST_REGS = {X86_REG_ST0:0,X86_REG_ST1:1,X86_REG_ST2:2,X86_REG_ST3:3,
@@ -997,7 +1065,7 @@ class Lifter:
             sz=o[0].size; ea2=self.ea(o[0].mem)
             src = {2:f"(double)(int16_t)MR16{ea2}",4:f"(double)(int32_t)MR32{ea2}"}.get(sz)
             if src is None: raise Unsupported(f"{m} size {sz}")
-            PCR = (lambda e: f"X87R({e})") if _X87PC else (lambda e: e)
+            PCR = (lambda e: f"X87R({e})") if self.x87pc else (lambda e: e)
             if m=='fiadd':  return [f"ST(0) = {PCR(f'ST(0) + ({src})')};"]
             if m=='fimul':  return [f"ST(0) = {PCR(f'ST(0) * ({src})')};"]
             if m=='fisub':  return [f"ST(0) = {PCR(f'ST(0) - ({src})')};"]
@@ -1220,6 +1288,14 @@ class Lifter:
                         f" for(int _k=0;_k<16;_k++)"
                         f" if(c->xmm[{XM[o[1].reg]}].b[_k] & 0x80u) _r|=1u<<_k;"
                         f" {W(0,'_r')} }}"]
+        if m == 'pshuflw' and is_xm(0):
+            imm=o[2].imm&255;di=XM[o[0].reg]
+            if is_xm(1):
+                lo=f"c->xmm[{XM[o[1].reg]}].u64[0]";hi=f"c->xmm[{XM[o[1].reg]}].u64[1]"
+            else:
+                ea=self.ea(o[1].mem);lo=f"MR64({ea})";hi=f"MR64(({ea})+8u)"
+            expression=" | ".join(f"(((_a>>{16*((imm>>(k*2))&3)})&65535ull)<<{16*k})"for k in range(4))
+            return [f"{{ uint64_t _a={lo},_b={hi},_r={expression}; c->xmm[{di}].u64[0]=_r;c->xmm[{di}].u64[1]=_b; }}"]
         if m == 'pshufd' and is_xm(0):
             imm = o[2].imm & 0xff
             sel = [(imm>>0)&3,(imm>>2)&3,(imm>>4)&3,(imm>>6)&3]
@@ -1727,6 +1803,14 @@ class Lifter:
                         f" c->xmm[{di}].u64[0] = (~c->xmm[{di}].u64[0]) & _a;"
                         f" c->xmm[{di}].u64[1] = (~c->xmm[{di}].u64[1]) & _b; }}"]
             raise Unsupported(m)
+        if m == 'unpckhpd' and is_xm(0):
+            di=XM[o[0].reg]
+            src=f"c->xmm[{XM[o[1].reg]}].u64[1]" if is_xm(1) else f"MR64(({self.ea(o[1].mem)})+8u)"
+            return [f"{{ uint64_t _a=c->xmm[{di}].u64[1],_b={src}; c->xmm[{di}].u64[0]=_a; c->xmm[{di}].u64[1]=_b; }}"]
+        if m == 'unpcklpd' and is_xm(0):
+            di=XM[o[0].reg]
+            src=f"c->xmm[{XM[o[1].reg]}].u64[0]" if is_xm(1) else "MR64"+self.ea(o[1].mem)
+            return [f"{{ uint64_t _v={src}; c->xmm[{di}].u64[1]=_v; }}"]
         if m in ('unpcklps','unpckhps') and is_xm(0):
             di=XM[o[0].reg]; hi = (m=='unpckhps')
             if is_xm(1):
@@ -1773,6 +1857,27 @@ class Lifter:
     # ---------- function -> C ----------
     def lift(self, entry):
         blocks, calls = self.discover(entry)
+        instructions={i.address:i for block in blocks.values() for i in block}
+        branches={site:target for site,target in self.branch_hooks.items() if site in instructions}
+        if branches:
+            for site,target in branches.items():
+                if target not in instructions:
+                    raise NativeBranchError(f'native branch {site:08x} target {target:08x} is outside decoded body')
+            if _os_pc.environ.get('LREGS','')=='1':
+                raise NativeBranchError('native branches require LREGS=0')
+            # Native edges must enter a fresh x87 region, including targets that
+            # were not leaders in the original x86 control flow.
+            leaders=set(blocks)|set(branches)|set(branches.values())
+            leaders.update(site+instructions[site].size for site in branches)
+            split={}
+            for start,block in blocks.items():
+                current=[]
+                for instruction in block:
+                    if current and instruction.address in leaders:
+                        split[start]=current;start=instruction.address;current=[]
+                    current.append(instruction)
+                if current:split[start]=current
+            blocks=split
         self.last_blocks = blocks; self.entry = entry
         addrs = sorted(blocks)
         # Flag liveness: for every instruction the mask "which flags are read
@@ -1780,7 +1885,9 @@ class Lifter:
         # A callee of tools/retpast.txt counts as returning flags: when it
         # returns past its caller, the caller's early return hands them on.
         import os as _os
-        if _os.environ.get('FLAGOPT','1') == '0':
+        if branches or _os.environ.get('FLAGOPT','1') == '0':
+            # The original CFG has no native edges. Keep all flags in these
+            # few functions so a new edge cannot expose an eliminated value.
             self.fafter = {}
         else:
             abi = abi_table()
@@ -1810,6 +1917,10 @@ class Lifter:
                     body.append(f"    WCHK(0x{i.address:x}u);")
                 if self.comments:
                     body.append(f"    /* {i.address:08x}  {i.mnemonic} {i.op_str} */")
+                if i.address in branches:
+                    if x87opt and xb.active:
+                        body += ["    "+l for l in xb.close()]
+                    body.append(f"    if (guest_branch(c, 0x{i.address:x}u)) goto L_{branches[i.address]:08x};")
                 if i.address in self.hooks:
                     # a hook reads and may change ST(0) (widescreen FOV) or
                     # other x87 state: the open X87OPT region is written back
@@ -1866,6 +1977,8 @@ class Lifter:
                         body.append(f"    if({CC[m[1:]]}) goto L_{_t:08x};")
                     else:
                         self.oob_branch = getattr(self,'oob_branch',0)+1
+                        self.traps += 1
+                        self.trap_kinds['branch-out'] += 1
                         body.append(f"    if({CC[m[1:]]}) {{ unsupported_insn(c, 0x{i.address:x}u, \"branch-out\"); POP32(c->eip); return; }}")
                     nxt=i.address+i.size
                     if k==len(ins)-1 and nxt in lbl: body.append(f"    goto L_{nxt:08x};")
@@ -1884,6 +1997,8 @@ class Lifter:
                             body += ["    "+l for l in xb.close()]
                     for line in lines:
                         body.append("    "+line)
+                    if self.is_noreturn_call(i):
+                        body.append("    __builtin_trap(); /* proved nonreturning call returned */")
                 except Unsupported as e:
                     if not self.trap: raise
                     self.traps+=1; self.trap_kinds[str(e)]+=1
@@ -1959,5 +2074,5 @@ if __name__=='__main__':
 
 
 # RawLifter shares Lifter's decoding/generation methods
-for _m in ('ea','rd','wr','discover','insn','lift','_fm','_jt_bound','_jt_table','_jt_writes','_JT_PASS'):
+for _m in ('is_noreturn_call','ea','rd','wr','discover','insn','lift','_fm','_jt_bound','_jt_table','_jt_writes','_JT_PASS'):
     setattr(RawLifter, _m, getattr(Lifter, _m))

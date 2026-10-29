@@ -18,7 +18,7 @@ if args.script:environment['NFSMW_INPUT_SCRIPT']=str(args.script)
 Path('out/traces').mkdir(parents=True,exist_ok=True)
 for attempt in range(args.runs):
     with open('out/traces/profile-build.log','w') as log:
-        subprocess.run(['./build.sh'],stdout=log,stderr=subprocess.STDOUT,check=True)
+        subprocess.run([sys.executable,'tools/build_native.py'],stdout=log,stderr=subprocess.STDOUT,check=True)
     for name in ('out/missing-code.bin','out/missing-code-address.txt'):
         Path(name).unlink(missing_ok=True)
     path=Path(f'out/traces/profile-{attempt:02d}.log')

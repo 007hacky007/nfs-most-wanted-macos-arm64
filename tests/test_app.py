@@ -20,7 +20,7 @@ getcwd(before,sizeof before);assert(app_prepare(argv[1],exe,sizeof exe,save,size
 getcwd(after,sizeof after);assert(!strcmp(before,after));assert(!strcmp(exe,argv[1]));assert(!strcmp(save,argv[2]));
 assert(!strncmp(reg,save,strlen(save))&&!strcmp(reg+strlen(save),"/registry"));}
 ''')
-            binary=root/'test';subprocess.run(['clang','-fobjc-arc',str(source),'runtime/app.m','-framework','Cocoa','-o',str(binary)],check=True,capture_output=True)
+            binary=root/'test';subprocess.run(['clang','-fobjc-arc',str(source),'runtime/app.m','runtime/launcher.m','-framework','Cocoa','-o',str(binary)],check=True,capture_output=True)
             env=os.environ.copy();env['NFSMW_SAVEDIR']=str(root/'Saves')
             subprocess.run([str(binary),str(exe),str(root/'Saves')],env=env,check=True,capture_output=True)
             self.assertTrue((root/'Saves').is_dir())

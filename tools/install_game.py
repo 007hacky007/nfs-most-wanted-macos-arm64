@@ -15,10 +15,12 @@ import zipfile
 
 EXE_SHA = '80774c2e5d619b4f120b48d4462896fd504c263399d203a238769cffde1d253c'
 D3DX_SHA = '8ea96fe01c3c86a36fcb3795ae03eb12034003e335ef475571efaeda17c5bc78'
+HQ_EXE_SHA = '8393f3487e3e024d6c2196d8adcd3f5b1b38077a893d9161a6f9ac61d587fa19'
+OFFICIAL_EXE_SHA = 'e8019e0d7b706beba5ec648a50108a9a13346695eba9ebe58b6d796260d3c4eb'
 
 
 class RawISO(io.RawIOBase):
-    """A bounded, seekable logical-byte view of a MODE1/2352 image."""
+    """A bounded logical-byte view of an ISO or a legacy MODE1/2352 image."""
     def __init__(self, path, base=0, size=None):
         super().__init__()
         self.file = open(path, 'rb')
@@ -26,10 +28,16 @@ class RawISO(io.RawIOBase):
         total = self.file.tell()
         self.file.seek(0)
         header = self.file.read(16)
-        if total % 2352 or header[:12] != b'\0' + b'\xff' * 10 + b'\0' or header[15:] != b'\x01':
+        self.raw = header[:12] == b'\0' + b'\xff' * 10 + b'\0'
+        if self.raw:
+            valid = total % 2352 == 0 and header[15:] == b'\x01'
+        else:
+            self.file.seek(16 * 2048)
+            valid = total % 2048 == 0 and self.file.read(7) == b'\x01CD001\x01'
+        if not valid:
             self.file.close()
-            raise ValueError(f'{Path(path).name}: invalid MODE1/2352 image')
-        logical = total // 2352 * 2048
+            raise ValueError(f'{Path(path).name}: invalid ISO or MODE1/2352 image')
+        logical = total // 2352 * 2048 if self.raw else total
         self.base = base
         self.size = logical - base if size is None else size
         self.pos = 0
@@ -59,6 +67,13 @@ class RawISO(io.RawIOBase):
         n = max(0, self.size - self.pos) if n < 0 else max(0, min(n, self.size - self.pos))
         if not n:
             return b''
+        if not self.raw:
+            self.file.seek(self.base + self.pos)
+            data = self.file.read(n)
+            if len(data) != n:
+                raise ValueError('truncated disc image')
+            self.pos += n
+            return data
         first, offset = divmod(self.base + self.pos, 2048)
         count = (offset + n + 2047) // 2048
         self.file.seek(first * 2352)
@@ -178,59 +193,82 @@ def verify_binary(data, expected):
         raise ValueError('expected an i386 PE, not x64')
 
 
-def install(backup, destination):
-    backup, destination = Path(backup), Path(destination)
-    if destination.exists():
+def supply_d3dx(archive, destination):
+    """Decode the pinned HQ redistributable cabinet when a folder lacks D3DX."""
+    member='Redist/dx/Jun2005_d3dx9_26_x86.cab'
+    with zipfile.ZipFile(archive) as zipped:
+        info=zipped.getinfo(member)
+        if info.file_size!=1064925:raise ValueError('unsupported D3DX cabinet size')
+        cabinet=zipped.read(info)
+    if hashlib.sha256(cabinet).hexdigest()!='b448d7ba5b6fe1dc27639d42eb6ba0a997a793135678c729ba6756cfe4efc38b':
+        raise ValueError('unsupported D3DX cabinet checksum')
+    with tempfile.TemporaryDirectory(prefix='.nfsmw-d3dx-',dir=Path(destination).parent) as temporary:
+        cab=Path(temporary)/'directx.cab';cab.write_bytes(cabinet)
+        result=subprocess.run(['cabextract','-p','-F','d3dx9_26.dll',str(cab)],capture_output=True)
+        if result.returncode:raise ValueError('cabextract could not decode D3DX')
+        verify_binary(result.stdout,D3DX_SHA)
+        (Path(destination)/'d3dx9_26.dll').write_bytes(result.stdout)
+
+
+def install(backup, destination, *, patches=None, hq_source=None,
+            extractor=Path('out/tools/hq-extractor/build/innoextract')):
+    """Stage a verified folder or disc set, apply patches, and publish once complete."""
+    destination=Path(destination)
+    if destination.exists() or destination.is_symlink():
         raise FileExistsError('destination already exists; keeping it untouched')
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    manifest = {'archives': [], 'binaries': {'speed.exe': EXE_SHA, 'd3dx9_26.dll': D3DX_SHA}}
-    with tempfile.TemporaryDirectory(prefix='.nfsmw-install-', dir=destination.parent) as work:
-        staging = Path(work) / 'game'
-        staging.mkdir()
-        images = sorted(backup.glob('*.bin'))
-        if len(images) != 4:
-            raise ValueError('expected four PC disc images')
-        found_d3dx = False
-        for image in images:
-            print(f'Reading {image.name}', flush=True)
-            files = disc_files(image)
-            archives = [f for f in files if f.name.lower().endswith('.zip') and 'compres' in f.name.lower()]
-            if len(archives) != 1:
-                raise ValueError('expected one game ZIP per disc')
-            entry = archives[0]
-            with RawISO(image, entry.offset, entry.size) as raw, io.BufferedReader(raw) as stream, zipfile.ZipFile(stream) as z:
-                count = extract_zip(z, staging)
-            manifest['archives'].append({'disc': image.name, 'archive': entry.name, 'files': count})
-            print(f'  Extracted and CRC-checked {count} files', flush=True)
-            for entry in files:
-                low = entry.name.lower()
-                if low in ('server.dll', 'server.cfg') or (low=='bin.dat' and image==images[0]):
-                    with RawISO(image, entry.offset, entry.size) as raw:
-                        (staging / low).write_bytes(raw.read())
-                if not found_d3dx and low.startswith('directx/') and low.endswith('.cab') and 'jun' in low:
-                    with RawISO(image, entry.offset, entry.size) as raw:
-                        cab = Path(work) / 'directx.cab'
-                        cab.write_bytes(raw.read())
-                    result = subprocess.run(['cabextract', '-p', '-F', 'd3dx9_26.dll', str(cab)], capture_output=True)
-                    if result.returncode == 0 and hashlib.sha256(result.stdout).hexdigest() == D3DX_SHA:
-                        verify_binary(result.stdout, D3DX_SHA)
-                        (staging / 'd3dx9_26.dll').write_bytes(result.stdout)
-                        found_d3dx = True
-        if not found_d3dx:
-            raise ValueError('required x86 d3dx9_26.dll not found on supplied discs')
-        updates = list(backup.glob('*.zip'))
-        if len(updates) != 1:
-            raise ValueError('expected the supplied v1.3 update ZIP')
-        with zipfile.ZipFile(updates[0]) as z:
-            names = [n for n in z.namelist() if n.lower().endswith('/speed.exe')]
-            if len(names) != 1:
-                raise ValueError('expected one speed.exe in the update ZIP')
-            data = z.read(names[0])
-            verify_binary(data, EXE_SHA)
-            (staging / 'speed.exe').write_bytes(data)
-        (staging / 'install-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    sources=[Path(backup)] if isinstance(backup,(str,Path)) else [Path(p) for p in backup]
+    if not sources:raise ValueError('supply a game folder or all four disc images')
+    if patches is None:
+        folder=(sources[0] if sources[0].is_dir() else sources[0].parent)/'patches'
+        official=folder/'nfsmwpatch1.3.exe'
+        patches={'official-1.3':official if official.is_file() else folder/'nfsmwpatch1.3.zip',
+                 'widescreen':folder/'NFSMostWanted.WidescreenFix.zip',
+                 'mw-hq':folder/'MW_HQ_1.20.9.zip'}
+    if set(patches)!={'official-1.3','widescreen','mw-hq'}:
+        raise ValueError('provide official-1.3, widescreen and mw-hq patch paths')
+    try:
+        from .game_sources import stage_game
+        from .official_patch import apply_official_patch
+        from .patch_sources import verify_patch
+        from .extract_hq import extract_hq
+        from .hq_variants import build_variants
+    except ImportError:
+        from game_sources import stage_game
+        from official_patch import apply_official_patch
+        from patch_sources import verify_patch
+        from extract_hq import extract_hq
+        from hq_variants import build_variants
+    verify_patch('widescreen',patches['widescreen'])
+    verify_patch('mw-hq',patches['mw-hq'])
+    destination.parent.mkdir(parents=True,exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.nfsmw-install-',dir=destination.parent) as temporary:
+        staging=Path(temporary)/'game';staging.mkdir()
+        source=stage_game(sources,staging)
+        if not (staging/'d3dx9_26.dll').is_file():supply_d3dx(patches['mw-hq'],staging)
+        verify_binary((staging/'d3dx9_26.dll').read_bytes(),D3DX_SHA)
+        official=apply_official_patch(patches['official-1.3'],staging)
+        verify_binary((staging/'speed.exe').read_bytes(),OFFICIAL_EXE_SHA)
+        with zipfile.ZipFile(patches['widescreen']) as zipped:
+            extract_zip(zipped,staging/'.nfsmw/windows/widescreen')
+            for name in ('scripts/NFSMostWanted.WidescreenFix.ini','scripts/NFSMostWanted.WidescreenFix.tpk'):
+                output=staging/name;output.parent.mkdir(parents=True,exist_ok=True)
+                output.write_bytes(zipped.read(name))
+        hq=Path(hq_source) if hq_source else Path(temporary)/'hq-source'
+        if hq_source is None:
+            print('Extracting verified HQ assets with the native installer reader',flush=True)
+            extract_hq(patches['mw-hq'],hq,extractor)
+        print('Preparing isolated Standard, HQ visual and Full HQ data',flush=True)
+        variants=build_variants(staging,hq)
+        manifest={'source':source,'archives':source['archives'],
+                  'binaries':{'speed.exe':OFFICIAL_EXE_SHA,'d3dx9_26.dll':D3DX_SHA,
+                              '.nfsmw/runtime.exe':EXE_SHA},
+                  'patches':{'official-1.3':official,
+                             'widescreen':{'implementation':'native'},
+                             'mw-hq':{'version':variants['version'],'implementation':'native'}},
+                  'variants':variants['variants']}
+        (staging/'install-manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
         staging.rename(destination)
-    print(f'Installed {sum(x["files"] for x in manifest["archives"])} archive files; both binary hashes verified.', flush=True)
+    print('Installed verified game files and patches.',flush=True)
     return manifest
 
 
@@ -238,5 +276,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('backup', type=Path)
     parser.add_argument('destination', type=Path)
+    parser.add_argument('--hq-source', type=Path, help='reuse an extracted and verified HQ source tree')
+    parser.add_argument('--extractor', type=Path, default=Path('out/tools/hq-extractor/build/innoextract'))
     args = parser.parse_args()
-    install(args.backup, args.destination)
+    install(args.backup, args.destination, hq_source=args.hq_source, extractor=args.extractor)

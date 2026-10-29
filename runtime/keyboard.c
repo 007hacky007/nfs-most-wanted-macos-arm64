@@ -44,12 +44,14 @@ const char *kbd_msg_name(uint32_t m){
 
 /* ---- key state and DirectInput events ----------------------------------- */
 static pthread_mutex_t g_kmx = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_presses[256];
 static uint8_t  g_src[256];              /* bit per KSRC_* */
 #define EVN 1024u                        /* power of two */
 static KbdEv    g_ev[EVN];
 static uint32_t g_seq = 1;               /* next sequence number (0 = never used) */
 
 static void push_ev_locked(unsigned dik, int down){
+    if(down)g_presses[dik]++;
     KbdEv *e = &g_ev[g_seq & (EVN - 1u)];
     e->dik = (uint8_t)dik; e->down = (uint8_t)(down ? 1 : 0);
     e->ms = host_ms();                   /* dwTimeStamp in GetTickCount time */
@@ -88,6 +90,11 @@ int kbd_key_down(unsigned dik){
     int d = g_src[dik] != 0;
     pthread_mutex_unlock(&g_kmx);
     return d;
+}
+uint64_t kbd_key_presses(unsigned dik){
+    if(dik>255u)return 0;
+    pthread_mutex_lock(&g_kmx);uint64_t count=g_presses[dik];pthread_mutex_unlock(&g_kmx);
+    return count;
 }
 uint32_t kbd_ev_head(void){
     pthread_mutex_lock(&g_kmx);

@@ -6,6 +6,14 @@ uint64_t g_icall_hits = 0;
 #include <stdio.h>
 #include <stdlib.h>
 #include "module.h"
+#if NFS_HQ_MODULES
+#include "hq_plugin.h"
+#include "hq_capture.h"
+#include "hq_native.h"
+#else
+#define hq_capture(c,reason,address) ((void)0)
+#define hq_capture_path(name) "out/" name
+#endif
 
 typedef void (*guest_fn)(CPU*);
 extern const uint32_t g_fn_addr[];
@@ -74,9 +82,10 @@ int  g_guest_exited = 0;
  * patch inside .text goes into the dispatch table itself (at dispatch_init,
  * or at once when that has run); one elsewhere (a lifted DLL) is looked up
  * in this list before the DLL's own functions. */
-#define PATCH_MAX 24
+#define PATCH_MAX 128
 static struct { uint32_t addr; guest_fn fn; } g_patch[PATCH_MAX];
 static int g_patch_n = 0;
+unsigned hq_dispatch_patch_count(void){return (unsigned)g_patch_n;}
 static void patch_apply(void){
     for (int i = 0; i < g_patch_n; i++)
         if (g_patch[i].addr - TEXT_BASE < TEXT_SIZE) g_dtab[g_patch[i].addr - TEXT_BASE] = g_patch[i].fn;
@@ -88,7 +97,18 @@ void dispatch_patch(uint32_t a, guest_fn f){
     if (a >= 0xE0000000u){        /* the order in dispatch_indirect relies on this */
         fprintf(stderr,"dispatch_patch: address %08x outside the text range, ignored\n", a);
         return; }
-    if (g_patch_n < PATCH_MAX){ g_patch[g_patch_n].addr=a; g_patch[g_patch_n].fn=f; g_patch_n++; }
+    for (int i = 0; i < g_patch_n; i++){
+        if (g_patch[i].addr == a){
+            g_patch[i].fn = f;
+            if (g_dtab_ready) patch_apply();
+            return;
+        }
+    }
+    if (g_patch_n == PATCH_MAX){
+        fprintf(stderr,"dispatch_patch: patch table full (%d entries), cannot register %08x\n", PATCH_MAX, a);
+        exit(80);
+    }
+    g_patch[g_patch_n].addr=a; g_patch[g_patch_n].fn=f; g_patch_n++;
     if (g_dtab_ready) patch_apply();
 }
 static guest_fn patch_at(uint32_t addr){
@@ -106,6 +126,9 @@ static guest_fn diag_lookup(uint32_t a){
  * and patches are tail-called so the jumping function's frame is gone; COM,
  * Win32 and generated code return here and end the chain like a call would. */
 void dispatch_tail(CPU *c){
+#if NFS_HQ_MODULES
+    if(c->eip>=0x01000000u&&c->eip<0x03000000u)hq_plugin_thread(c);
+#endif
     uint32_t addr = c->eip, off = addr - TEXT_BASE;
     if (off < TEXT_SIZE){
         guest_fn f = g_dtab[off];
@@ -151,6 +174,9 @@ static void icall_note(CPU *c, uint32_t addr){
 }
 
 void dispatch_indirect(CPU *c, uint32_t addr){
+#if NFS_HQ_MODULES
+    if(addr>=0x01000000u&&addr<0x03000000u)hq_plugin_thread(c);
+#endif
     /* The CHEAP range test first.  COM vtable methods (0xE...) and Win32
      * import bridges (0xF...) are far above the guest text range, so they
      * NEVER collide with the patch table below -- patches are always inside
@@ -186,6 +212,7 @@ void dispatch_indirect(CPU *c, uint32_t addr){
         int native_generated_call(CPU *,uint32_t);
         if(native_generated_call(c,addr)){g_stat_indirect_ok++;return;}
     }
+    hq_capture(c,"target",addr);
     g_stat_indirect_miss++;
     fprintf(stderr,"Missing native target %08x from %08x; eax=%08x ecx=%08x edx=%08x ebx=%08x esi=%08x edi=%08x\n",
         addr,MR32(c->esp),c->eax,c->ecx,c->edx,c->ebx,c->esi,c->edi);
@@ -198,21 +225,21 @@ void dispatch_indirect(CPU *c, uint32_t addr){
     uint32_t capture=0;
     while(capture<65536u && addr<=UINT32_MAX-capture && mem_is_committed(addr+capture))capture++;
     if(capture){
-        FILE *dump=fopen("out/missing-code.bin","wb");
+        FILE *dump=fopen(hq_capture_path("missing-code.bin"),"wb");
         if(dump){fwrite(g_mem+addr,1,capture,dump);fclose(dump);}
-        dump=fopen("out/missing-code-address.txt","w");
+        dump=fopen(hq_capture_path("missing-code-address.txt"),"w");
         if(dump){fprintf(dump,"%08x\n",addr);fclose(dump);}
     }
-    remove("out/missing-code-arena.bin");remove("out/missing-code-arena-address.txt");
+    remove(hq_capture_path("missing-code-arena.bin"));remove(hq_capture_path("missing-code-arena-address.txt"));
     if(addr>=0x10000000u && addr<0x60000000u){
         uint32_t base=addr&~0x7fffffu;
-        FILE *dump=fopen("out/missing-code-arena.bin","wb");
+        FILE *dump=fopen(hq_capture_path("missing-code-arena.bin"),"wb");
         static const unsigned char empty[0x4000]={0};
         if(dump){
             for(uint32_t offset=0;offset<0x800000u;offset+=0x4000u)
                 fwrite(mem_is_committed(base+offset)?g_mem+base+offset:empty,1,0x4000,dump);
             fclose(dump);
-            dump=fopen("out/missing-code-arena-address.txt","w");
+            dump=fopen(hq_capture_path("missing-code-arena-address.txt"),"w");
             if(dump){fprintf(dump,"%08x\n",base);fclose(dump);}
         }
     }
@@ -246,6 +273,7 @@ void dispatch_indirect(CPU *c, uint32_t addr){
 
 void unsupported_insn(CPU *c, uint32_t addr, const char *mn){
     (void)c; (void)mn;
+    hq_capture(c,"instruction",addr);
     g_stat_unsupported++;
     fprintf(stderr,"Unsupported instruction %s at %08x\n",mn,addr);
     guest_backtrace(c, 20); exit(79);
@@ -322,16 +350,15 @@ void guest_backtrace(CPU *c, int maxn){
 /* Resolve the generated guest function from a faulting host PC: g_fn_ptr
  * maps host addresses to guest addresses; the nearest function start below
  * the PC is looked up. */
-uint32_t guest_fn_from_host(const void *pc){
-    uintptr_t p = (uintptr_t)pc, best = 0; uint32_t bestg = 0;
-    for (uint32_t i = 0; i < g_fn_count; i++){
-        uintptr_t f = (uintptr_t)g_fn_ptr[i];
-        if (f <= p && f > best){ best = f; bestg = g_fn_addr[i]; }
-    }
-    /* the nearest start below pc may belong to a lifted DLL instead */
-    { uint32_t mg = module_fn_from_host(pc);
-      if (mg){ uintptr_t mf = 0;
-          mod_fn fp = module_fn_at(mg); mf = (uintptr_t)fp;
-          if (mf <= p && mf > best) bestg = mg; } }
+static uint32_t resolve_host_function(const void *pc,const char **name){
+    uintptr_t p=(uintptr_t)pc,best=0;uint32_t bestg=0;if(name)*name=NULL;
+    for(uint32_t i=0;i<g_fn_count;i++){uintptr_t f=(uintptr_t)g_fn_ptr[i];if(f<=p&&f>best){best=f;bestg=g_fn_addr[i];}}
+    uint32_t module=module_fn_from_host(pc);
+    if(module){uintptr_t f=(uintptr_t)module_fn_at(module);if(f<=p&&f>best){best=f;bestg=module;}}
+#if NFS_HQ_MODULES
+    hq_native_resolve(pc,&best,&bestg,name);
+#endif
     return bestg;
 }
+uint32_t guest_fn_from_host(const void *pc){return resolve_host_function(pc,NULL);}
+const char *guest_fn_name_from_host(const void *pc){const char *name;resolve_host_function(pc,&name);return name;}

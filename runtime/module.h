@@ -1,7 +1,4 @@
-/* Second guest modules: game DLLs lifted next to SPEED2.EXE (server.dll).
- * tools/prepare_module.py writes a ModInfo for each into gen/<module>/modinfo.c;
- * runtime/module.c maps the original file, relocates and binds it, and runs
- * its DllMain. */
+/* Fingerprinted guest PE modules and native AOT dispatch. */
 #ifndef MODULE_H
 #define MODULE_H
 #include <stdint.h>
@@ -26,8 +23,11 @@ uint32_t module_by_name(const char *name);             /* GetModuleHandleA: base
 int      module_known_name(const char *name);          /* name is a lifted module, mapped or not */
 uint32_t module_proc(uint32_t h, uint32_t name_or_ord, uint32_t *err);  /* GetProcAddress */
 int      module_file_name(uint32_t h, char *out, int n);                /* GetModuleFileNameA */
-/* Import calls: the combined table index of a module's first import, and
- * which module an import index belongs to (0 = SPEED2.EXE, 1 = server.dll). */
+/* Import namespaces: game = 0, generated catalog entries = 1..module_count(). */
+int module_count(void);
+const void *module_imports(int id,uint32_t *count);
+uint32_t module_from_address(uint32_t address);
+int module_static_tls(uint32_t base,uint32_t *data,uint32_t *size,uint32_t *index,uint32_t *slot);
 uint32_t module_imp_first(int m);
 int      module_of_import(uint32_t idx);
 /* dispatch.c: lifted function at a module address, or 0 */

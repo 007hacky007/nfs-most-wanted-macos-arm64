@@ -1,0 +1,21 @@
+/* Verified global stores in pinned XenonEffects LoadConfig; absent keys retain module defaults. */
+static const HQField hq_xenon_fields[]={
+ {"MAIN","TexturePack",0xd0,'s',260},
+ {"MAIN","UseD3DDeviceTexture",0x888,'b'},
+ {"MAIN","Contrails",0xbb,'b'},
+ {"MAIN","UseCGStyle",0x77b,'b'},
+ {"MAIN","BounceParticles",0xba,'b'},
+ {"MAIN","NISContrails",0x778,'b'},
+ {"MAIN","ContrailSpeed",0xc0,'f'},
+ {"MAIN","LimitContrailRate",0xb8,'b'},
+ {"MAIN","LimitSparkRate",0xb9,'b'},
+ {"MAIN","FadeOutParticles",0x77a,'b'},
+ {"MAIN","CGIntensityBehavior",0x779,'b'},
+ {"Limits","ContrailTargetFPS",0xac,'f'},
+ {"Limits","SparkTargetFPS",0xc8,'f'},
+ {"Limits","ContrailMinIntensity",0xcc,'f'},
+ {"Limits","ContrailMaxIntensity",0xc4,'f'},
+ {"Limits","SparkIntensity",0xbc,'f'},
+ {"Limits","MaxParticles",0x1d8,'i'},
+ {"Limits","NGEffectListSize",0x1d4,'i'},
+};

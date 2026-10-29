@@ -13,6 +13,7 @@ class WinKeyboardTests(unittest.TestCase):
 #include <stdlib.h>
 uint8_t *g_mem;int win_keyboard_call(CPU *,const char *,uint32_t *);
 void mem_commit(uint32_t a,uint32_t n){assert(a+n<65536);}
+uint64_t kbd_key_presses(unsigned scan){(void)scan;return 0;}
 int kbd_key_down(unsigned scan){return scan==0x1e||scan==0x36||scan==0x9d||scan==0xb8;}
 int main(void){g_mem=calloc(1,65536);CPU cpu={0},*c=&cpu;c->esp=0x1000;uint32_t r;
 assert(win_keyboard_call(c,"GetKeyboardLayout",&r)&&r==0x04090409);

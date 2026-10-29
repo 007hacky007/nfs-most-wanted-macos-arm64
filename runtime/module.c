@@ -1,32 +1,12 @@
-/* Second guest modules: game DLLs lifted next to SPEED2.EXE.
- *
- * Today that is one module, server.dll, EA's LAN server, which the game loads
- * when a player hosts a LAN game (SPEED2.EXE 0x5FA300: LoadLibraryA("server"),
- * GetProcAddress StartServer/StopServer/IsServerRunning, StartServer(...)).
- * gen.sh lifts it at the fixed guest base 0x00A00000 (its preferred base
- * 0x10000000 is the guest heap) into gen/server; this file maps the ORIGINAL
- * file from the game folder at that base the way the Windows loader does:
- *
- *   1. the file must be the one the code was lifted from (SHA-256 pinned at
- *      gen time); anything else is refused and logged, hosting then fails in
- *      the game's own "problem starting the LAN server" dialog;
- *   2. headers and sections are copied, the rest of SizeOfImage is zero;
- *   3. the file's own HIGHLOW base relocations are applied for the new base,
- *      which reproduces the analysis copy the lifter saw (prepare_module.py);
- *   4. the IAT is bound to the runtime's HLE: slot j holds IMP_MAGIC + the
- *      module's first index in the combined import table + j, so a lifted
- *      `call [iat]` lands in win32_call like the exe's own imports;
- *   5. DllMain(DLL_PROCESS_ATTACH) runs on the loading thread, with the guest
- *      lock held (Windows: under the loader lock);
- *   6. FreeLibrary of the last reference runs DllMain(DLL_PROCESS_DETACH).
- *      The pages stay committed, so a thread that is still inside the module
- *      reads stale data instead of faulting; the next load copies a fresh
- *      image, so .data and BSS start over as on Windows.
- *
- * Module handles are base addresses.  The DLL's exports are cdecl, its
- * imports stdcall; nothing about calling conventions differs from the exe. */
+/* Fingerprinted guest PE modules and their native AOT function tables. */
 #include "cpu.h"
 #include "module.h"
+#ifndef NFS_HQ_MODULES
+#define NFS_HQ_MODULES 0
+#endif
+#if NFS_HQ_MODULES
+#include "hq_plugin.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,9 +25,16 @@ void nfsu2_sha256(const void *data, size_t n, uint8_t out[32]);   /* runtime/web
 
 typedef struct { uint32_t iat; const char*dll; const char*name; int nargs; } ImpEnt;
 extern const ImpEnt g_imp[];     extern const uint32_t g_imp_count;
-extern const ImpEnt g_dx_imp[]; extern const uint32_t g_dx_imp_count;
-extern const uint32_t g_dx_fn_addr[]; extern const mod_fn g_dx_fn_ptr[]; extern const uint32_t g_dx_fn_count;
-extern const ModInfo g_dx_modinfo;
+#define HQ_MODULE(prefix,slot,start,size,index) \
+    extern const ImpEnt g_##prefix##imp[]; extern const uint32_t g_##prefix##imp_count; \
+    extern const uint32_t g_##prefix##fn_addr[],g_##prefix##fn_count; \
+    extern const mod_fn g_##prefix##fn_ptr[]; extern const ModInfo g_##prefix##modinfo;
+#if NFS_HQ_MODULES
+#include "catalog.inc"
+#else
+HQ_MODULE(dx_,UINT32_MAX,0u,0u,0u)
+#endif
+#undef HQ_MODULE
 uint32_t call_guest(CPU *c, uint32_t fn, int nargs, const uint32_t *args);
 void mem_commit(uint32_t, uint32_t);
 int fileio_resolve_game(const char *win, char *out, size_t outsz);
@@ -60,6 +47,7 @@ typedef struct {
     const ModInfo *info;
     const ImpEnt *imp; const uint32_t *imp_count;
     const uint32_t *fn_addr; const mod_fn *fn_ptr; const uint32_t *fn_count;
+    uint32_t tls_slot, tls_start, tls_size, tls_index;
     uint32_t *idx;                  /* .text offset -> fn index + 1 */
     int refs, mapped, refused;
     char path[1024];                /* host file it was mapped from */
@@ -70,10 +58,18 @@ typedef struct {
     uint32_t socks[256]; int nsocks, fds_at_load;
 } GuestMod;
 
-static GuestMod g_mods[1] = {
-    { .info = &g_dx_modinfo, .imp = g_dx_imp, .imp_count = &g_dx_imp_count,
-      .fn_addr = g_dx_fn_addr, .fn_ptr = g_dx_fn_ptr, .fn_count = &g_dx_fn_count },
+#define HQ_MODULE(prefix,slot,start,size,index) \
+    { .info=&g_##prefix##modinfo,.imp=g_##prefix##imp,.imp_count=&g_##prefix##imp_count, \
+      .fn_addr=g_##prefix##fn_addr,.fn_ptr=g_##prefix##fn_ptr,.fn_count=&g_##prefix##fn_count, \
+      .tls_slot=slot,.tls_start=start,.tls_size=size,.tls_index=index },
+static GuestMod g_mods[] = {
+#if NFS_HQ_MODULES
+#include "catalog.inc"
+#else
+HQ_MODULE(dx_,UINT32_MAX,0u,0u,0u)
+#endif
 };
+#undef HQ_MODULE
 #define NMOD ((int)(sizeof g_mods / sizeof g_mods[0]))
 
 static int mod_lifted(const GuestMod *m){ return m->info->name[0] && *m->fn_count; }
@@ -144,7 +140,10 @@ static uint16_t rd16(const uint8_t *p){ return (uint16_t)(p[0] | p[1] << 8); }
 static int map_image(GuestMod *m, uint32_t *err){
     const ModInfo *mi = m->info;
     char host[1024];
-    if (!fileio_resolve_game(mi->name, host, sizeof host)){
+    char source[1024];
+    const char *extension=strrchr(mi->name,'.');
+    snprintf(source,sizeof source,"%s%s",extension&&!strcmp(extension,".asi")?"scripts/":"",mi->name);
+    if (!fileio_resolve_game(source, host, sizeof host)){
         fprintf(stderr, "[module] %s: required file not found in the game folder\n", mi->name);
         *err = 126u; return 0;                                   /* ERROR_MOD_NOT_FOUND */
     }
@@ -211,7 +210,11 @@ static int map_image(GuestMod *m, uint32_t *err){
         if (!strcasecmp(m->imp[j].dll,"msvcrt.dll") && !strcmp(m->imp[j].name,"_adjust_fdiv")){
             uint32_t gheap_alloc(int,uint32_t,int);
             MR32(iat) = gheap_alloc(1,4,1);
-        } else MR32(iat) = IMP_MAGIC + first + j;
+        }
+#if NFS_HQ_MODULES
+        else if ((MR32(iat)=hq_plugin_data_import(m->imp[j].name))) {}
+#endif
+        else MR32(iat) = IMP_MAGIC + first + j;
     }
     snprintf(m->path, sizeof m->path, "%s", host);
     fprintf(stderr, "[module] %s mapped at 0x%08x-0x%08x from %s (sha256 ok, %u fixups, %u imports bound)\n",
@@ -231,6 +234,11 @@ uint32_t module_load(CPU *c, const char *name, uint32_t *err){
     if (!map_image(m, err)) return 0;
     build_index(m);
     m->mapped = 1; m->refs = 1; m->loads++;
+#if NFS_HQ_MODULES
+    if (!hq_plugin_module_mapped(c,m->info->base)){
+        m->mapped=0; m->refs=0; *err=1114u; return 0;
+    }
+#endif
     m->nsocks = 0; m->fds_at_load = host_fds_open();
     const uint32_t args[3] = { m->info->base, DLL_PROCESS_ATTACH, 0 };
     uint32_t ok = call_guest(c, m->info->entry, 3, args);
@@ -298,25 +306,52 @@ uint32_t module_proc(uint32_t h, uint32_t nm, uint32_t *err){
 int module_file_name(uint32_t h, char *out, int n){
     GuestMod *m = by_handle(h);
     if (!m || !m->mapped) return 0;
-    snprintf(out, (size_t)n, "C:\\NFSU2\\%s", m->info->name);
+    const char *extension=strrchr(m->info->name,'.');
+    snprintf(out,(size_t)n,"C:\\NFSU2\\%s%s",extension&&!strcmp(extension,".asi")?"scripts\\":"",m->info->name);
     return 1;
 }
 
-uint32_t module_imp_first(int m){ return m == 1 ? g_imp_count : 0u; }
-int module_of_import(uint32_t idx){ return idx >= g_imp_count ? 1 : 0; }
-
-mod_fn module_fn_at(uint32_t addr){
-    GuestMod *m = &g_mods[0];
-    uint32_t off = addr - m->info->text;
-    if (off >= m->info->text_size || !m->idx) return 0;
-    uint32_t k = m->idx[off];
-    if (!k) return 0;
-    if (!m->mapped){
-        static int said = 0;
-        if (said++ < 4) fprintf(stderr, "[module] WARNING: call to 0x%08x in %s while it is not loaded\n",
-                                addr, m->info->name);
+int module_count(void){ return NMOD; }
+const void *module_imports(int id,uint32_t *count){
+    if(count)*count=id>=1&&id<=NMOD?*g_mods[id-1].imp_count:0;
+    return id>=1&&id<=NMOD?g_mods[id-1].imp:NULL;
+}
+uint32_t module_from_address(uint32_t address){
+    for(int i=0;i<NMOD;i++)if(g_mods[i].mapped&&address-g_mods[i].info->base<g_mods[i].info->size)return g_mods[i].info->base;
+    return 0;
+}
+int module_static_tls(uint32_t base,uint32_t *data,uint32_t *size,uint32_t *index,uint32_t *slot){
+    GuestMod *m=by_handle(base);
+    if(!m||m->tls_slot==UINT32_MAX)return 0;
+    if(data)*data=m->tls_start;
+    if(size)*size=m->tls_size;
+    if(index)*index=m->tls_index;
+    if(slot)*slot=m->tls_slot;
+    return 1;
+}
+uint32_t module_imp_first(int id){
+    if(!id)return 0;
+    if(id<1||id>NMOD)return UINT32_MAX;
+    uint32_t first=g_imp_count;
+    for(int i=0;i<id-1;i++)first+=*g_mods[i].imp_count;
+    return first;
+}
+int module_of_import(uint32_t index){
+    if(index<g_imp_count)return 0;
+    index-=g_imp_count;
+    for(int i=0;i<NMOD;i++){
+        if(index<*g_mods[i].imp_count)return i+1;
+        index-=*g_mods[i].imp_count;
     }
-    return m->fn_ptr[k - 1];
+    return -1;
+}
+mod_fn module_fn_at(uint32_t addr){
+    for(int i=0;i<NMOD;i++){
+        GuestMod *m=&g_mods[i]; uint32_t off=addr-m->info->text;
+        if(off>=m->info->text_size||!m->idx||!m->mapped)continue;
+        uint32_t k=m->idx[off];if(k)return m->fn_ptr[k-1];
+    }
+    return 0;
 }
 
 uint32_t module_nearest_fn(uint32_t a, const char **mod){

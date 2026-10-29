@@ -16,7 +16,7 @@ iat={}
 import os
 _ipe=pefile.PE(os.environ['IMPDLL']) if os.environ.get('IMPDLL') else pe
 _idelta=IB-_ipe.OPTIONAL_HEADER.ImageBase
-for e in _ipe.DIRECTORY_ENTRY_IMPORT:
+for e in getattr(_ipe,'DIRECTORY_ENTRY_IMPORT',()):
     for imp in e.imports:
         iat[(imp.address+_idelta)&0xffffffff]=(e.dll.decode('latin1'), imp.name.decode('latin1') if imp.name else f"#{imp.ordinal}")
 def rd32(a):

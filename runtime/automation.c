@@ -13,7 +13,9 @@ static Event releases[32];
 static int key(const char *name,unsigned *scan,unsigned *vk,int *character){
     static const struct {const char *name;unsigned scan,vk;} named[]={
         {"RETURN",0x1c,13},{"ESCAPE",1,27},{"UP",0xc8,38},{"DOWN",0xd0,40},
-        {"LEFT",0xcb,37},{"RIGHT",0xcd,39},{"SPACE",0x39,32},{"BACKSPACE",0x0e,8}};
+        {"LEFT",0xcb,37},{"RIGHT",0xcd,39},{"SPACE",0x39,32},{"BACKSPACE",0x0e,8},
+        {"F4",0x3e,115},{"F7",0x41,118},{"PAGEUP",0xc9,33},
+        {"SCROLLLOCK",0x46,145},{"PAUSE",0xc5,19}};
     for(unsigned i=0;i<sizeof named/sizeof *named;i++)if(!strcmp(name,named[i].name)){
         *scan=named[i].scan;*vk=named[i].vk;*character=named[i].vk==13?13:0;return 1;
     }
@@ -21,6 +23,10 @@ static int key(const char *name,unsigned *scan,unsigned *vk,int *character){
         0x31,0x18,0x19,0x10,0x13,0x1f,0x14,0x16,0x2f,0x11,0x2d,0x15,0x2c};
     if(name[0]>='A'&&name[0]<='Z'&&!name[1]){
         *scan=letters[name[0]-'A'];*vk=(unsigned)name[0];*character=name[0];return 1;
+    }
+    if(name[0]>='0'&&name[0]<='9'&&!name[1]){
+        *scan=name[0]=='0'?0x0b:(unsigned)(name[0]-'1')+2;
+        *vk=(unsigned)name[0];*character=name[0];return 1;
     }
     return 0;
 }
