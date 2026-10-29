@@ -71,9 +71,9 @@ Compatibility is determined by the **extracted files and executable bytes**,
 not filenames, version strings or a whole-ISO/BIN checksum. Every required
 file is checked by size and SHA-256. The profile describes 1,406 required game
 asset files plus `speed.exe`, with additional checks for recognized optional
-files such as the supplied D3DX DLL. All accepted per-file alternatives are in
-[tools/game_checksums.json](tools/game_checksums.json). See
-[checksums and byte sizes](#checksums-and-byte-sizes) below.
+files such as the supplied D3DX DLL. All accepted per-file alternatives are
+recorded in `tools/game_checksums.json`. The Checksums and byte sizes section
+below explains which files each checksum describes.
 
 ### What has been tested
 
@@ -97,7 +97,7 @@ required file stops the build instead of producing a partially patched app.
 
 Patch payloads are downloaded during your build and are not included in this
 repository. Exact URLs, sizes and SHA-256 pins are recorded in
-[tools/patch_sources.py](tools/patch_sources.py).
+`tools/patch_sources.py`.
 
 | Patch | Version and source | Use |
 | --- | --- | --- |
@@ -125,18 +125,26 @@ of a complete ISO, BIN or CUE file.** Different image containers can hold the
 same accepted payload. Folder inputs do not need the disc ZIP files: their
 extracted contents are checked directly.
 
-### Accepted source executable
+### The executable you supply
 
-One of these exact `speed.exe` identities must accompany the verified game
-data. Changing a filename or version label does not make another executable
-compatible. The prepared identity allows reuse of a previously prepared copy;
-it is not an instruction to download a replacement executable.
+You supply **one game copy**, with **one `speed.exe`**. Its normal source is
+either the original Disc 1 or an installation updated with EA's official 1.3
+patch. These are the two ordinary input versions in the table below. The
+builder verifies your copy and prepares the same v1.3 native target from either
+one. When building from disc images, it finds the original executable on Disc 1
+automatically.
+
+| Your copy | What the builder does |
+| --- | --- |
+| Original, unpatched USA English Black Edition discs or extracted files | Verifies the original executable and data, then applies official 1.3 |
+| The same game data with the official 1.3 patch already installed | Verifies the patched files and prepares the supported runtime |
+
+The following hashes identify the two ordinary source executables:
 
 | Accepted source `speed.exe` | Exact size (bytes) | SHA-256 of the executable file |
 | --- | ---: | --- |
 | Original USA English Black Edition disc executable (unpatched) | 7250800 | `2cf8bdbf8095fa9e10ea552695404ae9c95b5b0367a7c830520c65a57896220a` |
 | Official USA 1.3 replacement | 7254894 | `e8019e0d7b706beba5ec648a50108a9a13346695eba9ebe58b6d796260d3c4eb` |
-| Verified prepared runtime from an earlier local build | 6029312 | `80774c2e5d619b4f120b48d4462896fd504c263399d203a238769cffde1d253c` |
 
 To check an extracted executable manually on macOS:
 
@@ -145,20 +153,36 @@ shasum -a 256 "./my-game-copy/speed.exe"
 stat -f '%z' "./my-game-copy/speed.exe"
 ```
 
-### Original disc payloads
+### Files stored inside each original disc
 
-These checks cover the complete named ZIP files stored inside the four discs,
-before their contents are extracted. Disc roles are identified from these
-payloads, so image filenames and ordering do not matter. After extraction,
-the builder checks every required output file separately; after patching,
-it verifies all seven official replacements.
+**`0compressed.zip` is a file in the root directory of Disc 1.** It is part
+of the original Windows installer and contains compressed game files. Your
+ISO or BIN image contains this ZIP file as an ordinary file in its disc
+filesystem. The ZIP is not a compressed ISO or BIN image.
 
-| Disc role | File inside the disc | Exact size (bytes) | SHA-256 of that ZIP file |
-| --- | --- | ---: | --- |
-| 1 | `0compressed.zip` | 612595273 | `d3a3179f4b794bab7cf633b1313b597d40934bb17a83d3e02b91af368624ee99` |
-| 2 | `1compressed.zip` | 731641113 | `1ae6c9410f726afeec9a27fb8e9abd5864f53849eb65c2187f6747893ac7dd97` |
-| 3 | `2compressed.zip` | 731635509 | `3fb6436c719cb01ec7002df41413dd163f57afff80f9cfb8f7e2c1c31f4c616c` |
-| 4 | `3compressed.zip` | 169410767 | `b77b352d5cfa5ceae2b103d7989ed2ac7a86c58f430a3335687fb82b8723ee7a` |
+To identify it, open or mount Disc 1 and look at its top-level files in Finder.
+The tested image has the volume label `NFSMW_DISC1` and a file named
+`0compressed.zip`. Discs 2, 3 and 4 similarly contain `1compressed.zip`,
+`2compressed.zip` and `3compressed.zip` at their top level. The original
+numbering starts at zero, although the physical discs are numbered 1 through 4.
+
+**Give the builder all four disc images, or a folder containing them.** The
+builder opens the images, finds these files, verifies their checksums and
+extracts their game files automatically. You do not need to open or extract
+the ZIPs yourself. For an already extracted game folder, these ZIPs are not
+needed; the builder checks the individual game files instead.
+
+Each checksum below covers only the named ZIP file **inside** its disc. The
+volume labels are identifiers observed on the tested discs; the actual
+compatibility check uses the archive filenames, sizes and contents. After
+extraction, the builder also checks every required game file separately.
+
+| Original disc | Tested ISO volume label | File at the disc's top level | Exact size of that file (bytes) | SHA-256 of that file |
+| --- | --- | --- | ---: | --- |
+| Disc 1 | `NFSMW_DISC1` | `0compressed.zip` | 612595273 | `d3a3179f4b794bab7cf633b1313b597d40934bb17a83d3e02b91af368624ee99` |
+| Disc 2 | `NFSMW_DISC2` | `1compressed.zip` | 731641113 | `1ae6c9410f726afeec9a27fb8e9abd5864f53849eb65c2187f6747893ac7dd97` |
+| Disc 3 | `NFSMW_DISC3` | `2compressed.zip` | 731635509 | `3fb6436c719cb01ec7002df41413dd163f57afff80f9cfb8f7e2c1c31f4c616c` |
+| Disc 4 | `NFSMW_DISC4` | `3compressed.zip` | 169410767 | `b77b352d5cfa5ceae2b103d7989ed2ac7a86c58f430a3335687fb82b8723ee7a` |
 
 ### Downloaded patches
 
@@ -171,17 +195,24 @@ The official download is an EXE container; the other two downloads are ZIPs.
 | `NFSMostWanted.WidescreenFix.zip` | 8911715 | `7be912197ac19134d5a64dfe61225e4ef85d612c4f64b96045727c3bf6735df4` |
 | `MW_HQ_1.20.9.zip` | 3337473092 | `1ff919737829ca46179c90740d32f6fed6797ad6b88a8daeaa6ecf255d184963` |
 
-### Prepared game files
+### Internal files the builder produces
 
-The builder creates and verifies these PE files locally. The repository does
-not supply them, and you do not need to prepare them yourself. The canonical
-file is the v1.3 translation input with original resources; Full HQ selects its
-own verified mod resources while using the supported native game code.
+The **6,029,312-byte runtime** is an intermediate file produced by this
+project. It is the file used to translate the game into ARM64, with the
+original v1.3 resources restored. It represents the prepared v1.3 code image,
+rather than another retail release. You do not need to obtain or select this
+file. The input checker also recognizes its exact bytes when reusing an older
+locally prepared game folder.
 
-| Prepared file | Exact size (bytes) | SHA-256 of the file |
-| --- | ---: | --- |
-| `.nfsmw/runtime.exe` (Standard/visuals translation input) | 6029312 | `80774c2e5d619b4f120b48d4462896fd504c263399d203a238769cffde1d253c` |
-| `.nfsmw/full/speed.exe` (HQ 1.20.9 game/resource image) | 5992448 | `8393f3487e3e024d6c2196d8adcd3f5b1b38077a893d9161a6f9ac61d587fa19` |
+Full HQ has a separate game/resource image supplied by the automatically
+downloaded HQ package. It provides the selected HQ resources. These internal
+files are created in the private build copy; your original copy is unchanged.
+All three launcher modes use the supported v1.3 native game code.
+
+| Internal build file | Purpose | Exact size (bytes) | SHA-256 of the file |
+| --- | --- | ---: | --- |
+| `.nfsmw/runtime.exe` | Canonical v1.3 input for ARM64 translation | 6029312 | `80774c2e5d619b4f120b48d4462896fd504c263399d203a238769cffde1d253c` |
+| `.nfsmw/full/speed.exe` | HQ 1.20.9 game/resource image | 5992448 | `8393f3487e3e024d6c2196d8adcd3f5b1b38077a893d9161a6f9ac61d587fa19` |
 
 ## Playing
 
@@ -208,8 +239,8 @@ the opening cutscene and driven races in development tests ran at roughly
 The shader-ID collision responsible for black water has a tested Metal fix;
 a clear view of the repaired water surface in a live race is still unverified.
 
-The donor project's personal-use terms are preserved in [LICENSE](LICENSE).
-Additional notices are under [third_party/](third_party/). The app you build
+The donor project's personal-use terms are preserved in `LICENSE`.
+Additional notices are in the `third_party` directory. The app you build
 contains your game files and locally generated game code.
 
 ## How native is it?
