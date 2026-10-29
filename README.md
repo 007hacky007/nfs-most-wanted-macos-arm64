@@ -232,6 +232,10 @@ Click the title screen to continue. Use arrows and Enter in menus, arrows to
 drive, and Esc to pause. The window close button and Cmd-Q request a normal
 game shutdown.
 
+Startup shows an animated loading bar, elapsed time and the number of shaders
+ready. It stays visible until the first game frame appears. Graphics
+preparation can still take tens of seconds, depending on mode and shader cache.
+
 Saves live under `~/Library/Application Support/NFSMW/Saves`. HQ visuals and
 Full HQ use separate `HQVisuals` and `HQFull` save folders. The latest app log
 is `~/Library/Logs/NFSMW/last-run.log`.
@@ -262,6 +266,10 @@ implement Win32, DirectInput and DirectSound calls. Direct3D 9 resources,
 rendering state and shaders are translated to Metal. Cocoa supplies the
 launcher and window, and CoreAudio supplies sound output. The game does not
 run through Wine, Rosetta or a runtime x86 interpreter.
+
+Identical translated pixel shaders share a compiled Metal function. Extra
+shader variants without alpha testing compile only when a draw needs them,
+reducing the work before the first game frame.
 
 Full HQ combines handwritten native adaptations with ahead-of-time compilation
 of the original supplied ASI modules. The build runs bounded headless native

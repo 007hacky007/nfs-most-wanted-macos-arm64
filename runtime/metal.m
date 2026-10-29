@@ -30,6 +30,69 @@
 
 static NSWindow        *g_win;
 NSWindow *metal_nswindow(void){ return g_win; }          /* keyboard_mac.m */
+
+static NSView *g_loading_view;
+static NSTextField *g_loading_status;
+static NSProgressIndicator *g_loading_bar;
+static _Atomic int g_loading_finished;
+static _Atomic unsigned g_loading_shaders;
+static _Atomic unsigned g_ps_library_reused;
+static double g_loading_started;
+
+/* Only a displayed frame with game content ends startup; the initial clear
+ * is presented before the game's long effect/shader preparation. */
+void loading_frame_presented(int content){
+    if(content)atomic_store(&g_loading_finished,1);
+}
+void loading_update(void){
+    if(!g_loading_view)return;
+    if(atomic_load(&g_loading_finished)){
+        fprintf(stderr,"startup: first game content displayed after %.2f s (%u shaders ready)\n",
+                CACurrentMediaTime()-g_loading_started,atomic_load(&g_loading_shaders));
+        fprintf(stderr,"startup: reused %u identical pixel shader compilations\n",atomic_load(&g_ps_library_reused));
+        [g_loading_bar stopAnimation:nil];[g_loading_view removeFromSuperview];
+        g_loading_view=nil;g_loading_status=nil;g_loading_bar=nil;return;
+    }
+    unsigned elapsed=(unsigned)(CACurrentMediaTime()-g_loading_started);
+    NSString *text=[NSString stringWithFormat:@"Preparing graphics: %u shaders ready  |  %u:%02u elapsed",
+                   atomic_load(&g_loading_shaders),elapsed/60,elapsed%60];
+    if(![g_loading_status.stringValue isEqualToString:text])g_loading_status.stringValue=text;
+}
+void loading_show(NSView *parent){
+    if(g_loading_view || atomic_load(&g_loading_finished))return;
+    g_loading_started=CACurrentMediaTime();
+    g_loading_view=[[NSView alloc] initWithFrame:parent.bounds];
+    g_loading_view.autoresizingMask=NSViewWidthSizable|NSViewHeightSizable;
+    g_loading_view.wantsLayer=YES;
+    g_loading_view.layer.backgroundColor=[NSColor colorWithWhite:.075 alpha:1].CGColor;
+    g_loading_view.appearance=[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+    NSTextField *title=[NSTextField labelWithString:@"Loading Need for Speed Most Wanted"];
+    title.font=[NSFont systemFontOfSize:24 weight:NSFontWeightSemibold];
+    title.textColor=NSColor.whiteColor;
+    g_loading_status=[NSTextField labelWithString:@"Preparing game graphics"];
+    g_loading_status.font=[NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightRegular];
+    g_loading_status.textColor=NSColor.lightGrayColor;
+    g_loading_bar=[[NSProgressIndicator alloc] initWithFrame:NSZeroRect];
+    g_loading_bar.style=NSProgressIndicatorStyleBar;
+    g_loading_bar.indeterminate=YES;g_loading_bar.usesThreadedAnimation=YES;
+    [g_loading_bar startAnimation:nil];
+    NSTextField *hint=[NSTextField labelWithString:@"The game will appear when loading finishes."];
+    hint.textColor=NSColor.lightGrayColor;hint.font=[NSFont systemFontOfSize:13];
+    NSStackView *stack=[NSStackView stackViewWithViews:@[title,g_loading_bar,g_loading_status,hint]];
+    stack.orientation=NSUserInterfaceLayoutOrientationVertical;
+    stack.alignment=NSLayoutAttributeCenterX;stack.spacing=20;
+    stack.translatesAutoresizingMaskIntoConstraints=NO;
+    [g_loading_view addSubview:stack];[parent addSubview:g_loading_view];
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.centerXAnchor constraintEqualToAnchor:g_loading_view.centerXAnchor],
+        [stack.centerYAnchor constraintEqualToAnchor:g_loading_view.centerYAnchor],
+        [stack.widthAnchor constraintLessThanOrEqualToAnchor:g_loading_view.widthAnchor constant:-48],
+        [g_loading_bar.widthAnchor constraintEqualToAnchor:stack.widthAnchor],
+        [g_loading_bar.heightAnchor constraintEqualToConstant:16]]];
+    title.lineBreakMode=NSLineBreakByTruncatingTail;
+    [title.widthAnchor constraintLessThanOrEqualToAnchor:stack.widthAnchor].active=YES;
+    loading_update();
+}
 #import <ImageIO/ImageIO.h>
 #import <CoreServices/CoreServices.h>
 
@@ -979,7 +1042,7 @@ static unsigned       g_texn = 1;            /* 0 = "no texture" (white) */
 static struct {
     id<CAMetalDrawable> drawable;
     unsigned char touched[MAXTEX+1];
-    int active,screen_touched,hd_post,scene_open,gb_first,refl_drawn;
+    int active,screen_touched,hd_post,scene_open,gb_first,refl_drawn,content;
     unsigned scene_zid;
     uint64_t gpu_ns,encode_ns;
     unsigned draws,verts,resource_count;
@@ -4025,6 +4088,28 @@ void metal_raw_overflow(unsigned *rv, unsigned *kb){
     if (kb) *kb = g_ov_kb;
 }
 
+/* Shader IDs name generated identifiers, but do not change the program.
+ * Compare the entire source after renaming those identifiers so repeated
+ * effects share a function without merging different shader bodies. */
+static id<MTLFunction> metal_pixel_function(NSString *source,int psid,NSError **error){
+    NSString *pattern=[NSString stringWithFormat:@"\\b(ps|PSMRT|PSIn)_%d\\b",psid];
+    NSRegularExpression *names=[NSRegularExpression regularExpressionWithPattern:pattern options:0 error:NULL];
+    NSString *canonical=[names stringByReplacingMatchesInString:source options:0 range:NSMakeRange(0,source.length) withTemplate:@"$1_shared"];
+    static NSMutableDictionary<NSString *,id<MTLFunction>> *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once,^{cache=[NSMutableDictionary new];});
+    @synchronized(cache){
+        id<MTLFunction> function=cache[canonical];
+        if(function){atomic_fetch_add(&g_ps_library_reused,1);return function;}
+        double started=CACurrentMediaTime();
+        id<MTLLibrary> library=[g_dev newLibraryWithSource:canonical options:nil error:error];
+        if(g_perflog)perflog_event(PL_PS,(uint64_t)((CACurrentMediaTime()-started)*1e9),0);
+        function=[library newFunctionWithName:@"ps_shared"];
+        if(function)cache[canonical]=function;
+        return function;
+    }
+}
+
 /* Compile and keep the MSL source from the translator (once per id). */
 /* CAREFUL: the parameter cannot be named "id" - it would shadow ObjC's id
  * type and "id<MTLLibrary>" could no longer be parsed. */
@@ -4081,39 +4166,36 @@ void metal_register_ps(int psid, const char *msl){
         NSString *src = [kPrelude stringByAppendingString:
                          [NSString stringWithUTF8String:msl]];
         NSError *err = nil;
-        struct timespec _c0; if (g_perflog) clock_gettime(CLOCK_MONOTONIC, &_c0);
-        id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:nil error:&err];
-        if (g_perflog){ struct timespec _c1; clock_gettime(CLOCK_MONOTONIC, &_c1);
-            perflog_event(PL_PS, (uint64_t)(_c1.tv_sec - _c0.tv_sec) * 1000000000ull + (uint64_t)_c1.tv_nsec - (uint64_t)_c0.tv_nsec, 0); }
-        if (!lib){
+        id<MTLFunction> function=metal_pixel_function(src,psid,&err);
+        if (!function){
             static int shown = 0;
             if (shown < 3){ shown++;
                 fprintf(stderr, "ps%d did not compile: %s\n", psid,
                         err ? [[err localizedDescription] UTF8String] : "?"); }
             return;
         }
-        char nm[32]; snprintf(nm, sizeof nm, "ps_%d", psid);
-        g_psfn[psid] = [lib newFunctionWithName:[NSString stringWithUTF8String:nm]];
+        g_psfn[psid] = function;
         g_ps_source[psid]=[NSString stringWithUTF8String:msl];
-        if (!g_psfn[psid]) fprintf(stderr, "ps%d: function not found\n", psid);
-        g_psfn_nd[psid] = g_psfn[psid];
-        { const char *at = "if (res.a < P.aref) discard_fragment();";
-          const char *hit = strstr(msl, at);
-          if (hit && g_psfn[psid] && hsrfix_on()){
-              size_t L = strlen(msl), la = strlen(at);
-              char *m2 = (char *)malloc(L + 1);
-              if (m2){
-                  memcpy(m2, msl, (size_t)(hit - msl));
-                  memcpy(m2 + (hit - msl), hit + la, L - (size_t)(hit - msl) - la + 1);
-                  NSString *src2 = [kPrelude stringByAppendingString:[NSString stringWithUTF8String:m2]];
-                  NSError *e2 = nil;
-                  id<MTLLibrary> lib2 = [g_dev newLibraryWithSource:src2 options:nil error:&e2];
-                  id<MTLFunction> f2 = lib2 ? [lib2 newFunctionWithName:[NSString stringWithUTF8String:nm]] : nil;
-                  if (f2) g_psfn_nd[psid] = f2;
-                  free(m2);
-              } } }
+        if(g_psfn[psid])atomic_fetch_add(&g_loading_shaders,1);
     }
     free(iso);
+}
+
+/* Most startup shaders never draw without alpha testing. Compile that
+ * variant once, on the render thread, only when a pipeline needs it. */
+static id<MTLFunction> metal_fragment_no_discard(int psid){
+    if(g_psfn_nd[psid])return g_psfn_nd[psid];
+    g_psfn_nd[psid]=g_psfn[psid];
+    NSString *source=g_ps_source[psid];
+    NSString *test=@"if (res.a < P.aref) discard_fragment();";
+    if(source && hsrfix_on() && [source containsString:test]){
+        NSString *variant=[source stringByReplacingOccurrencesOfString:test withString:@""];
+        NSError *error=nil;
+        id<MTLFunction> function=metal_pixel_function([kPrelude stringByAppendingString:variant],psid,&error);
+        if(function){g_psfn_nd[psid]=function;atomic_fetch_add(&g_loading_shaders,1);}
+        else fprintf(stderr,"ps%d: alpha variant failed: %s\n",psid,error.localizedDescription.UTF8String);
+    }
+    return g_psfn_nd[psid];
 }
 
 /* Preserve the shader body, including discard, inside a depth-writing entry.
@@ -4674,7 +4756,7 @@ static id<MTLRenderPipelineState> pso_for_colors(uint64_t key,const MTLPixelForm
                           : [g_lib newFunctionWithName:@"vmain"];
     int nd = (int)((key >> 52) & 1u);          /* alpha test off: the variant without discard */
     pd.fragmentFunction = ((key>>53)&1u) ? metal_depth_fragment(psid) : (psid > 0 && psid < MAXPS && g_psfn[psid])
-                          ? ((nd && g_psfn_nd[psid]) ? g_psfn_nd[psid] : g_psfn[psid])
+                          ? (nd ? metal_fragment_no_discard(psid) : g_psfn[psid])
                           : [g_lib newFunctionWithName:(nd ? @"fmain_nd" : @"fmain")];
     if(!pd.fragmentFunction)return nil;
     pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
@@ -5114,6 +5196,7 @@ static void metal_encode_ready(id<MTLTexture> screen,id<CAMetalDrawable> drawabl
                         if(!g_logical_frame.active){
                             memset(g_logical_frame.touched,0,sizeof g_logical_frame.touched);
                             g_logical_frame.screen_touched=g_logical_frame.hd_post=0;
+                            g_logical_frame.content=0;
                             g_logical_frame.scene_open=g_logical_frame.gb_first=1;
                             g_logical_frame.refl_drawn=0;g_logical_frame.scene_zid=0;
                             g_logical_frame.gpu_ns=g_logical_frame.encode_ns=0;
@@ -6117,6 +6200,12 @@ static void metal_encode_ready(id<MTLTexture> screen,id<CAMetalDrawable> drawabl
                             [bl endEncoding];readback_encoded=1;}
                         }
                         if(rb>=0){
+                            for(unsigned i=0;i<g_dn[rb];i++){
+                                const MDraw *draw=&g_dbuf[rb][i];
+                                if(!draw->target && !draw->is_clear &&
+                                   (draw->count || (draw->is_blit && draw->blit_src)))
+                                    g_logical_frame.content=1;
+                            }
                             g_logical_frame.draws+=g_dn[rb];g_logical_frame.verts+=g_vn[rb];
                             if(g_perflog)for(unsigned i=0;i<g_dn[rb];i++){
                                 const MDraw *draw=&g_dbuf[rb][i];
@@ -6249,11 +6338,13 @@ static void metal_encode_ready(id<MTLTexture> screen,id<CAMetalDrawable> drawabl
                          * period minus half a refresh after the previous drawable,
                          * so 60 fps on a 120 Hz panel holds every frame for exactly
                          * two refreshes.  presentedTime feeds the interval stats. */
-                        { double hfr_present_min_duration(void);
+                        { int content=g_logical_frame.content && !encode_failed;
+                          double hfr_present_min_duration(void);
                           void hfr_note_presented(double);
                           double md = hfr_present_min_duration();
                           if(drawable){[drawable addPresentedHandler:^(id<MTLDrawable> pd){ hfr_note_presented(pd.presentedTime);
-                                                                        fpscounter_note_presented(pd.presentedTime); }];
+                                                                        fpscounter_note_presented(pd.presentedTime);
+                                                                        loading_frame_presented(content); }];
                           if (md > 0.0) [cb presentDrawable:drawable afterMinimumDuration:md];
                           else [cb presentDrawable:drawable];}
                           void hfr_note_present_call(void); hfr_note_present_call();
@@ -6395,6 +6486,7 @@ void metal_run_main_loop(void){
 
         /* Match the window to the drawing surface one to one (see win_apply_size). */
         win_apply_size(rw, rh);
+        loading_show(view);
         [g_win center];
         display_hz_update([g_win screen] ? [g_win screen] : [NSScreen mainScreen]);
         vsync_link_start(view);
@@ -6441,6 +6533,7 @@ void metal_run_main_loop(void){
             if (quitat && atomic_load(&g_frames_drawn) >= quitat){
                 metal_request_quit(); break; }
             lifecycle_tick();
+            loading_update();
             rt_free_pending();
             /* FSFAKE=<frame>[,...]: fake a fullscreen transition as THE GAME
              * sees it, without touching the window (view = screen size, device
