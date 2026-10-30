@@ -31,6 +31,8 @@ static uint32_t create(CPU*c,uint32_t device,unsigned model,unsigned mask){
  uint32_t code[16]={model,0x02000001,0x800f0800,0xa0e40000,0xffff};unsigned n=5;
  if(mask==3){code[4]=0x02000001;code[5]=0x800f0801;code[6]=0xa0e40001;code[7]=0xffff;n=8;}
  if(model==0xffff0101u){const uint32_t legacy[]={0xffff0101,0x42,0xb00f0003,0x1,0x800f0000,0xb0e40003,0xffff};memcpy(code,legacy,sizeof legacy);n=7;}
+ /* Distinct bytecode must consume IDs even when the shader bodies match. */
+ memmove(code+3,code+1,(n-1)*4);code[1]=0x0001fffe;code[2]=(uint32_t)g_psn+1;n+=2;
  memcpy(g_mem+0x18000,code,n*4);MR32(0x18100)=0xdeadbeef;
  uint32_t a[8]={0x18000,0x18100};uint32_t result=invoke(c,IF_DEV,"CreatePixelShader",device,a);
  if(result){assert(!MR32(0x18100));return result;}

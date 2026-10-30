@@ -14,6 +14,21 @@ from tools.generation_manifest import record_generation
 
 
 class HQRouteTests(unittest.TestCase):
+    def test_replaced_data_callbacks_are_native_entries(self):
+        from tools.prepare_hq_routes import data_callback_targets
+        original=bytearray(0x3000);modified=bytearray(original)
+        struct.pack_into('<I',original,0x2000,0x401000)
+        modified[:]=original
+        struct.pack_into('<I',modified,0x2000,0x401020)
+        struct.pack_into('<I',modified,0x2004,0x401040)  # A new integer is not proof of a callback.
+        struct.pack_into('<I',original,0x1080,0x401000)
+        struct.pack_into('<I',modified,0x1080,0x401060)  # An instruction operand is not a data callback.
+        slots=[0x402000,0x402004,0x401080]
+        self.assertEqual(data_callback_targets([original,modified],0x400000,slots,{0x401000},0x401000,0x1000),{0x401020})
+        for value in (0,0x900000,0x401000):
+            struct.pack_into('<I',modified,0x2000,value)
+            self.assertEqual(data_callback_targets([original,modified],0x400000,slots,{0x401000},0x401000,0x1000),set())
+
     def record(self,exe,baseline,hooks,branches):
         relocs=exe.with_suffix('.relocs');relocs.write_text('')
         with patch.dict(os.environ,{'RELOCS':str(relocs),'X87PC':'1'}):

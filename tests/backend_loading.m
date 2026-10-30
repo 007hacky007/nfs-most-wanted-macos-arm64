@@ -6,6 +6,12 @@ int g_texrep_frame_on; __strong id<MTLTexture> g_texrep_tex[TEXREP_MAXTEX]; uint
 int com_frees(void){ return 0; }
 static unsigned reset_requests;
 void com_request_reset(void){ reset_requests++; }
+@interface StartupWindowProbe : NSWindow
+@property unsigned fullscreenRequests;
+@end
+@implementation StartupWindowProbe
+- (void)toggleFullScreen:(id)sender{(void)sender;self.fullscreenRequests++;}
+@end
 void loading_show(NSView *);
 void loading_update(void);
 void loading_frame_presented(int);
@@ -84,9 +90,24 @@ static void window_reset_test(int pinned){
  assert(reset_requests==(pinned?0:3));
  puts("window transitions preserve fixed-resolution resources and reset dynamic modes");
 }
+static void deferred_fullscreen_test(void){
+ [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+ setenv("NFSFULL","1",1);
+ StartupWindowProbe *window=[[StartupWindowProbe alloc] initWithContentRect:NSMakeRect(0,0,800,500) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+ g_win=window;int pending=1;
+ startup_fullscreen_if_ready(&pending);
+ assert(pending && !window.fullscreenRequests);
+ loading_frame_presented(0);startup_fullscreen_if_ready(&pending);
+ assert(pending && !window.fullscreenRequests);
+ loading_frame_presented(1);startup_fullscreen_if_ready(&pending);
+ assert(!pending && window.fullscreenRequests==1);
+ startup_fullscreen_if_ready(&pending);assert(window.fullscreenRequests==1);
+ puts("startup waits for visible game content before entering fullscreen once");
+}
 int main(int argc,char **argv){@autoreleasepool{
  if(argc>1&&!strcmp(argv[1],"ui"))ui_test(argv[2]);
  else if(argc>1&&!strcmp(argv[1],"pinned"))window_reset_test(1);
  else if(argc>1&&!strcmp(argv[1],"dynamic"))window_reset_test(0);
+ else if(argc>1&&!strcmp(argv[1],"deferred"))deferred_fullscreen_test();
  else shader_test();
 }return 0;}

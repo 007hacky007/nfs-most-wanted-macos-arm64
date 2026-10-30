@@ -18,8 +18,6 @@ class MRTTargets(unittest.TestCase):
 #undef main
 static unsigned slot_zero_calls;
 void metal_set_render_target(unsigned target){slot_zero_calls++;observed_targets[0]=target;}
-void metal_register_ps(int id,const char*source){assert(id>0&&source&&*source);}
-void metal_set_ps_model(int id,unsigned version,const int types[16]){(void)id;(void)version;(void)types;}
 void metal_set_blend(unsigned key,float alpha){(void)alpha;observed_color_write[0]=(key>>14)&15;}
 void metal_set_blendcolor(uint32_t color){(void)color;}
 void metal_set_fog(unsigned enabled,unsigned color){(void)enabled;(void)color;}

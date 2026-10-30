@@ -37,3 +37,7 @@ class LoadingTests(unittest.TestCase):
         for mode in ('pinned','dynamic'):
             with self.subTest(mode=mode):
                 self.assertIn('preserve fixed-resolution resources',self.run_probe(mode))
+
+    @unittest.skipUnless(os.environ.get('NFSMW_TEST_GUI'),'set NFSMW_TEST_GUI for Cocoa window events')
+    def test_fullscreen_starts_after_visible_content(self):
+        self.assertIn('entering fullscreen once',self.run_probe('deferred'))

@@ -1166,6 +1166,21 @@ static uint32_t g_psc_max = 0;                   /* highest index seen + 1 */
 static uint32_t g_psc_drop = 0;                  /* writes above 32 (dropped) */
 static int      g_cur_ps_id = 0;                 /* active ps id */
 static int      g_psn = 0;                       /* number of registered ps */
+#ifndef __wasm__
+/* Programs outlive COM objects; graphics resets recreate identical shaders. */
+typedef struct { void *bytes; uint32_t size; } ShaderCode;
+static ShaderCode g_ps_code[METAL_PS_BASE_LIMIT],g_vs_code[MAXVS];
+static unsigned shader_code_find(ShaderCode *cache,unsigned count,const void *bytes,uint32_t size){
+    if(size<8)return 0;
+    for(unsigned id=1;id<count;id++)
+        if(cache[id].size==size && !memcmp(cache[id].bytes,bytes,size))return id;
+    return 0;
+}
+static void shader_code_save(ShaderCode *entry,const void *bytes,uint32_t size){
+    entry->bytes=malloc(size);
+    if(entry->bytes){memcpy(entry->bytes,bytes,size);entry->size=size;}
+}
+#endif
 static uint64_t g_stage_hist[4] = {0,0,0,0};
 static float g_rmin[3] = { 1e30f, 1e30f, 1e30f };
 static float g_rmax[3] = { -1e30f, -1e30f, -1e30f };
@@ -4070,13 +4085,6 @@ int com_call(CPU *c, uint32_t magic){
             if(pp) MR32(pp)=h; r=0; }
         else if (MID(CreateVertexShader)||MID(CreatePixelShader)){
             uint32_t fn=A(c,1), pp=A(c,2);
-#ifndef __wasm__
-            if(MID(CreatePixelShader) && g_psn>=METAL_PS_BASE_LIMIT-1){
-                if(pp)MR32(pp)=0;r=0x8007000eu;goto shader_create_done;
-            }
-#endif
-            uint32_t h=com_new(IF_VSHADER,32);
-            CH_FLAGS(h) |= CF_DEVICE;                   /* kept: see CreateVertexDeclaration */
             /* scan the shader token stream: up to the 0x0000FFFF END token */
             uint32_t sz=0;
             if (fn){ uint32_t k=0;
@@ -4085,9 +4093,22 @@ int com_call(CPU *c, uint32_t magic){
                     uint32_t t=MR32(fn+4u*k); if(t==0x0000FFFFu){ k++; break; }
                 }
                 sz = 4u*k; }
+#ifndef __wasm__
+            ShaderCode *cache=MID(CreatePixelShader)?g_ps_code:g_vs_code;
+            unsigned cached=shader_code_find(cache,MID(CreatePixelShader)?(unsigned)g_psn+1:g_vsprogn,
+                                            g_mem+fn,sz);
+            if(MID(CreatePixelShader) && !cached && g_psn>=METAL_PS_BASE_LIMIT-1){
+                if(pp)MR32(pp)=0;r=0x8007000eu;goto shader_create_done;
+            }
+#endif
+            uint32_t h=com_new(IF_VSHADER,32);
+            CH_FLAGS(h) |= CF_DEVICE;                   /* kept: see CreateVertexDeclaration */
             uint32_t copy = sz ? gbuf_alloc(sz) : 0;
             if (copy && fn) memcpy(g_mem+copy, g_mem+fn, sz);
             MR32(h+4)=copy; MR32(h+8)=sz; MR32(h+12)=0;
+#ifndef __wasm__
+            if(cached){MR32(h+12)=cached;goto shader_registered;}
+#endif
             /* PSDUMP: pixel shaders use the same token format; compile and
              * disassemble them to see WHAT they do. */
             if (MID(CreatePixelShader) && copy && sz >= 8 && ENVC("PSDUMP")){
@@ -4179,6 +4200,10 @@ int com_call(CPU *c, uint32_t magic){
                     }
                 }
             }
+#ifndef __wasm__
+            if(MR32(h+12))shader_code_save(&cache[MR32(h+12)],g_mem+copy,sz);
+          shader_registered:;
+#endif
             if(MID(CreatePixelShader) && copy && sz>=8 && (MR32(copy)&0xffffu)>=0x0300 && !MR32(h+12)){
                 gbuf_free(copy);com_drop(h);if(pp)MR32(pp)=0;r=0x8876086cu;
             }else {if(pp)MR32(pp)=h;r=0;}

@@ -9,17 +9,22 @@ import re
 import sys
 import shutil
 import tempfile
+import struct
 import pefile
 try:
     from .lift import Lifter, parse_branch_hooks
     from .hq_routes import emit_wrappers, emit_native_names
     from .prepare_hq_modules import checked_output
     from .generation_manifest import verify_generation
+    from .game_code_data import CANONICAL_SHA
+    from .target import recover_relocations
 except ImportError:
     from lift import Lifter, parse_branch_hooks
     from hq_routes import emit_wrappers, emit_native_names
     from prepare_hq_modules import checked_output
     from generation_manifest import verify_generation
+    from game_code_data import CANONICAL_SHA
+    from target import recover_relocations
 
 ROOT=Path(__file__).resolve().parents[1]
 MARKER='.hq-routes.json'
@@ -27,7 +32,22 @@ MARKER='.hq-routes.json'
 
 def processor_hashes():
     return {name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest()for name in (
-        'tools/prepare_hq_routes.py','tools/hq_routes.py','tools/prepare_hq_modules.py')}
+        'tools/prepare_hq_routes.py','tools/hq_routes.py','tools/prepare_hq_modules.py',
+        'tools/game_code_data.py','tools/target.py')}
+
+
+def data_callback_targets(images,base,relocations,functions,start,size):
+    """Recover replacement callbacks in proved data pointers, not instruction operands."""
+    targets=set()
+    for slot in relocations:
+        if start<=slot<start+size:continue
+        offset=slot-base
+        before=struct.unpack_from('<I',images[0],offset)[0]
+        if before not in functions:continue
+        for image in images[1:]:
+            target=struct.unpack_from('<I',image,offset)[0]
+            if start<=target<start+size and target not in functions:targets.add(target)
+    return targets
 
 
 def verify_routes(output,generated,hook_file,branch_file):
@@ -179,6 +199,11 @@ def _generate(exe, generated, snapshots, output, extra_seeds=(), hook_file=None,
     # A new CFG may reach bytes which the original function did not cover.
     # Adding every direct branch/call destination in captured edits makes these explicit entries.
     extra={int(x,16)if isinstance(x,str)else x for x in extra_seeds}-functions
+    # ASI writers also replace vtable slots. Following only changed .text
+    # misses those callbacks, including the Full HQ video-options handler.
+    callbacks=data_callback_targets(images,base,recover_relocations(pe),functions,start,size) \
+        if hashlib.sha256(exe.read_bytes()).hexdigest()==CANONICAL_SHA else set()
+    extra.update(callbacks)
     if any(not start<=entry<start+size for entry in extra):
         raise ValueError('game continuation is outside executable .text')
     pending=set(extra);extra_code={};references=set();traps=[]
@@ -250,6 +275,7 @@ def _generate(exe, generated, snapshots, output, extra_seeds=(), hook_file=None,
     (output/'seeds.txt').write_text(''.join(f'{entry:08x}\n'for entry in seeds))
     (output/'register.c').write_text('#include "cpu.h"\n#include "decls.h"\nvoid dispatch_patch(uint32_t,void(*)(CPU*));\nvoid hq_game_register(void){\n'+''.join(f' dispatch_patch(0x{entry:08x}u,sub_{entry:08x});\n'for entry in seeds)+'}\n')
     result={'exe_sha256':hashlib.sha256(exe.read_bytes()).hexdigest(),'phases':names,'changed_bytes':observed_changed_bytes,
+            'data_callbacks':sorted(callbacks),
             'declared_patch_ranges':patch_ranges,'guarded_bytes':len(changes),
             'functions':records,'replaced_shards':replaced,'extra_entries':seeds,'traps':traps,
             'native_branches':[{'source':source,'target':target}for source,target in sorted(branches.items())],

@@ -4937,6 +4937,16 @@ static int fs_pref_load(void){
     if (fs_pref_test_run()) return 0;
     return [[NSUserDefaults standardUserDefaults] boolForKey:@"NFSUFullScreen"] ? 1 : 0;
 }
+/* AppKit must attach a presented Metal surface before moving the window
+ * into its fullscreen Space; doing this during creation can leave it black. */
+static void startup_fullscreen_if_ready(int *pending){
+    if(!*pending || !atomic_load(&g_loading_finished))return;
+    *pending=0;
+    if(fs_pref_load() && !g_fs_transition && !(g_win.styleMask&NSWindowStyleMaskFullScreen)){
+        fprintf(stderr,"app: entering fullscreen after first visible game frame\n");
+        [g_win toggleFullScreen:nil];
+    }
+}
 /* lifecycle.c: quit and activation are handed to the game as window
  * messages (WM_CLOSE, WM_ACTIVATE/WM_ACTIVATEAPP), like Windows does. */
 void lifecycle_request_quit(const char *why);
@@ -5089,13 +5099,17 @@ static void power_state_changed(void){
     fs_pref_save(1);
     fprintf(stderr, "app: fullscreen %.0fx%.0f points = %dx%d pixels\n",
             (double)c.width, (double)c.height, atomic_load(&g_fs_pw), atomic_load(&g_fs_ph));
-    window_request_reset(); }
+    window_request_reset();
+    cursor_hide_if_inside(); }
 - (void)windowDidExitFullScreen:(NSNotification *)n { (void)n;
     g_fs_transition = 0;
     atomic_store(&g_fs, 0);
     fs_pref_save(0);
     fprintf(stderr, "app: back to windowed mode\n");
-    window_request_reset(); }
+    window_request_reset();
+    cursor_hide_if_inside(); }
+/* Activation can precede the window becoming key, especially at startup. */
+- (void)windowDidBecomeKey:(NSNotification *)n { (void)n; cursor_hide_if_inside(); }
 /* Another window of ours (About, a panel) gets the keys from now on. */
 - (void)windowDidResignKey:(NSNotification *)n { (void)n; cursor_hide_update(0);
     kbdmac_release_all("window resigned key"); mouse_release_all(); }
@@ -6527,7 +6541,7 @@ void metal_run_main_loop(void){
         }
         else { [g_win makeKeyAndOrderFront:nil];
                [NSApp activateIgnoringOtherApps:YES]; }
-        if (fs_pref_load()) [g_win toggleFullScreen:nil];
+        int startup_fullscreen=fs_pref_load();
 
         /* the draw resources were set up in metal_early_init() */
         fprintf(stderr, "metal: window open (%s), draw path %s\n",
@@ -6545,6 +6559,7 @@ void metal_run_main_loop(void){
                 metal_request_quit(); break; }
             lifecycle_tick();
             loading_update();
+            startup_fullscreen_if_ready(&startup_fullscreen);
             rt_free_pending();
             /* FSFAKE=<frame>[,...]: fake a fullscreen transition as THE GAME
              * sees it, without touching the window (view = screen size, device

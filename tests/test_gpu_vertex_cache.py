@@ -75,6 +75,7 @@ int main(void){
  assert(strstr(registered_source[first],"LDF(0)")&&strstr(registered_source[moved],"LDF(4)"));
  declaration(&c,device,0,3,0,0);int typed=draw(32);assert(typed!=first&&typed!=moved&&registrations==3);
  declaration(&c,device,0,2,0,0);assert(draw(32)==first&&registrations==3);
+ MR32(0x18200+12*4)=0x90e40000; /* A different program must retain its own GPU shader. */
  a[0]=0x18200;a[1]=0x18300;assert(!invoke(&c,IF_DEV,"CreateVertexShader",device,a));
  uint32_t other=MR32(0x18300);assert(other!=shader);a[0]=other;
  assert(!invoke(&c,IF_DEV,"SetVertexShader",device,a));int program=draw(32);

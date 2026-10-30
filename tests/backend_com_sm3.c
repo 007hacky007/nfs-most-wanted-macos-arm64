@@ -314,9 +314,32 @@ static void stateblock_light_membership(CPU *cpu,uint32_t device){
     }
 }
 
+static void shader_recreation(CPU *cpu,uint32_t device){
+    uint32_t program[]={0xffff0200,0x02000001,0x800f0800,0x90e40000,0xffff};
+    memcpy(g_mem+0x15000,program,sizeof program);
+    uint32_t args[4]={0x15000,0x15100},first=0;
+    for(unsigned i=0;i<METAL_PS_BASE_LIMIT+2;i++){
+        assert(!invoke(cpu,IF_DEV,"CreatePixelShader",device,args));
+        uint32_t object=MR32(0x15100),id=MR32(object+12);assert(id);
+        if(!i)first=id;else assert(id==first);
+        assert(!invoke(cpu,IF_VSHADER,"Release",object,args));
+    }
+    MR32(0x1500c)=0x90e40001;
+    assert(!invoke(cpu,IF_DEV,"CreatePixelShader",device,args));
+    assert(MR32(MR32(0x15100)+12)!=first);
+    program[0]=0xfffe0200;program[2]=0xc00f0000;
+    memcpy(g_mem+0x15000,program,sizeof program);first=0;
+    for(unsigned i=0;i<MAXVS+2;i++){
+        assert(!invoke(cpu,IF_DEV,"CreateVertexShader",device,args));
+        uint32_t object=MR32(0x15100),id=MR32(object+12);assert(id);
+        if(!i)first=id;else assert(id==first);
+        assert(!invoke(cpu,IF_VSHADER,"Release",object,args));
+    }
+}
 int main(void){
     g_mem=mmap(NULL,GSZ,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);assert(g_mem!=MAP_FAILED);
     mem_commit(0x10000,0x10000);CPU cpu={0};uint32_t device=com_new(IF_DEV,16);
+    shader_recreation(&cpu,device);
     volume_formats(&cpu,device);
     predefined_states(&cpu,device);
     predefined_auxiliary(&cpu,device);
@@ -370,6 +393,8 @@ int main(void){
 }
 
 /* This fixture exercises COM with an unavailable query GPU backend. */
+void metal_register_ps(int id,const char *source){assert(id>0&&source);}
+void metal_set_ps_model(int id,unsigned model,const int types[16]){(void)id;(void)model;(void)types;}
 void metal_query_reset(void){}
 unsigned metal_query_create(void){return 0;}
 void metal_query_destroy(unsigned handle){(void)handle;}
