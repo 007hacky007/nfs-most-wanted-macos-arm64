@@ -5002,6 +5002,17 @@ static void vsync_link_start(NSView *v){
         vsync_link_range();
     }
 }
+/* With a launcher resolution, a window/Space transition only changes the
+ * presentation surface. Losing the D3D device discards live movie resources. */
+static void window_request_reset(void){
+    const char *fixed=ENVC("NFSRES");unsigned w=0,h=0;
+    if(fixed && sscanf(fixed,"%ux%u",&w,&h)==2 &&
+       w>=640 && h>=480 && w<=8192 && h<=8192){
+        win_apply_size(w,h);return;
+    }
+    com_request_reset();
+}
+
 /* A display reconfiguration (mode, resolution, refresh rate, arrangement)
  * that need not move the window to another screen or change its backing
  * scale, so neither windowDidChangeScreen: nor
@@ -5015,8 +5026,8 @@ static void screen_params_changed(const char *why){
     fprintf(stderr, "app: %s: backing x%.2f, panel %.3f px/pt, refresh %d Hz\n", why,
             s1 / 100.0, p1 / 1000.0, atomic_load(&g_display_hz));
     if (s1 != s0 || p1 != p0){
-        fprintf(stderr, "app: screen metrics changed -> device reset\n");
-        com_request_reset(); }
+        fprintf(stderr, "app: screen metrics changed\n");
+        window_request_reset(); }
 }
 /* Low Power Mode on or off.  Whether macOS lowers the screen's
  * maximumFramesPerSecond then or only runs the panel slower is not known
@@ -5076,15 +5087,15 @@ static void power_state_changed(void){
     atomic_store(&g_cont_w, (int)c.width); atomic_store(&g_cont_h, (int)c.height);
     atomic_store(&g_fs, 1);
     fs_pref_save(1);
-    fprintf(stderr, "app: fullscreen %.0fx%.0f points = %dx%d pixels -> rebuilding the device\n",
+    fprintf(stderr, "app: fullscreen %.0fx%.0f points = %dx%d pixels\n",
             (double)c.width, (double)c.height, atomic_load(&g_fs_pw), atomic_load(&g_fs_ph));
-    com_request_reset(); }
+    window_request_reset(); }
 - (void)windowDidExitFullScreen:(NSNotification *)n { (void)n;
     g_fs_transition = 0;
     atomic_store(&g_fs, 0);
     fs_pref_save(0);
-    fprintf(stderr, "app: back to windowed mode -> rebuilding the device\n");
-    com_request_reset(); }
+    fprintf(stderr, "app: back to windowed mode\n");
+    window_request_reset(); }
 /* Another window of ours (About, a panel) gets the keys from now on. */
 - (void)windowDidResignKey:(NSNotification *)n { (void)n; cursor_hide_update(0);
     kbdmac_release_all("window resigned key"); mouse_release_all(); }
@@ -5094,7 +5105,7 @@ static void power_state_changed(void){
     NSSize c = [[[n object] contentView] bounds].size;
     atomic_store(&g_cont_w, (int)c.width); atomic_store(&g_cont_h, (int)c.height);
     g_applied_cw = c.width; g_applied_ch = c.height;
-    if (!atomic_load(&g_fs)) com_request_reset(); }
+    if (!atomic_load(&g_fs)) window_request_reset(); }
 - (void)windowDidResize:(NSNotification *)n {
     NSWindow *w = [n object];
     NSSize c = [[w contentView] bounds].size;
@@ -5106,9 +5117,9 @@ static void power_state_changed(void){
      * steps and reset once when they finish. */
     if (![w inLiveResize] && !g_fs_transition && !atomic_load(&g_fs) &&
         g_win_sized && (fabs(c.width - g_applied_cw) >= 1.0 || fabs(c.height - g_applied_ch) >= 1.0)){
-        fprintf(stderr, "app: window content %.0fx%.0f pt -> device reset\n", c.width, c.height);
+        fprintf(stderr, "app: window content %.0fx%.0f pt\n", c.width, c.height);
         g_applied_cw = c.width; g_applied_ch = c.height;
-        com_request_reset(); } }
+        window_request_reset(); } }
 /* The window moved to a screen with another scale factor (or the display
  * mode changed): new backing pixels, new panel density. */
 - (void)windowDidChangeBackingProperties:(NSNotification *)n {
@@ -5116,13 +5127,13 @@ static void power_state_changed(void){
     CGFloat old = [[[n userInfo] objectForKey:NSBackingPropertyOldScaleFactorKey] doubleValue];
     scr_cache();
     if (g_layer) g_layer.contentsScale = [w backingScaleFactor];
-    fprintf(stderr, "app: backing scale %.2f -> %.2f -> device reset\n", (double)old,
+    fprintf(stderr, "app: backing scale %.2f -> %.2f\n", (double)old,
             (double)[w backingScaleFactor]);
-    com_request_reset(); }
+    window_request_reset(); }
 - (void)windowDidChangeScreen:(NSNotification *)n { (void)n;
     scr_cache();
-    fprintf(stderr, "app: window changed screen -> device reset\n");
-    com_request_reset(); }
+    fprintf(stderr, "app: window changed screen\n");
+    window_request_reset(); }
 - (void)windowWillEnterFullScreen:(NSNotification *)n { (void)n; g_fs_transition = 1; }
 - (void)windowWillExitFullScreen:(NSNotification *)n { (void)n; g_fs_transition = 1; }
 /* A transition AppKit gives up on ends here, not in the Did handlers above;

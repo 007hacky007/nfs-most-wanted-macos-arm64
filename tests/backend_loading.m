@@ -4,6 +4,8 @@
 int g_perflog; _Atomic int g_pl_thumb_req; char g_pl_dir[900]; _Atomic long g_mw_dump_frame;
 int g_texrep_frame_on; __strong id<MTLTexture> g_texrep_tex[TEXREP_MAXTEX]; uint8_t g_texrep_k[TEXREP_MAXTEX];
 int com_frees(void){ return 0; }
+static unsigned reset_requests;
+void com_request_reset(void){ reset_requests++; }
 void loading_show(NSView *);
 void loading_update(void);
 void loading_frame_presented(int);
@@ -67,6 +69,24 @@ static void ui_test(const char *capture){
  loading_show(root);assert(root.subviews.count==0); /* A late update cannot resurrect startup UI. */
  [window orderOut:nil];puts("loading UI survives a blank frame and resize, and hides after content");
 }
+static void window_reset_test(int pinned){
+ [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+ setenv("NFSFULL","1",1);
+ if(pinned)setenv("NFSRES","3840x2160",1);else unsetenv("NFSRES");
+ NSWindow *window=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,800,500) styleMask:NSWindowStyleMaskTitled backing:NSBackingStoreBuffered defer:NO];
+ NfsuDelegate *delegate=[NfsuDelegate new];
+ NSNotification *note=[NSNotification notificationWithName:NSWindowDidEnterFullScreenNotification object:window];
+ [delegate windowDidEnterFullScreen:note];
+ assert(reset_requests==(pinned?0:1));
+ [delegate windowDidExitFullScreen:note];
+ assert(reset_requests==(pinned?0:2));
+ [delegate windowDidChangeScreen:note];
+ assert(reset_requests==(pinned?0:3));
+ puts("window transitions preserve fixed-resolution resources and reset dynamic modes");
+}
 int main(int argc,char **argv){@autoreleasepool{
- if(argc>1&&!strcmp(argv[1],"ui"))ui_test(argv[2]);else shader_test();
+ if(argc>1&&!strcmp(argv[1],"ui"))ui_test(argv[2]);
+ else if(argc>1&&!strcmp(argv[1],"pinned"))window_reset_test(1);
+ else if(argc>1&&!strcmp(argv[1],"dynamic"))window_reset_test(0);
+ else shader_test();
 }return 0;}

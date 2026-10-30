@@ -31,3 +31,9 @@ class LoadingTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('NFSMW_TEST_GUI'),'set NFSMW_TEST_GUI for Cocoa loading UI')
     def test_blank_frame_does_not_dismiss_loading_screen(self):
         self.assertIn('hides after content',self.run_probe('ui'))
+
+    @unittest.skipUnless(os.environ.get('NFSMW_TEST_GUI'),'set NFSMW_TEST_GUI for Cocoa window events')
+    def test_fixed_resolution_survives_window_and_space_transitions(self):
+        for mode in ('pinned','dynamic'):
+            with self.subTest(mode=mode):
+                self.assertIn('preserve fixed-resolution resources',self.run_probe(mode))
