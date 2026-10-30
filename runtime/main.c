@@ -184,7 +184,8 @@ int main(int argc,char **argv){
     void app_show_error(const char *);
     int paths=app_prepare(module_prepare?argv[2]:argc>1&&!kernel_probe?argv[1]:NULL,exe,sizeof exe,saves,sizeof saves,registry,sizeof registry);
     if(paths==0)return 0;
-    if(paths<0){app_show_error("Cannot create the save or log directory.");return 2;}
+    if(paths<0){app_show_error(paths==-2?"Cannot start the game engine. Rebuild the app and try again.":
+                             "Cannot create the save or log directory.");return 2;}
     { const char *mode=getenv("NFSMW_MODE");int app_full_hq_supported(void);
       int experimental=0;
 #if NFS_HQ_MODULES

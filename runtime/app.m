@@ -26,6 +26,13 @@ int app_prepare(const char *argument,char *exe,size_t exe_size,char *save,size_t
             NSString *folder=launcher_choose_game();
             if(!folder)return 0;
             game=[folder stringByAppendingPathComponent:@"speed.exe"];
+            /* A fresh AppKit instance keeps the launcher modal session out of fullscreen startup. */
+            [NSUserDefaults.standardUserDefaults synchronize];
+            const char *engine=NSBundle.mainBundle.executablePath.fileSystemRepresentation;
+            char *args[]={(char *)engine,(char *)game.fileSystemRepresentation,NULL};
+            execv(engine,args);
+            perror("Cannot restart the game engine");
+            return -2;
         }
         if(!game)game=@"game/speed.exe";
         if(bundled()&&![game isAbsolutePath])game=[files.currentDirectoryPath stringByAppendingPathComponent:game];
