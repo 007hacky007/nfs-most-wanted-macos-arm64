@@ -286,3 +286,9 @@ HQ code image and official 1.3 resources. Its SHA-256 is
 `80774c2e5d619b4f120b48d4462896fd504c263399d203a238769cffde1d253c`.
 Standard and visuals-only modes use original shader resources. Full HQ uses
 its selected original mod resources and compiled modules.
+
+Runtime patch targets use an index instead of scanning the complete patch list
+on each translated DLL call. A hidden 1080p HQ visuals comparison on an M1 Pro
+reduced guest CPU time per frame from 6.86 ms to 5.83 ms in the same stationary
+race scene. This is a CPU measurement, not a sustained driving FPS result;
+see `docs/performance.md` for the workload and limits.

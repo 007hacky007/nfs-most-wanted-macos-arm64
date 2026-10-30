@@ -16,7 +16,7 @@ Fullscreen startup: **resolved**, accepted by the user on 2026-10-30.
 
 The launcher now restarts the executable with the selected game path before engine initialization, so fullscreen starts with fresh AppKit state. Direct startup and the real launcher handoff showed visible game output, and the user confirmed loading completed. Version 0.3.5 is installed in Applications with the original game icon. The bundled restart regression and full suite pass (351 tests, 32 skipped).
 
-The user stopped the repeated startup matrix after eight recorded attempts. The first attempt had no game-window observation and is inconclusive. Later attempts recorded visible windows across Standard, HQ visuals and Full HQ, including 720p, 1080p and 4K. No further startup matrix is required. Performance work remains pending; no speedup or 60 FPS result has been established.
+The user stopped the repeated startup matrix after eight recorded attempts. The first attempt had no game-window observation and is inconclusive. Later attempts recorded visible windows across Standard, HQ visuals and Full HQ, including 720p, 1080p and 4K. No further startup matrix is required. The first background CPU optimization is verified: indexed runtime patch lookup reduced guest CPU cost about 15% in a controlled stationary HQ visuals 1080p race scene. See `docs/performance.md`. Sustained 60 FPS in active driving is not established; visible validation remains deferred while the user works.
 
 ## Global Constraints
 
@@ -25,6 +25,7 @@ The user stopped the repeated startup matrix after eight recorded attempts. The 
 - Preserve sound, music, videos, cutscenes, input, saves and all advertised Full HQ behavior.
 - Keep game assets, generated game code, profiles, screenshots, traces and executable files outside version control.
 - Use isolated test profiles. Do not overwrite user saves, terminate user play sessions or clear system caches.
+- The user is working on this computer. Run the engine directly with a fully transparent, noninteractive window, no launcher, no fullscreen, no focus changes and muted audio. Capture only game-rendered frames, never the desktop. Defer visible validation until the user is ready.
 - Use repository-relative paths and ASCII punctuation in tracked documentation.
 - Do not publish without the user's explicit authorization after showing the exact proposed public content.
 - Agreed performance priority: sustained 60 FPS at 1920x1080 in HQ visuals mode first. Standard is a diagnostic comparison. Full HQ optimization follows; its target will be assessed from measurements. These are targets, not measured capabilities or promises.
@@ -55,8 +56,8 @@ The user stopped the repeated startup matrix after eight recorded attempts. The 
 **Interfaces:** Reuse `NFSMW_SAVEDIR`, `NFSMW_COMMANDS` and `PERFLOG`. Retain raw timings and captures under ignored output directories.
 
 - [ ] Freeze one car, race, route, camera, opponents, graphics settings and input sequence. Record equivalent setup separately for modes with separate save formats or profiles.
-- [ ] First capture HQ visuals at 1920x1080, then the same setup at 1280x720 and Standard mode at both resolutions as diagnostic comparisons. Use two-minute active-driving segments and three repetitions per configuration. Separate loading, menus, video and pause from the scored segment. Capture the Full HQ baseline after the primary workload is characterized.
-- [ ] Record build identity, actual drawable dimensions, graphics settings, power mode, display refresh, thermal state and cache conditions. Do not run concurrent builds or game instances during measurements.
+- [ ] First capture HQ visuals at 1920x1080, then the same setup at 1280x720 and Standard mode at both resolutions as diagnostic comparisons. Start with one two-minute active-driving segment at HQ visuals 1080p. Run additional configurations or repetitions only when the first result requires them. Separate loading, menus, video and pause from the scored segment. Capture the Full HQ baseline after the primary workload is characterized.
+- [x] Record build identity, actual drawable dimensions, graphics settings, power mode, display refresh, thermal state and cache conditions. Do not run concurrent builds or game instances during measurements.
 - [ ] Report average FPS; median, p95 and p99 frame times; frames exceeding 33.3 and 50 ms; guest CPU time; main-thread encode time; GPU time; waits; draw counts; compilation events and memory growth.
 - [ ] Use sampling to identify slow functions, then confirm timings with profiling disabled. Quantify instrumentation overhead rather than treating profiled FPS as the final result.
 - [ ] Rank measured costs: translated game code/dispatch, render-state and draw submission, GPU work, synchronous readback/query waits, compilation and texture streaming. Treat these as candidates until measured.
@@ -64,6 +65,8 @@ The user stopped the repeated startup matrix after eight recorded attempts. The 
 **Deliverable:** A baseline and ranked bottlenecks. Do not prioritize work from menu FPS or resolution changes alone.
 
 ## Task 4: Optimize one measured bottleneck at a time
+
+First retained change: indexed runtime patches, with a matched hidden scene comparison and explicit limits recorded in `docs/performance.md`. The sustained driving target and later Full HQ profiling remain open.
 
 **Files:** Conditional on Task 3: `runtime/com.c`, `runtime/metal.m`, `runtime/perflog.c`, `tools/build_native.py` or translation tooling. Use the connected tests listed below for whichever path changes.
 

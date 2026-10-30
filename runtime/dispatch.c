@@ -5,6 +5,7 @@
 uint64_t g_icall_hits = 0;
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include "module.h"
 #if NFS_HQ_MODULES
 #include "hq_plugin.h"
@@ -83,9 +84,20 @@ int  g_guest_exited = 0;
  * or at once when that has run); one elsewhere (a lifted DLL) is looked up
  * in this list before the DLL's own functions. */
 #define PATCH_MAX 128
-static struct { uint32_t addr; guest_fn fn; } g_patch[PATCH_MAX];
+static struct { uint32_t addr; _Atomic(guest_fn) fn; } g_patch[PATCH_MAX];
+static _Atomic uint16_t g_patch_index[256];
 static int g_patch_n = 0;
 unsigned hq_dispatch_patch_count(void){return (unsigned)g_patch_n;}
+/* Keep entries stable while indexing DLL calls, including unpatched targets. */
+static unsigned patch_find(uint32_t addr,unsigned *empty){
+    unsigned slot=(addr*2654435761u)>>24;
+    for(;;){
+        unsigned index=atomic_load_explicit(&g_patch_index[slot],memory_order_acquire);
+        if(!index){if(empty)*empty=slot;return 0;}
+        if(g_patch[index-1].addr==addr)return index;
+        slot=(slot+1)&255u;
+    }
+}
 static void patch_apply(void){
     for (int i = 0; i < g_patch_n; i++)
         if (g_patch[i].addr - TEXT_BASE < TEXT_SIZE) g_dtab[g_patch[i].addr - TEXT_BASE] = g_patch[i].fn;
@@ -97,23 +109,23 @@ void dispatch_patch(uint32_t a, guest_fn f){
     if (a >= 0xE0000000u){        /* the order in dispatch_indirect relies on this */
         fprintf(stderr,"dispatch_patch: address %08x outside the text range, ignored\n", a);
         return; }
-    for (int i = 0; i < g_patch_n; i++){
-        if (g_patch[i].addr == a){
-            g_patch[i].fn = f;
-            if (g_dtab_ready) patch_apply();
-            return;
-        }
+    unsigned slot=0,index=patch_find(a,&slot);
+    if(index){
+        g_patch[index-1].fn=f;
+        if(g_dtab_ready)patch_apply();
+        return;
     }
     if (g_patch_n == PATCH_MAX){
         fprintf(stderr,"dispatch_patch: patch table full (%d entries), cannot register %08x\n", PATCH_MAX, a);
         exit(80);
     }
     g_patch[g_patch_n].addr=a; g_patch[g_patch_n].fn=f; g_patch_n++;
+    atomic_store_explicit(&g_patch_index[slot],(uint16_t)g_patch_n,memory_order_release);
     if (g_dtab_ready) patch_apply();
 }
 static guest_fn patch_at(uint32_t addr){
-    for (int i = 0; i < g_patch_n; i++) if (g_patch[i].addr == addr) return g_patch[i].fn;
-    return 0;
+    unsigned index=patch_find(addr,NULL);
+    return index?atomic_load_explicit(&g_patch[index-1].fn,memory_order_relaxed):NULL;
 }
 /* a .text function the table leaves out for ICALL/EFXSTAT (patch_apply) */
 static guest_fn diag_lookup(uint32_t a){

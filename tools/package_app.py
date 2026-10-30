@@ -92,7 +92,7 @@ def package_app(binary,game=None,output=Path('out/NFSMW.app')):
         if game is not None:shutil.copytree(game,resources/'game',copy_function=shutil.copyfile)
         info={'CFBundleExecutable':'NFSMW','CFBundleIdentifier':BUNDLE_ID,
               'CFBundleName':'NFSMW','CFBundleDisplayName':'NFSMW',
-              'CFBundlePackageType':'APPL','CFBundleVersion':'8','CFBundleShortVersionString':'0.3.5',
+              'CFBundlePackageType':'APPL','CFBundleVersion':'9','CFBundleShortVersionString':'0.3.6',
               'LSMinimumSystemVersion':'11.0','NSHighResolutionCapable':True,
               'NSPrincipalClass':'NSApplication','NSQuitAlwaysKeepsWindows':False}
         if icon is not None:
