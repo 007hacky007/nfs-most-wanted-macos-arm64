@@ -70,3 +70,11 @@ public func diskSpaceCheck(workspaceAvailable: Int64, workspaceVolume: String,
     }
     return .ready("\(gigabytes(workspaceAvailable)) free on \(workspaceVolume)")
 }
+
+/// Pipeline messages name the build's Try again button ("Click Try again ...", "... click Try
+/// again."). Where another button does the job, such as Download now on the Downloads row, the
+/// sentence names that button instead, in either case.
+public func naming(button: String, in message: String) -> String {
+    message.replacingOccurrences(of: "Click Try again", with: "Click \(button)")
+        .replacingOccurrences(of: "click Try again", with: "click \(button)")
+}

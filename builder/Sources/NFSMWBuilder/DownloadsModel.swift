@@ -78,17 +78,12 @@ extension BuilderModel {
                 downloadFailures = 0
             } else {
                 downloadFailures += 1
-                notice = Self.plain(failure.map(Self.plainDownloadError)
+                notice = Self.plain(failure.map { naming(button: "Download now", in: $0) }
                     ?? "The download stopped. Click Download now to continue where it stopped.")
             }
             refreshDownloads()
             notifyIfIdle()
         })
-    }
-
-    /// The pipeline's sentence says "click Try again" (the build's button); here the button is Download now.
-    static func plainDownloadError(_ message: String) -> String {
-        message.replacingOccurrences(of: "click Try again", with: "click Download now")
     }
 
     func noteDownload(received: Int64, total: Int64) {

@@ -83,6 +83,14 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(Set(buildStepNames.keys), Set(buildSteps.map(\.id)))
     }
 
+    func testDownloadMessagesNameTheRowButton() {
+        XCTAssertEqual(naming(button: "Download now", in: "The Most Wanted HQ download did not finish. Click Try again to continue where it stopped."),
+                       "The Most Wanted HQ download did not finish. Click Download now to continue where it stopped.")
+        XCTAssertEqual(naming(button: "Download now", in: "The WidescreenFix download did not finish. Check your internet connection, then click Try again."),
+                       "The WidescreenFix download did not finish. Check your internet connection, then click Download now.")
+        XCTAssertEqual(naming(button: "Download now", in: "Something else."), "Something else.")
+    }
+
     func testDiskSpaceNamesTheShortVolume() {
         let gb: Int64 = 1_000_000_000
         XCTAssertEqual(diskSpaceCheck(workspaceAvailable: 31_200_000_000, workspaceVolume: "Macintosh HD",
