@@ -86,12 +86,9 @@ extension BuilderModel {
         })
     }
 
+    /// The pipeline's sentence says "click Try again" (the build's button); here the button is Download now.
     static func plainDownloadError(_ message: String) -> String {
-        if message.hasPrefix("No verified download available") || message.contains("HTTP") {
-            return "The download did not finish. Check your internet connection, then click Download now "
-                + "to continue where it stopped."
-        }
-        return message
+        message.replacingOccurrences(of: "click Try again", with: "click Download now")
     }
 
     func noteDownload(received: Int64, total: Int64) {

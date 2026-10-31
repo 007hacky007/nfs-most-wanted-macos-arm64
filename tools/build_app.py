@@ -89,14 +89,30 @@ def cache_directory(value=None):
     return Path(value).expanduser().resolve() if value else ROOT / 'out/downloads'
 
 
+DOWNLOAD_NAMES = {'official-1.3': 'official 1.3 patch', 'widescreen': 'WidescreenFix',
+                  'mw-hq': 'Most Wanted HQ', 'hq-extractor': 'innoextract source'}
+
+
+def download_failed(key):
+    """The plain sentence for a download that did not finish."""
+    name = DOWNLOAD_NAMES.get(key, key)
+    if key == 'mw-hq':
+        return f'The {name} download did not finish. Click Try again to continue where it stopped.'
+    return f'The {name} download did not finish. Check your internet connection, then click Try again.'
+
+
 def fetch_all(keys, cache):
     """Fetch pinned downloads with one running byte count over all of them."""
-    from patch_sources import SOURCES, fetch_patch
+    from patch_sources import SOURCES, DownloadError, fetch_patch
     total = sum(SOURCES[key].size for key in keys)
     done, paths = 0, {}
     for key in keys:
-        paths[key] = fetch_patch(key, cache, progress=lambda got, _, key=key, base=done:
-                                 progress.download(key, base + got, total))
+        try:
+            paths[key] = fetch_patch(key, cache, progress=lambda got, _, key=key, base=done:
+                                     progress.download(key, base + got, total))
+        except DownloadError as error:
+            print(f'{key}: {error}', file=sys.stderr, flush=True)
+            raise RuntimeError(download_failed(key)) from error
         done += SOURCES[key].size
     return paths
 

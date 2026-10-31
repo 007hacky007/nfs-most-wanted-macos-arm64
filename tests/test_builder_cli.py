@@ -122,7 +122,7 @@ class BuilderCliTests(unittest.TestCase):
         self.assertEqual(found, [{'error': self.cli.build_app.STEP_FAILED}])
         with patch.object(self.sources, 'fetch_patch', side_effect=self.sources.DownloadError('offline')):
             status, found = self.call('downloads', 'fetch', '--cache-dir', str(self.root))
-        self.assertEqual((status, found[-1]), (1, {'error': 'offline'}))
+        self.assertEqual((status, found[-1]), (1, {'error': self.cli.build_app.download_failed('official-1.3')}))
 
     def test_script_runs_from_another_directory(self):
         result = subprocess.run([sys.executable, str(ROOT / 'tools/builder_cli.py'), 'accepted-copies'],

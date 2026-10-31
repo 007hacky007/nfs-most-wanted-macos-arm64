@@ -146,6 +146,21 @@ class BuildEventTests(unittest.TestCase):
         for error in (subprocess.CalledProcessError(1, ['clang']), KeyError('boom')):
             self.assertEqual(self.last_event(error)[0]['error'], self.build_app.STEP_FAILED)
 
+    def test_download_failure_is_a_plain_sentence(self):
+        import patch_sources
+        def fetch(key, cache, progress=None):
+            if key == 'mw-hq':
+                raise patch_sources.DownloadError('No verified download available for mw-hq')
+            return cache / key
+        with patch('patch_sources.fetch_patch', side_effect=fetch), redirect_stderr(io.StringIO()), \
+                self.assertRaises(RuntimeError) as failure:
+            self.build_app.fetch_all(('official-1.3', 'mw-hq'), self.root)
+        self.assertEqual(str(failure.exception),
+                         'The Most Wanted HQ download did not finish. Click Try again to continue where it stopped.')
+        event, _ = self.last_event(failure.exception)
+        self.assertEqual(event, {'error': str(failure.exception), 'log': None})
+        self.assertIn('WidescreenFix download did not finish', self.build_app.download_failed('widescreen'))
+
     def test_preparation_step_failure_names_its_log(self):
         import progress
         from tools import prepare_public_hq
