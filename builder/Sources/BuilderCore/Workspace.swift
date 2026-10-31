@@ -167,21 +167,27 @@ public func sweepOldWorkspaces(_ paths: BuilderPaths, keeping version: String,
 
 /// Removes what a build left in the workspace (out/, gen/ and anything else the pipeline wrote),
 /// keeping the bundled sources, the .venv packages and the version marker, so the next build
-/// needs no setup. Each item is renamed aside into the support folder first, so a quit during
-/// the slow delete leaves only a `.trash-*` folder that the next start sweeps. Returns bytes freed.
+/// needs no setup. Every item is first renamed aside into the support folder (quick), then the
+/// renamed copies are deleted (slow), so a quit during the delete leaves only `.trash-*` folders
+/// that the next start sweeps. Nothing is touched while a build holds the workspace's lock
+/// (out/app-build.lock); the lock is checked again before each rename. Returns bytes freed.
 @discardableResult
-public func removeBuildFiles(_ paths: BuilderPaths, version: String) -> Int64 {
+public func removeBuildFiles(_ paths: BuilderPaths, version: String,
+                             isLocked: (URL) -> Bool = workspaceIsLocked) -> Int64 {
     let fm = FileManager.default
     let workspace = paths.workspace(version: version)
     let keep = Set(bundledSourceEntries + [".venv", versionMarker])
-    var freed: Int64 = 0
+    var moved: [(URL, Int64)] = []
     for name in (try? fm.contentsOfDirectory(atPath: workspace.path)) ?? [] where !keep.contains(name) {
+        guard !isLocked(workspace) else { break }
         let item = workspace.appendingPathComponent(name)
         let size = allocatedSize(of: item)
         let trash = paths.support.appendingPathComponent(".trash-\(UUID().uuidString)")
         guard (try? fm.moveItem(at: item, to: trash)) != nil else { continue }
-        if (try? fm.removeItem(at: trash)) != nil { freed += size }
+        moved.append((trash, size))
     }
+    var freed: Int64 = 0
+    for (trash, size) in moved where (try? fm.removeItem(at: trash)) != nil { freed += size }
     return freed
 }
 

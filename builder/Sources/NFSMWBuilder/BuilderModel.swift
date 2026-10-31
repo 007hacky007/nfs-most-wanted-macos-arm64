@@ -94,7 +94,8 @@ final class BuilderModel: ObservableObject {
     // MARK: - Checklist
 
     var toolsReady: Bool { states[.buildTools]?.isReady == true }
-    var buildEnabled: Bool { canBuild(states) && phase == .checklist }
+    /// Never while old build files are being removed: that removal must not see the new build.
+    var buildEnabled: Bool { canBuild(states) && phase == .checklist && !removingBuildFiles }
     var gameRejected: Bool { gameReport != nil && states[.gameCopy].map { if case .blocked = $0 { return true }; return false } == true }
 
     func start() {

@@ -360,6 +360,27 @@ final class EnvironmentTests: XCTestCase {
         XCTAssertEqual(buildToolsCheck(paths: paths, version: "1"), .blocked(incompleteBuilderMessage))
     }
 
+    func testRemoveBuildFilesLeavesARunningBuildAlone() throws {
+        let paths = BuilderPaths(support: tmp)
+        let ws = paths.workspace(version: "1")
+        try write("x", to: ws.appendingPathComponent("gen/all/a.c"))
+        let lock = ws.appendingPathComponent("out/app-build.lock")
+        try write("", to: lock)
+        let fd = open(lock.path, O_RDWR)
+        XCTAssertEqual(flock(fd, LOCK_EX), 0)
+        XCTAssertEqual(removeBuildFiles(paths, version: "1"), 0)
+        XCTAssertTrue(fm.fileExists(atPath: ws.appendingPathComponent("gen/all/a.c").path))
+        XCTAssertTrue(fm.fileExists(atPath: lock.path))
+        close(fd)
+        // A build that starts while the removal walks the folder stops it before the next rename.
+        var checks = 0
+        try write("x", to: ws.appendingPathComponent("stray.log"))
+        removeBuildFiles(paths, version: "1", isLocked: { _ in checks += 1; return checks > 1 })
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: ws.path).filter { !$0.hasPrefix(".") }.count, 2)
+        removeBuildFiles(paths, version: "1")
+        XCTAssertEqual(try fm.contentsOfDirectory(atPath: ws.path), [])
+    }
+
     func testRemoveBuildFilesKeepsSourcesAndPackages() throws {
         let paths = BuilderPaths(support: tmp)
         let ws = paths.workspace(version: "1")
