@@ -10,6 +10,11 @@ public struct InstallError: LocalizedError {
     /// Underlying error text, for the log.
     public var details: String? = nil
     public var errorDescription: String? { message }
+
+    public init(message: String, details: String? = nil) {
+        self.message = message
+        self.details = details
+    }
 }
 
 func bundleIdentifier(of app: URL) -> String? {
