@@ -157,6 +157,11 @@ shasum -a 256 "./my-game-copy/speed.exe"
 stat -f '%z' "./my-game-copy/speed.exe"
 ```
 
+An installed game folder has 1,407 required files: the 1,406 game asset
+files plus `speed.exe`. Together they are 3,028,017,159 bytes as installed
+from the discs, or 3,028,022,871 bytes with the official 1.3 files. The four
+disc archives in the next table are 2,245,282,662 bytes together.
+
 ### Files stored inside each original disc
 
 **`0compressed.zip` is a file in the root directory of Disc 1.** It is part

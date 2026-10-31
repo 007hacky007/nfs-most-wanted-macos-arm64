@@ -199,14 +199,42 @@ def _disc_inventory(images, archives):
     return roles
 
 
-def _extract_discs(images, destination, profile, files, archives):
-    roles = _disc_inventory(images, archives)
-    seen, found, directories = {}, set(), {}
+def _directories(files):
+    directories = {}
     for row in files.values():
         parts = row['path'].split('/')
         for count in range(1, len(parts)):
             name = '/'.join(parts[:count])
             directories[name.casefold()] = name
+    return directories
+
+
+def _members(archive, role, files, archives, seen, directories, found):
+    """Check one disc ZIP's directory against the profile and normalize its member names."""
+    for info in archive.infolist():
+        name = _path(info.orig_filename)
+        if stat.S_ISLNK(info.external_attr >> 16):
+            raise ValueError(f'ZIP symlink refused: {name}')
+        directory = info.is_dir() or info.filename.endswith('\\')
+        _claim(seen, name, directory)
+        if directory:
+            if name.casefold() not in directories:
+                raise ValueError(f'unexpected ZIP directory: {name}')
+            info.filename = directories[name.casefold()] + '/'
+            continue
+        row = files.get(name.casefold())
+        if not row or row['source'].get('archive') != archives[role]['path'] or row['source'].get('role') != role:
+            raise ValueError(f'unexpected ZIP member for disc role {role}: {name}')
+        if info.file_size not in {v['size'] for v in row['variants']}:
+            raise ValueError(f'unsupported ZIP member size: {name}')
+        found.add(name.casefold())
+        # ZipFile validates the stored header using orig_filename, not filename.
+        info.filename = row['path']
+
+
+def _extract_discs(images, destination, profile, files, archives):
+    roles = _disc_inventory(images, archives)
+    seen, found, directories = {}, set(), _directories(files)
     with ExitStack() as stack:
         opened = []
         for role in sorted(roles):
@@ -214,25 +242,7 @@ def _extract_discs(images, destination, profile, files, archives):
             raw = stack.enter_context(RawISO(image, entry.offset, entry.size))
             stream = stack.enter_context(io.BufferedReader(raw))
             archive = stack.enter_context(zipfile.ZipFile(stream))
-            for info in archive.infolist():
-                name = _path(info.orig_filename)
-                if stat.S_ISLNK(info.external_attr >> 16):
-                    raise ValueError(f'ZIP symlink refused: {name}')
-                directory = info.is_dir() or info.filename.endswith('\\')
-                _claim(seen, name, directory)
-                if directory:
-                    if name.casefold() not in directories:
-                        raise ValueError(f'unexpected ZIP directory: {name}')
-                    info.filename = directories[name.casefold()] + '/'
-                    continue
-                row = files.get(name.casefold())
-                if not row or row['source'].get('archive') != archives[role]['path'] or row['source'].get('role') != role:
-                    raise ValueError(f'unexpected ZIP member for disc role {role}: {name}')
-                if info.file_size not in {v['size'] for v in row['variants']}:
-                    raise ValueError(f'unsupported ZIP member size: {name}')
-                found.add(name.casefold())
-                # ZipFile validates the stored header using orig_filename, not filename.
-                info.filename = row['path']
+            _members(archive, role, files, archives, seen, directories, found)
             opened.append(archive)
         expected = {key for key, row in files.items() if 'archive' in row['source']}
         if found != expected:
@@ -273,6 +283,238 @@ def _extract_discs(images, destination, profile, files, archives):
             (destination / 'd3dx9_26.dll').write_bytes(result.stdout)
     return [{'role': role, 'archive': archives[role]['path'],
              'size': archives[role]['size'], 'sha256': archives[role]['sha256']} for role in sorted(roles)]
+
+
+REQUIRED_RELEASE = ('Need for Speed Most Wanted (2005) for PC, USA English Black Edition (4 CDs), '
+                    'original or updated to v1.3')
+NOT_SUPPORTED = ['other regions', 'the DVD edition', 'Most Wanted (2012)', 'console versions',
+                 'repacks or modified copies']
+VERSIONS = {'source': 'USA English Black Edition, original discs (updated to 1.3 during the build)',
+            'official-1.3': 'USA English Black Edition, updated to 1.3',
+            'canonical': 'A game folder prepared by an earlier build'}
+EXECUTABLE_LABELS = {'source': 'Original disc executable', 'official-1.3': 'Official 1.3 executable'}
+
+
+def _accepted(row):
+    return [{'kind': v['kind'], 'size': v['size'], 'sha256': v['sha256']} for v in row['variants']]
+
+
+def _is_image(path):
+    return path.suffix.casefold() in ('.iso', '.bin', '.cue')
+
+
+def _layout(sources):
+    """Folder or disc input, decided exactly like stage_game."""
+    if len(sources) == 1 and sources[0].is_dir() and not sources[0].is_symlink():
+        root = sources[0]
+        names = list(root.iterdir())
+        images = sorted(path for path in names if _is_image(path))
+        if not any(path.name.casefold() == 'speed.exe' for path in names):
+            return ('discs', images) if images else ('none', [])
+        return 'folder', [root]
+    return 'discs', sources
+
+
+def _check_folder(root, files, report, add):
+    available = _folder_files(root)
+    for key, row in files.items():
+        if row['required']:
+            report['checked'] += 1
+        source = available.get(key)
+        if source is None:
+            if row['required']:
+                add(row['path'], 'missing', row)
+            continue
+        with source.open('rb') as stream:
+            actual = _digest(stream)
+        variant = next((v['kind'] for v in row['variants'] if _matches(actual, v)), None)
+        if variant is None:
+            add(row['path'], actual, row)
+        elif row['path'] == 'speed.exe':
+            report['version'] = VERSIONS.get(variant)
+
+
+def _check_discs(sources, profile, files, archives, report, add):
+    def invalid(path, error):
+        text = str(error)
+        report['invalid'].append(text if text.startswith(path.name) else f'{path.name}: {text}')
+
+    images, identities = [], set()
+    for path in sources:
+        if not path.exists():
+            report['invalid'].append(f'{path.name} does not exist')
+            continue
+        try:
+            image = _images([path])[0]
+        except ValueError as error:
+            invalid(path, error)
+            continue
+        if image.resolve() not in identities:
+            identities.add(image.resolve())
+            images.append((path, image))
+    roles = {}
+    for path, image in images:
+        try:
+            index, seen = {}, {}
+            for entry in disc_files(image):
+                name = _path(entry.name)
+                _claim(seen, name)
+                index[name.casefold()] = entry
+        except ValueError as error:
+            invalid(path, error)
+            continue
+        found = [role for role, row in archives.items() if row['path'].casefold() in index]
+        if len(found) != 1:
+            report['invalid'].append(f'{path.name} is not one of the four supported discs: it has no '
+                                     'single 0compressed.zip to 3compressed.zip archive')
+            continue
+        role = found[0]
+        if role in roles:
+            report['invalid'].append(f'{path.name} is a second copy of disc {role + 1}')
+            continue
+        row, entry = archives[role], index[archives[role]['path'].casefold()]
+        with RawISO(image, entry.offset, entry.size) as stream:
+            actual = _digest(stream)
+        if not _matches(actual, row):
+            report['wrong'].append({'name': path.name, 'archive': row['path']})
+            add(f'Disc {role + 1}: {row["path"]}', actual, {'variants': [{'kind': 'disc', **row}]})
+            continue
+        roles[role] = (path, image, index, entry)
+    report['discs'] = {'found': sorted(roles), 'missing': sorted(set(archives) - set(roles))}
+    seen, members, directories = {}, set(), _directories(files)
+    for role in sorted(roles):
+        path, image, index, entry = roles[role]
+        try:
+            with RawISO(image, entry.offset, entry.size) as raw, io.BufferedReader(raw) as stream, \
+                    zipfile.ZipFile(stream) as archive:
+                _members(archive, role, files, archives, seen, directories, members)
+        except (ValueError, zipfile.BadZipFile) as error:
+            report['invalid'].append(f'{path.name} is not one of the four supported discs: {error}')
+    if report['discs']['missing'] or report['invalid'] or report['wrong']:
+        return
+    expected = {key for key, row in files.items() if 'archive' in row['source']}
+    if members != expected:
+        report['invalid'].append('the disc archives do not hold every required game file')
+    cab = profile['d3dx_cab']
+    _, image, index, _ = roles[cab['role']]
+    entry = index.get(cab['path'].casefold())
+    report['checked'] += 1
+    if entry is None:
+        add(f'Disc {cab["role"] + 1}: {cab["path"]}', 'missing', {'variants': [{'kind': 'disc', **cab}]})
+    else:
+        with RawISO(image, entry.offset, entry.size) as stream:
+            actual = _digest(stream)
+        if not _matches(actual, cab):
+            add(f'Disc {cab["role"] + 1}: {cab["path"]}', actual, {'variants': [{'kind': 'disc', **cab}]})
+    for row in files.values():
+        source = row['source']
+        if 'disc_path' not in source or row['path'].casefold() == 'd3dx9_26.dll':
+            continue
+        # stage_game copies every disc root file it knows, optional ones included.
+        report['checked'] += 1
+        _, image, index, _ = roles[source['role']]
+        entry = index.get(source['disc_path'].casefold())
+        if entry is None:
+            add(row['path'], 'missing', row)
+            continue
+        with RawISO(image, entry.offset, entry.size) as stream:
+            actual = _digest(stream)
+        if not any(_matches(actual, v) for v in row['variants']):
+            add(row['path'], actual, row)
+    report['checked'] += len(archives)
+
+
+def check_sources(sources, *, profile=None, limit=20):
+    """Check a game copy like stage_game, without writing anywhere, and collect every problem.
+
+    Returns a JSON-ready report: ok, kind (folder, discs or none), version, checked and
+    failed counts, the first `limit` problems in detail, the disc roles found and missing,
+    and the plain message from describe().
+    """
+    profile, files, archives = _profile(profile)
+    sources = [Path(source) for source in sources]
+    report = {'ok': False, 'kind': 'none', 'version': None, 'checked': 0, 'failed': 0, 'problems': [],
+              'discs': None, 'invalid': [], 'wrong': [], 'message': ''}
+
+    def add(path, found, row):
+        report['failed'] += 1
+        if len(report['problems']) < limit:
+            report['problems'].append({'path': path, 'found': found, 'accepted': _accepted(row)})
+
+    try:
+        if not sources:
+            raise ValueError('no game copy was chosen')
+        for source in sources:
+            if source.is_symlink():
+                raise ValueError(f'{source.name} is a symbolic link; choose the original file or folder')
+        kind, inputs = _layout(sources)
+        report['kind'] = kind
+        if kind == 'folder':
+            _check_folder(inputs[0], files, report, add)
+        elif kind == 'discs':
+            _check_discs(inputs, profile, files, archives, report, add)
+            if not report['invalid'] and not report['wrong'] and not report['discs']['missing']:
+                report['version'] = 'USA English Black Edition, 4 CDs'
+    except (ValueError, OSError) as error:
+        report['invalid'].append(str(error))
+    missing = (report['discs'] or {}).get('missing')
+    report['ok'] = report['kind'] != 'none' and not (report['failed'] or report['invalid'] or report['wrong'] or missing)
+    report['message'] = describe(report)
+    return report
+
+
+def _names(items):
+    return items[0] if len(items) == 1 else ', '.join(items[:-1]) + ' and ' + items[-1]
+
+
+def describe(report):
+    """The plain sentence the Builder shows for a checked copy."""
+    if report['ok']:
+        return report['version'] or 'Supported game copy'
+    prefix = 'This is not the supported game copy. NFSMW Builder needs ' + REQUIRED_RELEASE + '. '
+    discs = report.get('discs') or {}
+    if report['kind'] == 'none' and not report['invalid']:
+        return prefix + 'This folder has no speed.exe and no disc images.'
+    if report['wrong']:
+        wrong = report['wrong'][0]
+        return (prefix + f'{wrong["name"]} is not one of the four supported discs: its {wrong["archive"]} '
+                'has a different size or checksum.')
+    if report['invalid']:
+        text = report['invalid'][0]
+        return prefix + text[:1].upper() + text[1:] + '.'
+    if discs.get('missing'):
+        found, missing = len(discs['found']), discs['missing']
+        if found and len(missing) == 1:
+            role = missing[0]
+            return (prefix + f'Found {found} of the 4 discs. Disc {role + 1} (the image that contains '
+                    f'{role}compressed.zip) is missing.')
+        return (prefix + f'Found {found} of the 4 discs. Choose all four disc images together, '
+                'or a folder that contains them.')
+    shown = [problem['path'] for problem in report['problems'][:3]]
+    verb = 'is' if report['failed'] == 1 else 'are'
+    return (prefix + f'{report["failed"]:,} of {report["checked"]:,} files {verb} missing or different, '
+            f'for example {_names(shown)}.')
+
+
+def accepted_copies(profile=None):
+    """What the Builder accepts, computed from the checksum profile."""
+    profile, files, archives = _profile(profile)
+    required = [row for row in files.values() if row['required']]
+
+    def total(kinds):
+        return sum(next(v['size'] for kind in kinds for v in row['variants'] if v['kind'] == kind)
+                   for row in required)
+
+    executable = files['speed.exe']
+    return {'release': REQUIRED_RELEASE, 'not_supported': list(NOT_SUPPORTED),
+            'discs': [{'disc': role + 1, 'archive': row['path'], 'size': row['size'], 'sha256': row['sha256']}
+                      for role, row in sorted(archives.items())],
+            'discs_total': sum(row['size'] for row in archives.values()),
+            'folder': {'required_files': len(required), 'total_original': total(['source']),
+                       'total_official': total(['official-1.3', 'source']),
+                       'executables': [{'kind': v['kind'], 'label': EXECUTABLE_LABELS[v['kind']],
+                                        'size': v['size'], 'sha256': v['sha256']}
+                                       for v in executable['variants'] if v['kind'] in EXECUTABLE_LABELS]}}
 
 
 def stage_game(sources, destination, *, profile=None):

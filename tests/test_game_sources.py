@@ -16,7 +16,7 @@ import zipfile
 from unittest.mock import patch
 
 from tests.test_install import raw_image, record
-from tools.game_sources import stage_game
+from tools.game_sources import REQUIRED_RELEASE, accepted_copies, check_sources, describe, stage_game
 
 
 def pin(data):
@@ -301,6 +301,142 @@ class GameSourcesTests(unittest.TestCase):
                                  'import game_sources; assert callable(game_sources.stage_game)'],
                                 cwd=Path(__file__).resolve().parents[1] / 'tools', capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def snapshot(self):
+        return sorted((p.relative_to(self.root).as_posix(), p.stat().st_size, p.stat().st_mtime_ns)
+                      for p in self.root.rglob('*'))
+
+    def check(self, sources):
+        return check_sources(sources, profile=self.profile)
+
+    def stages(self, sources):
+        destination = self.root.parent / (self.root.name + '-agree')
+        shutil.rmtree(destination, ignore_errors=True)
+        destination.mkdir()
+        self.addCleanup(lambda: shutil.rmtree(destination, ignore_errors=True))
+        try:
+            self.stage_discs(sources, destination)
+        except (ValueError, zipfile.BadZipFile):
+            return False
+        return True
+
+    def test_check_reports_all_problems_without_writing(self):
+        source = self.folder()
+        (source / 'cars/two.bin').write_bytes(b'TWO')
+        (source / 'tracks/three.bin').write_bytes(b'changed')
+        (source / 'sound/four.bin').unlink()
+        for path in sorted(source.rglob('*'), reverse=True):
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        source.chmod(0o555)
+        self.addCleanup(lambda: [p.chmod(0o755) for p in [source, *source.rglob('*')] if p.is_dir()])
+        before, temporary = self.snapshot(), set(Path(tempfile.gettempdir()).iterdir())
+        report = self.check([source])
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual({p for p in set(Path(tempfile.gettempdir()).iterdir()) - temporary
+                          if p.name.startswith(('nfsmw', '.nfsmw'))}, set())
+        self.assertFalse(report['ok'])
+        self.assertEqual((report['kind'], report['checked'], report['failed']), ('folder', 5, 3))
+        self.assertEqual({p['path'] for p in report['problems']},
+                         {'CARS/Two.bin', 'TRACKS/Three.bin', 'SOUND/Four.bin'})
+        missing = next(p for p in report['problems'] if p['path'] == 'SOUND/Four.bin')
+        self.assertEqual(missing['found'], 'missing')
+        self.assertEqual(missing['accepted'], [{'kind': 'source', **pin(b'four')}])
+        changed = next(p for p in report['problems'] if p['path'] == 'CARS/Two.bin')
+        self.assertEqual(changed['found'], pin(b'TWO'))
+        message = describe(report)
+        self.assertEqual(message, report['message'])
+        self.assertIn('USA English Black Edition', message)
+        self.assertIn('3 of 5 files are missing or different, for example', message)
+
+    def test_check_accepts_folder_and_names_its_version(self):
+        source = self.folder()
+        report = self.check([source])
+        self.assertTrue(report['ok'], report)
+        self.assertEqual((report['kind'], report['failed'], report['problems']), ('folder', 0, []))
+        self.assertIn('original discs', report['version'])
+        (source / 'speed.exe').write_bytes(b'patched')
+        self.assertEqual(self.check([source])['version'], 'USA English Black Edition, updated to 1.3')
+
+    def test_check_and_stage_agree_on_every_fixture(self):
+        images = self.discs()
+        source = self.folder()
+        cases = {'folder': [source], 'discs': images, 'shuffled': [images[2], images[0], images[3], images[1]],
+                 'image folder': [self.root], 'three discs': images[:3],
+                 'duplicate': images[:3] + [images[0]], 'one disc': images[:1]}
+        for name, sources in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.check(sources)['ok'], self.stages(sources), name)
+        (source / 'server.dll').write_bytes(b'unknown')
+        (source / 'global/one.bin').unlink()
+        self.assertEqual(self.check([source])['ok'], self.stages([source]))
+        self.assertFalse(self.check([source])['ok'])
+        self.profile['archives'][2]['sha256'] = '0' * 64
+        self.assertEqual(self.check(images)['ok'], self.stages(images))
+        self.profile['archives'][2].update(pin(zip_bytes([('TRACKS\\Three.bin', b'three')])))
+        for extra in (('../escape', b'x'), ('global/one.BIN', b'x'), ('CARS/Two.bin', b'two')):
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', UserWarning)
+                data = zip_bytes([('CARS/Two.bin', b'two'), extra])
+            self.profile['archives'][1].update(pin(data))
+            changed = self.discs({1: data})
+            with self.subTest(extra=extra):
+                self.assertEqual(self.check(changed)['ok'], self.stages(changed))
+                self.assertFalse(self.check(changed)['ok'])
+        empty = self.root / 'empty'
+        empty.mkdir()
+        self.assertEqual(self.check([empty])['ok'], self.stages([empty]))
+
+    def test_check_names_missing_disc_role(self):
+        report = self.check(self.discs()[:3])
+        self.assertFalse(report['ok'])
+        self.assertEqual(report['kind'], 'discs')
+        self.assertEqual(report['discs'], {'found': [0, 1, 2], 'missing': [3]})
+        self.assertIn('Found 3 of the 4 discs. Disc 4 (the image that contains 3compressed.zip) is missing.',
+                      describe(report))
+        one = describe(self.check(self.discs()[:1]))
+        self.assertIn('Found 1 of the 4 discs. Choose all four disc images together, or a folder that contains them.', one)
+
+    def test_check_names_wrong_disc_and_empty_folder(self):
+        images = self.discs()
+        self.profile['archives'][1]['sha256'] = '0' * 64
+        report = self.check(images)
+        self.assertIn(images[1].name + ' is not one of the four supported discs: its 1compressed.zip '
+                      'has a different size or checksum.', describe(report))
+        empty = self.root / 'empty'
+        empty.mkdir()
+        report = self.check([empty])
+        self.assertEqual(report['kind'], 'none')
+        self.assertIn('This folder has no speed.exe and no disc images.', describe(report))
+        self.assertIn('does not exist', describe(self.check([self.root / 'missing'])))
+
+    def test_check_limits_detail_but_counts_all(self):
+        source = self.folder()
+        for index in range(30):
+            self.profile['files'].append({'path': f'GLOBAL/Extra{index:02}.bin', 'required': True,
+                                         'source': {'role': 0, 'archive': '0compressed.zip'},
+                                         'variants': [{'kind': 'source', **pin(b'x')}]})
+        report = self.check([source])
+        self.assertEqual((len(report['problems']), report['failed']), (20, 30))
+        self.assertIn('30 of 35 files', describe(report))
+
+    def test_accepted_copies_match_profile(self):
+        accepted = accepted_copies()
+        self.assertEqual(accepted['release'], REQUIRED_RELEASE)
+        self.assertEqual(accepted['folder']['required_files'], 1407)
+        self.assertEqual(accepted['folder']['total_original'], 3028017159)
+        self.assertEqual(accepted['folder']['total_official'], 3028022871)
+        self.assertEqual(accepted['discs_total'], 2245282662)
+        self.assertEqual([d['disc'] for d in accepted['discs']], [1, 2, 3, 4])
+        self.assertEqual(accepted['discs'][0], {'disc': 1, 'archive': '0compressed.zip', 'size': 612595273,
+                                                'sha256': 'd3a3179f4b794bab7cf633b1313b597d40934bb17a83d3e02b91af368624ee99'})
+        self.assertEqual([(e['kind'], e['size']) for e in accepted['folder']['executables']],
+                         [('source', 7250800), ('official-1.3', 7254894)])
+        self.assertIn('Most Wanted (2012)', accepted['not_supported'])
+
+    @unittest.skipUnless(os.environ.get('NFSMW_GAME_SOURCE_TEST'), 'set NFSMW_GAME_SOURCE_TEST for full source checks')
+    def test_actual_supported_source_check(self):
+        report = check_sources([Path(os.environ['NFSMW_GAME_SOURCE_TEST'])])
+        self.assertTrue(report['ok'], report['message'])
 
     @unittest.skipUnless(os.environ.get('NFSMW_GAME_SOURCE_TEST'), 'set NFSMW_GAME_SOURCE_TEST for full source staging')
     def test_actual_supported_source(self):
