@@ -103,13 +103,15 @@ def download_failed(key):
 
 def fetch_all(keys, cache):
     """Fetch pinned downloads with one running byte count over all of them."""
-    from patch_sources import SOURCES, DownloadError, fetch_patch
+    from patch_sources import SOURCES, DownloadBusy, DownloadError, fetch_patch
     total = sum(SOURCES[key].size for key in keys)
     done, paths = 0, {}
     for key in keys:
         try:
             paths[key] = fetch_patch(key, cache, progress=lambda got, _, key=key, base=done:
                                      progress.download(key, base + got, total))
+        except DownloadBusy as error:
+            raise RuntimeError(str(error)) from error
         except DownloadError as error:
             print(f'{key}: {error}', file=sys.stderr, flush=True)
             raise RuntimeError(download_failed(key)) from error

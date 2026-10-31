@@ -241,9 +241,9 @@ def _unlink(name, directory):
         pass
 
 
-def _download(client, candidate, spec, cache, directory, original, progress=None):
-    if spec.size >= RESUMABLE_BYTES:
-        return _resumable(client, candidate, spec, cache, directory, original, progress)
+def _download(client, candidate, spec, cache, directory, original, progress=None, partial=None):
+    if partial is not None:
+        return _resumable(client, candidate, spec, cache, directory, original, progress, partial)
     url, headers, timeout = candidate
     temporary = '.' + spec.filename + '.' + secrets.token_hex(8) + '.part'
     created = False
@@ -281,68 +281,109 @@ def _partial_name(spec):
     return '.' + spec.filename + '.partial'
 
 
-def _resumable(client, candidate, spec, cache, directory, original, progress):
-    """Continue a kept partial file with an HTTP Range request; the pin still decides."""
-    url, headers, timeout = candidate
-    partial = _partial_name(spec)
-    report = _Progress(progress, spec.size)
-    fd = os.open(partial, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory)
-    with os.fdopen(fd, 'r+b') as output:
-        if not stat.S_ISREG(os.fstat(output.fileno()).st_mode):
-            raise DownloadError('Partial download must be a regular file')
+class DownloadBusy(DownloadError):
+    """Another process holds the partial download of the same payload."""
+
+
+class _Partial:
+    """The kept partial download of a large payload: opened, locked and hashed once per fetch.
+
+    `kept` bytes on disk always match `digest`; every attempt first cuts the file back to
+    `kept`, so bytes of a failed write never count.
+    """
+    def __init__(self, spec, directory):
+        self.spec, self.name = spec, _partial_name(spec)
+        fd = os.open(self.name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        self.file = os.fdopen(fd, 'r+b')
         try:
-            fcntl.flock(output.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise DownloadError('Another download of this file is running') from None
-        digest, kept = hashlib.sha256(), os.fstat(output.fileno()).st_size
-        if kept >= spec.size:
-            output.truncate(0)
-            kept = 0
-        while chunk := output.read(min(BLOCK_BYTES, kept - output.tell())):
-            digest.update(chunk)
-        if output.tell() != kept:
-            raise DownloadError('Partial download changed while it was checked')
-        report(kept)
-        request = dict(headers, Range=f'bytes={kept}-') if kept else headers
-        try:
-            response = _open(client, url, request, timeout, statuses=(200, 206))
-        except RangeRefused:
-            output.truncate(0)
+            if not stat.S_ISREG(os.fstat(self.file.fileno()).st_mode):
+                raise DownloadError('Partial download must be a regular file')
+            try:
+                fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise DownloadBusy(spec.filename + ' is already being downloaded by another NFSMW Builder window '
+                                   'or build. Wait for it to finish, then try again.') from None
+            self.digest, self.kept = hashlib.sha256(), os.fstat(self.file.fileno()).st_size
+            if self.kept > spec.size:
+                self.reset()
+            while chunk := self.file.read(min(BLOCK_BYTES, self.kept - self.file.tell())):
+                self.digest.update(chunk)
+            if self.file.tell() != self.kept:
+                raise DownloadError('Partial download changed while it was checked')
+        except BaseException:
+            self.file.close()
             raise
-        with response:
-            if response.status == 206:
-                if response.headers.get('Content-Range') != f'bytes {kept}-{spec.size - 1}/{spec.size}':
-                    output.truncate(0)
-                    raise DownloadError('Response does not continue the partial download')
-                _check_headers(response, spec.size - kept)
-            else:
-                _check_headers(response, spec.size)
-                output.seek(0)
-                output.truncate(0)
-                digest, kept = hashlib.sha256(), 0
-            total = kept
-            output.seek(kept)
+
+    def complete(self):
+        return self.kept == self.spec.size and self.digest.hexdigest() == self.spec.sha256
+
+    def rewind(self):
+        """Drop anything written after the last counted byte."""
+        self.file.seek(self.kept)
+        self.file.truncate(self.kept)
+
+    def reset(self):
+        self.file.seek(0)
+        self.file.truncate(0)
+        self.digest, self.kept = hashlib.sha256(), 0
+
+    def append(self, chunk):
+        self.file.write(chunk)
+        self.digest.update(chunk)
+        self.kept += len(chunk)
+
+    def close(self):
+        self.file.close()
+
+
+def _publish_partial(partial, spec, cache, directory, original, report):
+    partial.file.flush()
+    os.fsync(partial.file.fileno())
+    result = _publish(partial.name, spec, cache, directory, original)
+    _unlink(partial.name, directory)
+    report(spec.size, final=True)
+    return result
+
+
+def _resumable(client, candidate, spec, cache, directory, original, progress, partial):
+    """Continue the kept partial file with an HTTP Range request; the pin still decides."""
+    url, headers, timeout = candidate
+    report = _Progress(progress, spec.size)
+    partial.rewind()
+    if partial.kept == spec.size:
+        partial.reset()  # complete but wrong; fetch_patch publishes a complete and right one
+    report(partial.kept)
+    kept = partial.kept
+    request = dict(headers, Range=f'bytes={kept}-') if kept else headers
+    try:
+        response = _open(client, url, request, timeout, statuses=(200, 206))
+    except RangeRefused:
+        partial.reset()
+        raise
+    with response:
+        if response.status == 206:
+            if response.headers.get('Content-Range') != f'bytes {kept}-{spec.size - 1}/{spec.size}':
+                partial.reset()
+                raise DownloadError('Response does not continue the partial download')
+            _check_headers(response, spec.size - kept)
+        else:
+            _check_headers(response, spec.size)
+            partial.reset()
+        deadline = time.monotonic() + STALL_SECONDS
+        while chunk := _read(response, min(BLOCK_BYTES, spec.size - partial.kept + 1), deadline):
+            if partial.kept + len(chunk) > spec.size:
+                partial.reset()
+                raise DownloadError('Response exceeds the pinned payload size')
+            partial.append(chunk)
             deadline = time.monotonic() + STALL_SECONDS
-            while chunk := _read(response, min(BLOCK_BYTES, spec.size - total + 1), deadline):
-                total += len(chunk)
-                if total > spec.size:
-                    output.truncate(0)
-                    raise DownloadError('Response exceeds the pinned payload size')
-                output.write(chunk)
-                digest.update(chunk)
-                deadline = time.monotonic() + STALL_SECONDS
-                report(total)
-            output.flush()
-            if total != spec.size:
-                raise DownloadError('Download stopped before the end; the partial file is kept')
-            if digest.hexdigest() != spec.sha256:
-                output.truncate(0)
-                raise DownloadError('Payload size or SHA-256 does not match its pin')
-            os.fsync(output.fileno())
-        result = _publish(partial, spec, cache, directory, original)
-        _unlink(partial, directory)
-        report(spec.size, final=True)
-        return result
+            report(partial.kept)
+        partial.file.flush()
+        if partial.kept != spec.size:
+            raise DownloadError('Download stopped before the end; the partial file is kept')
+        if not partial.complete():
+            partial.reset()
+            raise DownloadError('Payload size or SHA-256 does not match its pin')
+    return _publish_partial(partial, spec, cache, directory, original, report)
 
 
 def partial_bytes(key, cache=Path('out/downloads')) -> int:
@@ -427,11 +468,18 @@ def fetch_patch(key, cache=Path('out/downloads'), progress=None) -> Path:
         headers = {'User-Agent': USER_AGENT, 'Accept-Encoding': 'identity'}
         if spec.kind == 'github':
             headers['Accept'] = 'application/octet-stream'
-        for candidate in _candidates(key, spec, client, headers):
-            try:
-                return _download(client, candidate, spec, cache, directory, original, progress)
-            except _FAILURES:
-                continue
+        partial = _Partial(spec, directory) if spec.size >= RESUMABLE_BYTES else None
+        try:
+            if partial is not None and partial.complete():
+                return _publish_partial(partial, spec, cache, directory, original, _Progress(progress, spec.size))
+            for candidate in _candidates(key, spec, client, headers):
+                try:
+                    return _download(client, candidate, spec, cache, directory, original, progress, partial)
+                except _FAILURES:
+                    continue
+        finally:
+            if partial is not None:
+                partial.close()
         raise DownloadError('No verified download available for ' + key) from None
     finally:
         os.close(directory)

@@ -301,6 +301,48 @@ class PatchSourcesTests(unittest.TestCase):
             self.fetch('directx', [refused])
         self.assertEqual(subject.partial_bytes('directx', self.cache), 0)
 
+    def test_complete_partial_is_published_without_network(self):
+        partial = self.large()
+        self.cache.mkdir()
+        partial.write_bytes(PAYLOAD)
+        result, client = self.fetch('directx', [])
+        self.assertEqual(result.read_bytes(), PAYLOAD)
+        self.assertEqual(client.calls, [])
+        self.assertEqual(self.entries(), [result.name])
+        result.unlink()
+        partial.write_bytes(b'x' * len(PAYLOAD))
+        result, client = self.fetch('directx', [Response(PAYLOAD)])
+        self.assertEqual(result.read_bytes(), PAYLOAD)
+        self.assertIsNone(client.calls[0][0].get_header('Range'))
+
+    def test_partial_is_hashed_once_per_fetch(self):
+        self.large()
+        self.cache.mkdir()
+        partial = self.cache / ('.' + self.specs['official-1.3'].filename + '.partial')
+        partial.write_bytes(PAYLOAD[:3])
+        reads = []
+        real = subject._Partial.__init__
+        def counting(inner, *args):
+            reads.append(1)
+            real(inner, *args)
+        with patch.object(subject._Partial, '__init__', counting):
+            result, client = self.fetch('official-1.3', [OSError('first source'), self.ranged(3)])
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(result.read_bytes(), PAYLOAD)
+        self.assertEqual([c[0].get_header('Range') for c in client.calls], ['bytes=3-', 'bytes=3-'])
+
+    def test_locked_partial_fails_before_any_request(self):
+        import fcntl
+        partial = self.large()
+        self.cache.mkdir()
+        partial.write_bytes(PAYLOAD[:3])
+        with partial.open('r+b') as other:
+            fcntl.flock(other.fileno(), fcntl.LOCK_EX)
+            with self.assertRaises(subject.DownloadBusy) as failure:
+                self.fetch('directx', [])
+        self.assertIn('already being downloaded', str(failure.exception))
+        self.assertEqual(partial.read_bytes(), PAYLOAD[:3])
+
     def test_wrong_final_hash_never_publishes_and_drops_partial(self):
         partial = self.large()
         self.cache.mkdir()
