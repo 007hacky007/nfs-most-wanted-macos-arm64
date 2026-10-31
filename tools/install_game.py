@@ -218,7 +218,7 @@ def supply_d3dx(archive, destination):
 
 
 def install(backup, destination, *, patches=None, hq_source=None,
-            extractor=Path('out/tools/hq-extractor/build/innoextract')):
+            extractor=Path('out/tools/hq-extractor/build/innoextract'), decoder=None):
     """Stage a verified folder or disc set, apply patches, and publish once complete."""
     destination=Path(destination)
     if destination.exists() or destination.is_symlink():
@@ -239,21 +239,25 @@ def install(backup, destination, *, patches=None, hq_source=None,
         from .patch_sources import verify_patch
         from .extract_hq import extract_hq
         from .hq_variants import build_variants
+        from . import progress
     except ImportError:
         from game_sources import stage_game
         from official_patch import apply_official_patch
         from patch_sources import verify_patch
         from extract_hq import extract_hq
         from hq_variants import build_variants
+        import progress
     verify_patch('widescreen',patches['widescreen'])
     verify_patch('mw-hq',patches['mw-hq'])
     destination.parent.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.nfsmw-install-',dir=destination.parent) as temporary:
         staging=Path(temporary)/'game';staging.mkdir()
+        progress.step('game','Copying and checking all game files')
         source=stage_game(sources,staging)
+        progress.step('patches','Applying the official 1.3 patch, D3DX and WidescreenFix')
         if not (staging/'d3dx9_26.dll').is_file():supply_d3dx(patches['mw-hq'],staging)
         verify_binary((staging/'d3dx9_26.dll').read_bytes(),D3DX_SHA)
-        official=apply_official_patch(patches['official-1.3'],staging)
+        official=apply_official_patch(patches['official-1.3'],staging,decoder)
         verify_binary((staging/'speed.exe').read_bytes(),OFFICIAL_EXE_SHA)
         with zipfile.ZipFile(patches['widescreen']) as zipped:
             extract_zip(zipped,staging/'.nfsmw/windows/widescreen')
@@ -262,9 +266,9 @@ def install(backup, destination, *, patches=None, hq_source=None,
                 output.write_bytes(zipped.read(name))
         hq=Path(hq_source) if hq_source else Path(temporary)/'hq-source'
         if hq_source is None:
-            print('Extracting verified HQ assets with the native installer reader',flush=True)
+            progress.step('hq','Extracting verified HQ assets with the native installer reader')
             extract_hq(patches['mw-hq'],hq,extractor)
-        print('Preparing isolated Standard, HQ visual and Full HQ data',flush=True)
+        progress.step('variants','Preparing isolated Standard, HQ visual and Full HQ data')
         variants=build_variants(staging,hq)
         manifest={'source':source,'archives':source['archives'],
                   'binaries':{'speed.exe':OFFICIAL_EXE_SHA,'d3dx9_26.dll':D3DX_SHA,

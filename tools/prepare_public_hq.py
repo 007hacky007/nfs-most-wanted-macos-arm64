@@ -80,6 +80,7 @@ def prepare_build(game,output):
         from .prepare_hq_phases import prepare_phases
         from .hq_module_catalog import MODULES
         from .runtime_image import STANDARD_RUNTIME_SHA256
+        from . import progress
     except ImportError:
         from prepare_audio_callbacks import prepare as prepare_audio
         from prepare_hq_modules import prepare_modules
@@ -88,6 +89,7 @@ def prepare_build(game,output):
         from prepare_hq_phases import prepare_phases
         from hq_module_catalog import MODULES
         from runtime_image import STANDARD_RUNTIME_SHA256
+        import progress
     import pefile
 
     game,output=Path(game).resolve(),Path(output).resolve()
@@ -95,6 +97,7 @@ def prepare_build(game,output):
         raise ValueError('public preparation requires a fresh output directory')
     output.mkdir(parents=True)
     python=Path(sys.executable)
+    progress.step('translate','Translating the game to C')
     run(['sh',ROOT/'gen.sh',game],output/'generate.log')
     canonical=game/'.nfsmw/runtime.exe'
     if sha(canonical)!=STANDARD_RUNTIME_SHA256:
@@ -103,9 +106,9 @@ def prepare_build(game,output):
     mapped=mapped_image(image)
     baseline=output/'canonical.game.bin';baseline.write_bytes(mapped)
     audio=output/'audio'
-    print('Preparing native audio callbacks from verified game banks',flush=True)
+    progress.step('audio','Preparing native audio callbacks from verified game banks')
     prepare_audio(game,canonical,audio)
-    print('Generating the six original runtime modules',flush=True)
+    progress.step('modules','Generating the six original runtime modules')
     modules=prepare_modules(game,ROOT/'out/hq-modules',ROOT/'gen/hq')
     prepare_runtime(ROOT/'gen/hq',ROOT/'gen/hq-runtime')
     routes=output/'routes'
@@ -156,12 +159,14 @@ def prepare_build(game,output):
         captures.append({'stage':label,'status':status,'engine_sha256':sha(ROOT/'out/nfsmw_boot')})
         return status,images
 
+    progress.step('bootstrap','First native build and module start-up')
     compile_routes('bootstrap')
     status,images=capture('module-init','--prepare-hq-modules')
     if status:
         raise ValueError('original module initialization failed before game preparation')
     add(images)
     for attempt in range(12):
+        progress.step('runtime',f'Finding the remaining code states, round {attempt+1} of at most 12')
         compile_routes(f'runtime-{attempt}')
         status,images=capture(f'runtime-{attempt}','--prepare-hq-runtime')
         added=add(images)
@@ -181,6 +186,7 @@ def prepare_build(game,output):
     upstream=next(path for reason,path in reversed(images) if reason=='xenoninit')
     render=prepare_phases(game,upstream,output/'renderer',baseline_sha256=sha(upstream))
     add([('callback',render[0]),('render',render[1])])
+    progress.step('final','Final native build and verification run')
     record=compile_routes('final')
     status,images=capture('verify','--prepare-hq-runtime')
     if status or add(images):

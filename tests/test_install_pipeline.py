@@ -35,7 +35,7 @@ class InstallPipelineTests(unittest.TestCase):
         patches={'official-1.3':root/'official.exe','widescreen':ws,'mw-hq':root/'hq.zip'}
         destination=root/'installed'
 
-        def decode(archive,staging):
+        def decode(archive,staging,decoder=None):
             self.assertEqual(archive,patches['official-1.3'])
             (staging/'speed.exe').write_bytes(pe)
             if fail_patch:raise ValueError('fixture decoder failure')
