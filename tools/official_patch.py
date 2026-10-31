@@ -51,12 +51,13 @@ def read_patch_payload(archive: Path) -> bytes:
     return data
 
 
-def apply_official_patch(archive: Path, destination: Path) -> dict:
+def apply_official_patch(archive: Path, destination: Path, decoder: Path = None) -> dict:
     """Verify and stage all seven replacements, then return {relative_path: {size, sha256}}.
 
     The destination must be an existing installer staging directory. Decoding and
     verification finish before any files there are replaced. Each replacement is
-    atomic; the caller owns publishing the complete staged installation.
+    atomic; the caller owns publishing the complete staged installation. A prebuilt
+    `decoder` (a verified helper) replaces compiling tools/rtpatch_decode.rs with rustc.
     """
     archive, destination = Path(archive), Path(destination)
     data=read_patch_payload(archive)
@@ -71,17 +72,18 @@ def apply_official_patch(archive: Path, destination: Path) -> dict:
                 raise ValueError(f'unsafe official patch destination: {name}')
         if target.is_dir():
             raise ValueError(f'official patch destination is a directory: {name}')
-    rustc = shutil.which('rustc')
-    if rustc is None:
+    rustc = None if decoder is not None else shutil.which('rustc')
+    if decoder is None and rustc is None:
         raise RuntimeError('rustc is required to decode the official patch natively')
     source = Path(__file__).with_name('rtpatch_decode.rs')
     with tempfile.TemporaryDirectory(prefix='.official-patch-', dir=destination.parent) as tmp:
         stage = Path(tmp)
         executable = stage / 'patch.exe'
         executable.write_bytes(data)
-        decoder = stage / 'decode'
-        subprocess.run([rustc, '--edition=2021', '-O', str(source), '-o', str(decoder)],
-                       check=True, capture_output=True)
+        if decoder is None:
+            decoder = stage / 'decode'
+            subprocess.run([rustc, '--edition=2021', '-O', str(source), '-o', str(decoder)],
+                           check=True, capture_output=True)
         manifest = {}
         for name, offset, size, expected, w1, w2, sha in RECORDS:
             output = stage / 'files' / name
