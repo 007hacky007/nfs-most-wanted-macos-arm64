@@ -1,9 +1,161 @@
 # NFSMW for Apple Silicon
 
-Build a local macOS version of Need for Speed Most Wanted (2005) from your own
-Windows game copy. **This repository contains no EA game code or game assets.**
-You must supply the game. Extracted files, downloaded patches and locally
-generated game code remain in ignored build directories.
+Play **Need for Speed Most Wanted (2005)** natively on your Apple Silicon Mac,
+built from your own Windows game copy. NFSMW turns your PC copy of the game
+into a Mac app with native ARM64 code, Metal graphics and CoreAudio sound.
+
+<!-- LAUNCHER SCREENSHOT TO ADD: the repository has no launcher image yet. Capture the
+     NFSMW.app launcher as docs/images/launcher.png and show it here with
+     <p align="center"><img src="docs/images/launcher.png" width="420" alt="NFSMW launcher with resolution and game mode"></p> -->
+
+## What you get
+
+- The original game: menus, profiles, Quick Race and the Career, compiled to
+  native ARM64 code.
+- A launcher before each game with the resolution (4:3, 16:9, 16:10 and other
+  supported sizes) and three game modes:
+  - **Standard**: the game as released, updated to v1.3.
+  - **HQ visuals only**: standard gameplay, car list, shaders, audio and
+    videos, with the Most Wanted HQ world and existing-car visual files.
+  - **Full HQ**: the Most Wanted HQ 1.20.9 mod with its added cars, modern
+    shaders, Xbox 360 lighting and HQ audio.
+- WidescreenFix for native resolution, aspect, HUD and movie handling.
+- The original music, sound, videos and in-engine cutscenes.
+- Keyboard and game-controller input through native macOS interfaces.
+- Your own saves, kept apart from the game files. Your game copy is never
+  changed.
+
+## What you need
+
+- A Mac with Apple Silicon (M1 or later) and **macOS 12 or newer** for NFSMW
+  Builder. On macOS 11, use [Build from Terminal](#build-from-terminal)
+  instead.
+- Your own copy of **Need for Speed Most Wanted (2005) for PC, USA English
+  Black Edition (4 CDs)**: an installed game folder, or the four disc images.
+  See [Which game copy works](#which-game-copy-works).
+- About **40 GB of free space** while the build runs. The finished app is
+  about **16 GB**; the build files are removed automatically afterwards.
+- An internet connection. The first build downloads **3.36 GB** once, mostly
+  the Most Wanted HQ package; later builds reuse it.
+
+NFSMW Builder installs everything else for you: its own Python and build
+tools. Only the Xcode command line tools come from Apple, and the Builder asks
+macOS to install them.
+
+## Build your game
+
+NFSMW Builder is a small app that checks what is missing, fixes it with one
+button per item, and builds NFSMW.app from your own game copy. You never open
+Terminal.
+
+<p align="center">
+  <img src="docs/images/builder.png" width="460" alt="NFSMW Builder checklist with every row green, the game copy recognised as the USA English Black Edition on 4 CDs and the Build NFSMW.app button enabled">
+</p>
+
+1. Download `NFSMW-Builder.dmg` from the
+   [Releases page](../../releases/latest) of this repository and open it. You
+   do not need to copy NFSMW Builder anywhere.
+2. Run **NFSMW Builder** from the opened disk.
+
+NFSMW Builder is not signed by Apple, so macOS asks once before it opens. The
+same steps are drawn on the disk's background.
+
+**On macOS 14 or older:** right-click **NFSMW Builder** and choose **Open**.
+
+**On macOS 15 or newer:**
+
+1. macOS says it cannot be opened. Click **Done**.
+2. Open **System Settings**, then **Privacy & Security**, and scroll down.
+3. Click **Open Anyway** next to "NFSMW Builder" was blocked, then confirm.
+
+### The checklist
+
+The Builder shows a checklist. Green rows are ready, orange rows are handled
+automatically during the build, and red rows need you.
+
+- **Mac**: Apple Silicon and macOS 12 or newer.
+- **Xcode command line tools**: **Install...** opens Apple's installer (about
+  2 GB). The row turns green by itself when it is done.
+- **Build tools**: **Install** downloads the Builder's own Python (about
+  90 MB) and its packages. It never touches other Python installations or
+  Homebrew.
+- **Downloads**: the official 1.3 patch, WidescreenFix and Most Wanted HQ
+  (3.36 GB together). They are downloaded during the build, or now with
+  **Download now**. An interrupted download continues where it stopped. If
+  you already have `MW_HQ_1.20.9.zip`, choose **Use a file I already have...**;
+  it is checked and copied, and your file is not changed. If the download
+  keeps failing, **Open the download page** opens it in your browser.
+- **Game copy**: click **Choose...** or drag your game folder, a folder with
+  the disc images, or all four images at once onto the window. The check takes
+  a few seconds to a minute. If your copy is rejected, the row says what is
+  wrong; **Which copy works?** lists the accepted discs and files with their
+  sizes and checksums, and **Copy details** copies the findings for a bug
+  report.
+- **Destination**: where NFSMW.app is placed. The default is Applications.
+  An existing NFSMW.app built by NFSMW Builder is replaced; a different app
+  with that name is never touched.
+- **Free disk space**: about 40 GB while building, plus 18 GB on the
+  destination disk when it is a different disk. If an earlier build was
+  cancelled or failed, **Remove build files** frees its space.
+
+Fix the red rows, then click **Build NFSMW.app**. The build takes about 25
+minutes, longer on the first build while Most Wanted HQ downloads, and you can
+keep using your Mac. **Cancel** stops it and removes its files.
+
+When it finishes, NFSMW.app is in the destination folder. Click **Play** or
+**Show in Finder**. The build files are removed automatically; the Builder's
+Python and the downloads are kept for the next build. **Remove downloads**
+frees the 3.4 GB of downloads too.
+
+If a step fails, the Builder names it in plain words. **Copy log** copies
+everything for a bug report, and **Try again** returns to the checklist.
+
+### Playing
+
+Open NFSMW.app. Choose a resolution and game mode, then click Play.
+
+Click the title screen to continue. Use arrows and Enter in menus, arrows to
+drive, and Esc to pause. The window close button and Cmd-Q request a normal
+game shutdown.
+
+Startup shows an animated loading bar, elapsed time and the number of shaders
+ready. It stays visible until the first game frame appears. Graphics
+preparation can still take tens of seconds, depending on mode and shader cache.
+
+Saves live under `~/Library/Application Support/NFSMW/Saves`. HQ visuals and
+Full HQ use separate `HQVisuals` and `HQFull` save folders. The latest app log
+is `~/Library/Logs/NFSMW/last-run.log`.
+
+## Which game copy works
+
+You need **Need for Speed Most Wanted (2005) for PC, USA English Black Edition
+(4 CDs)**, either original or updated to v1.3. It can be:
+
+- a folder with the installed game (`speed.exe`, `CARS`, `GLOBAL`, `MOVIES`,
+  `SOUND` and `TRACKS`),
+- a folder with the four disc images (ISO, or BIN/CUE), or
+- the four disc images chosen together.
+
+Other regions, the DVD edition, Most Wanted (2012), console versions, repacks
+and modified copies do not work. You do not need to install any patches: the
+build applies the official 1.3 update and everything else it needs.
+
+The check looks at the files inside your copy, not at a checksum of a whole
+disc image, so any image format that holds the right files works. If your copy
+is rejected, the Builder's **Which copy works?** button lists what is
+accepted. The exact sizes and checksums are in
+[Checksums and byte sizes](#checksums-and-byte-sizes) below.
+
+---
+
+# Technical details
+
+The rest of this page is for power users, LLM agents and anyone curious about
+how the build works.
+
+**This repository contains no EA game code or game assets.** You must supply
+the game. Extracted files, downloaded patches and locally generated game code
+remain in ignored build directories.
 
 The port compiles the game into ARM64 and renders through Metal. Its macOS
 launcher offers resolution and three game modes: Standard, HQ visuals only,
@@ -11,42 +163,11 @@ and Full HQ. The build targets **Most Wanted (2005) PC v1.3, USA English
 Black Edition**. Use the verified original four-CD data described below; the
 builder installs the official 1.3 update automatically.
 
-## Easiest way: NFSMW Builder
-
-NFSMW Builder is a small Mac app that checks what is missing, fixes it with
-one button per item, and builds `NFSMW.app` from your game copy. You never
-open Terminal.
-
-1. Download `NFSMW-Builder.dmg` from the [Releases](../../releases) page and
-   open it.
-2. Double-click NFSMW Builder. macOS blocks it the first time; click Done.
-3. Open System Settings, then Privacy & Security, and scroll down.
-4. Click Open Anyway next to "NFSMW Builder" was blocked, then confirm.
-
-On macOS 14 or older: right-click NFSMW Builder and choose Open instead.
-
-The Builder shows a checklist. Fix any red row with its button, choose your
-game folder or all four disc images, and click Build NFSMW.app. When it
-finishes, click Play. If your copy is not the supported one, the Builder
-names the problem, and Which copy works? lists the accepted discs and files
-with their sizes and checksums.
-
-What you need for the Builder:
-
-- An Apple Silicon Mac with macOS 12 or newer. On macOS 11, build from
-  Terminal as described below.
-- About 40 GB of free space while the build runs. The finished app is about
-  16 GB; the build files are removed automatically afterwards.
-- Internet access. The first build downloads 3.36 GB of patches, mostly the
-  Most Wanted HQ package; later builds reuse them. If you already have
-  `MW_HQ_1.20.9.zip`, choose Use a file I already have.
-- The Builder installs its own Python and build tools. Only the Xcode command
-  line tools come from Apple; the Builder asks macOS to install them.
-
 ## Build from Terminal
 
-You need an Apple Silicon Mac, internet access and about 60 GB of free space
-for the build. Install the Xcode command-line tools and build dependencies
+You need an Apple Silicon Mac with macOS 11 or newer, internet access and about
+40 GB of free space for the build (the measured peak is 33 GB plus 3.4 GB of
+downloads). Install the Xcode command-line tools and build dependencies
 once. The second command uses Homebrew and supplies Python 3.12 or later:
 
 ```sh
@@ -89,7 +210,7 @@ Packaging extracts the original Windows icon from your verified `speed.exe`
 and converts it to the macOS app icon. The icon is generated locally from your
 game copy; no original game icon is included in this repository.
 
-## Supported game copy
+## Supported game copy in detail
 
 **Expected data edition:** the USA English Black Edition four-CD PC release
 of Need for Speed Most Wanted (2005). **Prepared and tested game version:**
@@ -128,6 +249,27 @@ support for another release just because it reports the same version number.
 Extra saves or configuration files in a supplied installation are not imported.
 The builder copies only recognized game files. A damaged or incompatible
 required file stops the build instead of producing a partially patched app.
+
+## NFSMW Builder internals
+
+NFSMW Builder runs the same pipeline as `./build.sh` (`tools/build_app.py`),
+from a copy of the sources bundled in the app. It keeps its files outside
+your game copy:
+
+- Build files and the copied sources:
+  `~/Library/Application Support/NFSMW Builder/<version>`, excluded from Time
+  Machine. Older versions' folders are removed when a new Builder starts.
+- Its own Python (python-build-standalone 3.12, checksum-pinned):
+  `~/Library/Application Support/NFSMW Builder/python`.
+- Downloads: `~/Library/Caches/NFSMW/downloads`. `./build.sh` keeps its own
+  cache in `out/downloads`; set `NFSMW_CACHE_DIR` to share one cache.
+
+Instead of Homebrew's cmake, Boost, xz and Rust, the Builder bundles a
+prebuilt innoextract and RTPatch decoder. The release workflow builds them
+from the same pinned sources and source edits that `./build.sh` uses
+(`tools/build_helpers.py`), for macOS 12, and every file they produce is still
+checked against the same SHA-256 pins. Microsoft cabinets are read with the
+system `/usr/bin/tar` by both the Builder and `./build.sh`.
 
 ## Patches
 
@@ -255,39 +397,6 @@ All three launcher modes use the supported v1.3 native game code.
 | `.nfsmw/runtime.exe` | Canonical v1.3 input for ARM64 translation | 6029312 | `80774c2e5d619b4f120b48d4462896fd504c263399d203a238769cffde1d253c` |
 | `.nfsmw/full/speed.exe` | HQ 1.20.9 game/resource image | 5992448 | `8393f3487e3e024d6c2196d8adcd3f5b1b38077a893d9161a6f9ac61d587fa19` |
 
-## Playing
-
-- Original menus, profile creation and reload, Quick Race, and the opening
-  Career sequence have been exercised.
-- Driving, steering, pause, restart and return to the menu work in native runs.
-- Music, engine and menu audio, attract video, opening story video and the
-  following in-engine cutscene have been verified.
-- The launcher provides 4:3, 16:9, 16:10 and other supported resolutions.
-- Keyboard and game-controller input use native macOS interfaces.
-
-Click the title screen to continue. Use arrows and Enter in menus, arrows to
-drive, and Esc to pause. The window close button and Cmd-Q request a normal
-game shutdown.
-
-Startup shows an animated loading bar, elapsed time and the number of shaders
-ready. It stays visible until the first game frame appears. Graphics
-preparation can still take tens of seconds, depending on mode and shader cache.
-
-Saves live under `~/Library/Application Support/NFSMW/Saves`. HQ visuals and
-Full HQ use separate `HQVisuals` and `HQFull` save folders. The latest app log
-is `~/Library/Logs/NFSMW/last-run.log`.
-
-This remains an experimental port. A complete Career playthrough, every car
-and track, and every controller have not been tested. Full HQ is demanding;
-the opening cutscene and driven races in development tests ran at roughly
-18-31 FPS at 1920x1080. Network play is disabled.
-The shader-ID collision responsible for black water has a tested Metal fix;
-a clear view of the repaired water surface in a live race is still unverified.
-
-The donor project's personal-use terms are preserved in `LICENSE`.
-Additional notices are in the `third_party` directory. The app you build
-contains your game files and locally generated game code.
-
 ## How native is it?
 
 The build translates supported x86 game and D3DX instructions into C, then
@@ -329,3 +438,28 @@ on each translated DLL call. A hidden 1080p HQ visuals comparison on an M1 Pro
 reduced guest CPU time per frame from 6.86 ms to 5.83 ms in the same stationary
 race scene. This is a CPU measurement, not a sustained driving FPS result;
 see `docs/performance.md` for the workload and limits.
+
+## What has been played
+
+- Original menus, profile creation and reload, Quick Race, and the opening
+  Career sequence have been exercised.
+- Driving, steering, pause, restart and return to the menu work in native runs.
+- Music, engine and menu audio, attract video, opening story video and the
+  following in-engine cutscene have been verified.
+- The launcher provides 4:3, 16:9, 16:10 and other supported resolutions.
+- Keyboard and game-controller input use native macOS interfaces.
+
+## Limitations
+
+This remains an experimental port. A complete Career playthrough, every car
+and track, and every controller have not been tested. Full HQ is demanding;
+the opening cutscene and driven races in development tests ran at roughly
+18-31 FPS at 1920x1080. Network play is disabled.
+The shader-ID collision responsible for black water has a tested Metal fix;
+a clear view of the repaired water surface in a live race is still unverified.
+
+## Legal and notices
+
+The donor project's personal-use terms are preserved in `LICENSE`.
+Additional notices are in the `third_party` directory. The app you build
+contains your game files and locally generated game code.
