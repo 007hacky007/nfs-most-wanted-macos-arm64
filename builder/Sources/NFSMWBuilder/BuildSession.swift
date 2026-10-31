@@ -23,6 +23,7 @@ extension BuilderModel {
         // Nothing from an earlier, cancelled or failed build is reused; clear it so it cannot
         // add to the peak (the Disk row counts these files as free).
         let (paths, version) = (paths, version)
+        buildFilesGeneration += 1
         background({ removeBuildFiles(paths, version: version) }, then: { [self] in
             buildFilesBytes = 0
             guard !shuttingDown else { return }
@@ -181,6 +182,7 @@ extension BuilderModel {
     func removeBuildFilesNow() {
         guard buildRunner == nil, !removingBuildFiles else { return }
         removingBuildFiles = true
+        buildFilesGeneration += 1
         let (paths, version) = (paths, version)
         background({ removeBuildFiles(paths, version: version) }, then: { [self] in
             removingBuildFiles = false
@@ -189,10 +191,14 @@ extension BuilderModel {
     }
 
     /// Measures the leftover build files off the main queue, then updates the Disk row.
+    /// Only the latest measurement applies: one started before a removal or a newer
+    /// measurement finishes too late to matter.
     func refreshBuildFiles() {
-        let (paths, version) = (paths, version)
+        buildFilesGeneration += 1
+        let (paths, version, generation) = (paths, version, buildFilesGeneration)
         var size: Int64 = 0
         background({ size = buildFilesSize(paths, version: version) }, then: { [self] in
+            guard generation == buildFilesGeneration else { return }
             buildFilesBytes = size
             refreshDiskSpace()
         })

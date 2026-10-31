@@ -50,6 +50,8 @@ final class BuilderModel: ObservableObject {
     /// Files a cancelled, failed or not installed build left in the workspace.
     @Published var buildFilesBytes: Int64 = 0
     @Published var removingBuildFiles = false
+    /// Counts size measurements of the build files; see refreshBuildFiles.
+    var buildFilesGeneration = 0
 
     let paths = BuilderPaths()
     let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0-dev"
