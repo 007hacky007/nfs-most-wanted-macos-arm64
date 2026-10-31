@@ -88,9 +88,9 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(diskSpaceCheck(workspaceAvailable: 31_200_000_000, workspaceVolume: "Macintosh HD",
                                       destinationAvailable: 500 * gb, destinationVolume: "Games",
                                       sameVolume: false, cachedBytes: 0),
-                       .blocked("Only 31.2 GB free on Macintosh HD, 40.0 GB needed during the build"))
-        XCTAssertTrue(diskSpaceCheck(workspaceAvailable: 37 * gb, workspaceVolume: "Macintosh HD",
-                                     destinationAvailable: 37 * gb, destinationVolume: "Macintosh HD",
+                       .blocked("Only 31.2 GB free on Macintosh HD, 45.0 GB needed during the build"))
+        XCTAssertTrue(diskSpaceCheck(workspaceAvailable: 42 * gb, workspaceVolume: "Macintosh HD",
+                                     destinationAvailable: 42 * gb, destinationVolume: "Macintosh HD",
                                      sameVolume: true, cachedBytes: 3_400_000_000).isReady)
         XCTAssertEqual(diskSpaceCheck(workspaceAvailable: 100 * gb, workspaceVolume: "Macintosh HD",
                                       destinationAvailable: 10 * gb, destinationVolume: "Games",

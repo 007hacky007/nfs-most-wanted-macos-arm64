@@ -22,7 +22,7 @@ struct ChecklistView: View {
             .keyboardShortcut(.defaultAction)
             .disabled(!model.buildEnabled)
             .padding(.top, 16)
-            Text("The build takes about 25 minutes and needs about 40 GB of free space while it runs. "
+            Text("The build takes about 25 minutes and needs about 45 GB of free space while it runs. "
                  + "You can keep using your Mac.")
                 .font(.caption)
                 .foregroundColor(.secondary)

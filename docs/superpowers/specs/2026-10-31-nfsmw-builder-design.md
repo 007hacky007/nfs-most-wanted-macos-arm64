@@ -6,7 +6,7 @@ Reference: the NFSV Builder (NFSV repo, branch `nfsv-builder`): `docs/superpower
 
 ## Why
 
-Building NFSMW today means opening Terminal, installing the Xcode command line tools, installing Homebrew, running `brew install python cmake boost xz cabextract rust`, and running `./build.sh <source>`. The build then needs about 40 GB of free space (measured peak 32.7 GB plus the download cache), a 3.34 GB download and a long wait. That loses most regular players. The goal is a downloadable app that a non-technical Mac user can double-click, that tells them in plain words what is missing, fixes it with one button per item, and then builds their own `NFSMW.app` from their own game copy.
+Building NFSMW today means opening Terminal, installing the Xcode command line tools, installing Homebrew, running `brew install python cmake boost xz cabextract rust`, and running `./build.sh <source>`. The build then needs about 45 GB of free space (measured peak 32.7 GB plus the download cache, plus a margin), a 3.34 GB download and a long wait. That loses most regular players. The goal is a downloadable app that a non-technical Mac user can double-click, that tells them in plain words what is missing, fixes it with one button per item, and then builds their own `NFSMW.app` from their own game copy.
 
 The translated game code is derived from each user's own `speed.exe`, and the produced app contains the user's own game files, so a prebuilt game can never be shipped. Every user's Mac must still compile it. The Builder makes the existing local build painless; it does not replace it.
 
@@ -57,7 +57,7 @@ Deferred by the owner on 2026-10-31. This design adds no release guard, no prove
 - The pipeline needs **Python 3.12+** (`hashlib.file_digest`, `tarfile` `filter='data'`) with `capstone==5.0.9` and `pefile==2024.8.26` (`requirements.txt`). The private Python pinned in the NFSV Builder (python-build-standalone 3.12.16) qualifies.
 - `build_app.py` checks for `clang`, `cmake`, `cabextract`, `rustc` and `codesign` on `PATH`. The Builder runs the pipeline with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, so the pipeline must learn to use the bundled helpers and the system `tar` instead (see Dependencies).
 - Every Python tool resolves paths from `ROOT` and writes `.venv`, `gen/`, `out/` under it. Downloads are cached in `ROOT/out/downloads` today. The Builder needs the cache outside its versioned workspace, so a 3.34 GB download survives a Builder update: new `--cache-dir` flag and `NFSMW_CACHE_DIR` override, CLI default unchanged.
-- Peak disk use measured end-to-end (Task 13): 32.7 GB in the workspace while NFSMW.app is packaged, plus the 3.4 GB download cache; the Disk row asks for 40 GB with margin (18 GB on another destination volume). The produced app is about 16 GB because it contains the user's verified game files and the Standard, HQ visual and Full HQ data trees.
+- Peak disk use measured end-to-end (Task 13): 32.7 GB in the workspace while NFSMW.app is packaged, plus the 3.4 GB download cache; the Disk row asks for 45 GB, leaving a margin for other programs writing to the same disk (18 GB on another destination volume). The produced app is about 16 GB because it contains the user's verified game files and the Standard, HQ visual and Full HQ data trees.
 - When launched from a DMG the Builder's own bundle is read-only and may be App-Translocated to a random path.
 - Public GitHub repo under the `007hacky007` pseudonym. Commits use the `007hacky007` identity; no AI attribution in commits, release notes or docs.
 
@@ -252,7 +252,7 @@ No secrets beyond the default `GITHUB_TOKEN`. No game files are ever available t
 
 ## README
 
-Add a top-level "Easiest way" section: download `NFSMW-Builder.dmg` from Releases, open it, follow the pictures, fix any red rows, click Build, then Play. Say that it needs about 40 GB free during the build and downloads 3.36 GB. Keep the Terminal instructions under "Build from Terminal". In "What you need", say the Builder installs its own Python and tools and only the command line tools come from Apple, and that the Builder needs macOS 12 or newer. Add the file count and total sizes to "Checksums and byte sizes". Drop `cabextract` from the brew line if D7 is accepted.
+Add a top-level "Easiest way" section: download `NFSMW-Builder.dmg` from Releases, open it, follow the pictures, fix any red rows, click Build, then Play. Say that it needs about 45 GB free during the build and downloads 3.36 GB. Keep the Terminal instructions under "Build from Terminal". In "What you need", say the Builder installs its own Python and tools and only the command line tools come from Apple, and that the Builder needs macOS 12 or newer. Add the file count and total sizes to "Checksums and byte sizes". Drop `cabextract` from the brew line if D7 is accepted.
 
 ## Differences from the NFSV Builder (summary)
 
@@ -262,7 +262,7 @@ Add a top-level "Easiest way" section: download `NFSMW-Builder.dmg` from Release
 | Game input | one folder or one image | folder, image folder, or 4 images / BIN-CUE set picked or dropped together |
 | Verification | about 30 files, first error | 1,407 files or 4 disc archives, collect all problems, "Which copy works?" |
 | Downloads | 15 MB | 3.36 GB, resumable, byte progress, "use a file I already have" |
-| Disk | 3 GB | about 33 GB workspace peak (40 GB asked), 16 GB app, automatic cleanup |
+| Disk | 3 GB | about 33 GB workspace peak (45 GB asked), 16 GB app, automatic cleanup |
 | Steps | 7 | 14, with a repeating `runtime` step |
 | Cache | `~/Library/Caches/NFSV` shared with CLI | CLI in `out/downloads`, Builder in `~/Library/Caches/NFSMW/downloads` |
 | Install | copy | move on the same volume, refuse an unrelated `NFSMW.app` |

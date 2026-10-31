@@ -11,7 +11,7 @@ import BuilderCore
 ///
 /// The pipeline only ever sees temporary clones: the game copy and the downloads folder are
 /// snapshotted (paths, sizes, modification times) and must be unchanged at the end.
-/// Needs about 40 GB free. Prints measurements with the E2E prefix.
+/// Needs about 45 GB free. Prints measurements with the E2E prefix.
 final class EndToEndTests: XCTestCase {
     private let fm = FileManager.default
     private let version = "0.0.0-e2e"

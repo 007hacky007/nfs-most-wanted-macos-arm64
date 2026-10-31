@@ -31,7 +31,7 @@ into a Mac app with native ARM64 code, Metal graphics and CoreAudio sound.
 - Your own copy of **Need for Speed Most Wanted (2005) for PC, USA English
   Black Edition (4 CDs)**: an installed game folder, or the four disc images.
   See [Which game copy works](#which-game-copy-works).
-- About **40 GB of free space** while the build runs. The finished app is
+- About **45 GB of free space** while the build runs. The finished app is
   about **16 GB**; the build files are removed automatically afterwards.
 - An internet connection. The first build downloads **3.36 GB** once, mostly
   the Most Wanted HQ package; later builds reuse it.
@@ -92,7 +92,7 @@ automatically during the build, and red rows need you.
 - **Destination**: where NFSMW.app is placed. The default is Applications.
   An existing NFSMW.app built by NFSMW Builder is replaced; a different app
   with that name is never touched.
-- **Free disk space**: about 40 GB while building, plus 18 GB on the
+- **Free disk space**: about 45 GB while building, plus 18 GB on the
   destination disk when it is a different disk. If an earlier build was
   cancelled or failed, **Remove build files** frees its space.
 
@@ -164,8 +164,8 @@ builder installs the official 1.3 update automatically.
 ## Build from Terminal
 
 You need an Apple Silicon Mac with macOS 11 or newer, internet access and about
-40 GB of free space for the build (the measured peak is 33 GB plus 3.4 GB of
-downloads). Install the Xcode command-line tools and build dependencies
+45 GB of free space for the build (the measured peak is 33 GB plus 3.4 GB of
+downloads, plus some room to spare). Install the Xcode command-line tools and build dependencies
 once. The second command uses Homebrew and supplies Python 3.12 or later:
 
 ```sh

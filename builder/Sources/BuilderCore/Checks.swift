@@ -44,8 +44,9 @@ public func macCheck(isAppleSilicon: Bool, version: OperatingSystemVersion) -> C
 }
 
 /// Peak space the build uses in its workspace, plus the download cache. Measured end-to-end:
-/// 32.7 GB in the workspace while NFSMW.app is packaged, plus the 3.4 GB cache, with 10 percent margin.
-public let requiredWorkspaceBytes: Int64 = 40_000_000_000
+/// 32.7 GB in the workspace while NFSMW.app is packaged, plus the 3.4 GB cache, plus room for other
+/// programs writing to the same disk during the 25 minutes.
+public let requiredWorkspaceBytes: Int64 = 45_000_000_000
 /// The finished NFSMW.app, which holds your game files and the HQ data (measured 16.0 GB, plus margin).
 public let appBytes: Int64 = 18_000_000_000
 
