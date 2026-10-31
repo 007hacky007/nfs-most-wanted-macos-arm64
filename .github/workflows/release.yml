@@ -11,6 +11,8 @@ permissions:
 jobs:
   release:
     runs-on: macos-15
+    # Tests take about 2 minutes; an uncached Boost and xz build up to about 20 on a runner.
+    timeout-minutes: 90
     defaults:
       run:
         shell: bash
@@ -38,6 +40,12 @@ jobs:
         with:
           path: out/helpers-work/deps
           key: helpers-deps-${{ runner.os }}-${{ hashFiles('tools/build_helpers.py') }}
+
+      - name: Check helper build tools
+        run: |
+          set -euo pipefail
+          cmake --version
+          rustc --version
 
       - name: Build helpers
         run: |
