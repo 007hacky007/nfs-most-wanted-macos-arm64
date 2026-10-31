@@ -11,7 +11,39 @@ and Full HQ. The build targets **Most Wanted (2005) PC v1.3, USA English
 Black Edition**. Use the verified original four-CD data described below; the
 builder installs the official 1.3 update automatically.
 
-## Build your app
+## Easiest way: NFSMW Builder
+
+NFSMW Builder is a small Mac app that checks what is missing, fixes it with
+one button per item, and builds `NFSMW.app` from your game copy. You never
+open Terminal.
+
+1. Download `NFSMW-Builder.dmg` from the [Releases](../../releases) page and
+   open it.
+2. Double-click NFSMW Builder. macOS blocks it the first time; click Done.
+3. Open System Settings, then Privacy & Security, and scroll down.
+4. Click Open Anyway next to "NFSMW Builder" was blocked, then confirm.
+
+On macOS 14 or older: right-click NFSMW Builder and choose Open instead.
+
+The Builder shows a checklist. Fix any red row with its button, choose your
+game folder or all four disc images, and click Build NFSMW.app. When it
+finishes, click Play. If your copy is not the supported one, the Builder
+names the problem, and Which copy works? lists the accepted discs and files
+with their sizes and checksums.
+
+What you need for the Builder:
+
+- An Apple Silicon Mac with macOS 12 or newer. On macOS 11, build from
+  Terminal as described below.
+- About 65 GB of free space while the build runs. The finished app is about
+  15 GB; the build files are removed automatically afterwards.
+- Internet access. The first build downloads 3.36 GB of patches, mostly the
+  Most Wanted HQ package; later builds reuse them. If you already have
+  `MW_HQ_1.20.9.zip`, choose Use a file I already have.
+- The Builder installs its own Python and build tools. Only the Xcode command
+  line tools come from Apple; the Builder asks macOS to install them.
+
+## Build from Terminal
 
 You need an Apple Silicon Mac, internet access and about 60 GB of free space
 for the build. Install the Xcode command-line tools and build dependencies
@@ -19,7 +51,7 @@ once. The second command uses Homebrew and supplies Python 3.12 or later:
 
 ```sh
 xcode-select --install
-brew install python cmake boost xz cabextract rust
+brew install python cmake boost xz rust
 ```
 
 Open Terminal in this repository and run one command:
