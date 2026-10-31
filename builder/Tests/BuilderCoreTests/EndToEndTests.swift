@@ -112,7 +112,13 @@ final class EndToEndTests: XCTestCase {
         mark("truncated \(victim.lastPathComponent) rejected: \(rejection?.0 ?? "no event")")
 
         let status = try run(.downloadsStatus(paths: paths, version: version), timeout: 120)
-        mark("downloads status: \(status.events.compactMap { if case let .downloads(s) = $0 { return "\(s.downloads)" }; return nil })")
+        let decoded = status.events.compactMap { event -> DownloadsStatus? in
+            if case let .downloads(s) = event { return s }
+            return nil
+        }
+        XCTAssertEqual(decoded.count, 1, "downloads status did not decode: \(status.lines)")
+        XCTAssertGreaterThanOrEqual(decoded.first?.remainingBytes ?? -1, 0)
+        mark("downloads status: \(decoded.first.map { "\($0.downloads)" } ?? "none")")
 
         // First build: cancel while the game is being translated; nothing from it may survive.
         let workspace = paths.workspace(version: version).path

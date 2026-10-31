@@ -7,6 +7,7 @@ let package = Package(
     targets: [
         .target(name: "BuilderCore"),
         .executableTarget(name: "NFSMWBuilder", dependencies: ["BuilderCore"]),
-        .testTarget(name: "BuilderCoreTests", dependencies: ["BuilderCore"]),
+        // Fixtures are read through #filePath; tests/test_builder_events_fixture.py keeps them current.
+        .testTarget(name: "BuilderCoreTests", dependencies: ["BuilderCore"], exclude: ["Fixtures"]),
     ]
 )
