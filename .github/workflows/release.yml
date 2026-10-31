@@ -17,9 +17,9 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -36,7 +36,7 @@ jobs:
 
       # Boost and xz are built from pinned sources for macOS 12; reuse them while
       # tools/build_helpers.py (which holds the pins and flags) is unchanged.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: out/helpers-work/deps
           key: helpers-deps-${{ runner.os }}-${{ hashFiles('tools/build_helpers.py') }}
