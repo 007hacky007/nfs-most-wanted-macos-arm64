@@ -10,6 +10,17 @@ import os
 PREFIX = 'NFSMW-EVENT '
 
 
+class StepFailed(ValueError):
+    """A build step failed; `log` names the file with its full output (paths may contain spaces).
+
+    str() keeps the Terminal wording "...; inspect <log>"; the Builder gets a plain sentence
+    and the log path as its own event field.
+    """
+    def __init__(self, message, log):
+        super().__init__(f'{message}; inspect {log}')
+        self.log = str(log)
+
+
 def enabled():
     return os.environ.get('NFSMW_PROGRESS') == '1'
 

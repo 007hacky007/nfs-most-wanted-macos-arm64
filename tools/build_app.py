@@ -146,8 +146,11 @@ def build(sources, cache=None, helper_dir=None):
         return app
 
 
-def log_path(message):
-    match = re.search(r'inspect (\S+)$', message)
+def log_path(error):
+    """The step log a failure names. Builder workspaces have spaces in their paths."""
+    if getattr(error, 'log', None):
+        return error.log
+    match = re.search(r'; inspect (.+)$', str(error))
     return match.group(1) if match else None
 
 
@@ -195,7 +198,9 @@ def main(argv=None):
         return 2
     except (ValueError, OSError, RuntimeError) as error:
         print('Build failed: ' + str(error), file=sys.stderr, flush=True)
-        progress.error(str(error), log=log_path(str(error)))
+        log = log_path(error)
+        # A step with its own log gets a plain sentence; Copy log adds the end of that log.
+        progress.error(STEP_FAILED if log else str(error), log=log)
         return 2
     except KeyboardInterrupt:
         print('Build interrupted. The previous app is preserved.', file=sys.stderr, flush=True)

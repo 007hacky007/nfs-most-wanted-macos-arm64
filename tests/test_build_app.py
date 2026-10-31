@@ -124,23 +124,39 @@ class BuildEventTests(unittest.TestCase):
         self.assertEqual([e['received'] for e in downloads], sorted(e['received'] for e in downloads))
         self.assertEqual(found[-1], {'done': str((self.root / 'out/NFSMW.app').resolve())})
 
-    def test_error_event_carries_log_path(self):
-        output = io.StringIO()
-        message = 'preparation failed (1); inspect /tmp/x/final-build.log'
+    def last_event(self, error):
+        output, stderr = io.StringIO(), io.StringIO()
         with patch.object(self.build_app, 'resolve_sources', return_value=[self.root]), \
                 patch.object(self.build_app, 'prerequisites'), patch.object(self.build_app, 'environment'), \
-                patch.object(self.build_app, 'build', side_effect=ValueError(message)), redirect_stdout(output), \
-                redirect_stderr(io.StringIO()):
+                patch.object(self.build_app, 'build', side_effect=error), redirect_stdout(output), \
+                redirect_stderr(stderr):
             self.assertEqual(self.build_app.main(['--progress', 'game']), 2)
-        self.assertEqual(events(output.getvalue())[-1], {'error': message, 'log': '/tmp/x/final-build.log'})
+        return events(output.getvalue())[-1], stderr.getvalue()
+
+    def test_error_event_carries_log_path_with_spaces(self):
+        import progress
+        log = '/Users/x/Library/Application Support/NFSMW Builder/1.0/out/app-preparation-1/final-build.log'
+        event, stderr = self.last_event(progress.StepFailed('preparation failed (1)', log))
+        self.assertEqual(event, {'error': self.build_app.STEP_FAILED, 'log': log})
+        self.assertIn('preparation failed (1); inspect ' + log, stderr)
+        event, _ = self.last_event(ValueError('native preparation timed out; inspect ' + log))
+        self.assertEqual(event, {'error': self.build_app.STEP_FAILED, 'log': log})
+        event, _ = self.last_event(ValueError('source does not exist: /a b'))
+        self.assertEqual(event, {'error': 'source does not exist: /a b', 'log': None})
         for error in (subprocess.CalledProcessError(1, ['clang']), KeyError('boom')):
-            output = io.StringIO()
-            with patch.object(self.build_app, 'resolve_sources', return_value=[self.root]), \
-                    patch.object(self.build_app, 'prerequisites'), patch.object(self.build_app, 'environment'), \
-                    patch.object(self.build_app, 'build', side_effect=error), redirect_stdout(output), \
-                    redirect_stderr(io.StringIO()):
-                self.assertEqual(self.build_app.main(['--progress', 'game']), 2)
-            self.assertEqual(events(output.getvalue())[-1]['error'], self.build_app.STEP_FAILED)
+            self.assertEqual(self.last_event(error)[0]['error'], self.build_app.STEP_FAILED)
+
+    def test_preparation_step_failure_names_its_log(self):
+        import progress
+        from tools import prepare_public_hq
+        folder = self.root / 'NFSMW Builder' / 'app preparation'
+        folder.mkdir(parents=True)
+        log = folder / 'final-build.log'
+        with redirect_stdout(io.StringIO()), self.assertRaises(ValueError) as failure:
+            prepare_public_hq.run(['sh', '-c', 'echo detail; exit 3'], log)
+        self.assertEqual(failure.exception.log, str(log))
+        self.assertEqual(log.read_text(), 'detail\n')
+        self.assertEqual(self.build_app.log_path(failure.exception), str(log))
 
     def test_game_rejection_event_carries_the_report(self):
         output = io.StringIO()

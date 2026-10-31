@@ -7,6 +7,11 @@ import re
 import subprocess
 import sys
 
+try:
+    from .progress import StepFailed
+except ImportError:
+    from progress import StepFailed
+
 ROOT=Path(__file__).resolve().parents[1]
 
 
@@ -58,9 +63,9 @@ def run(command,log,*,environment=None,timeout=None,accepted=(0,)):
             result=subprocess.run(list(map(str,command)),cwd=ROOT,env=environment,
                                   stdout=stream,stderr=subprocess.STDOUT,timeout=timeout)
         except subprocess.TimeoutExpired as error:
-            raise ValueError('native preparation timed out; inspect '+str(log)) from error
+            raise StepFailed('native preparation timed out',log) from error
     if result.returncode not in accepted:
-        raise ValueError(f'preparation failed ({result.returncode}); inspect {log}')
+        raise StepFailed(f'preparation failed ({result.returncode})',log)
     return result.returncode
 
 
