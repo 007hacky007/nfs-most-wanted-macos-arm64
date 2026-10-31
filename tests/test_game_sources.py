@@ -109,9 +109,7 @@ class GameSourcesTests(unittest.TestCase):
 
     def stage_discs(self, sources, destination):
         # Only the external cabinet decoder is substituted; ISO and ZIP handling are real.
-        import subprocess
-        with patch('tools.game_sources.subprocess.run', return_value=subprocess.CompletedProcess(
-                ['cabextract'], 0, b'd3dx', b'')):
+        with patch('tools.game_sources.extract_cab_member', return_value=b'd3dx'):
             return stage_game(sources, destination, profile=self.profile)
 
     def test_folder_normalizes_expected_paths_and_ignores_mods(self):
@@ -269,11 +267,23 @@ class GameSourcesTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'cabinet'):
             self.stage_discs(images, self.destination('missing-cab'))
         self.profile['d3dx_cab']['path'] = 'd3dx.cab'
-        for code, output in ((1, b''), (0, b'wrong-dll')):
-            with self.subTest(code=code), patch('tools.game_sources.subprocess.run',
-                    return_value=subprocess.CompletedProcess(['cabextract'], code, output, b'')):
+        for code, output in ((1, b''), (0, b''), (0, b'wrong-dll')):
+            with self.subTest(code=code, output=output), patch('tools.install_game.subprocess.run',
+                    return_value=subprocess.CompletedProcess(['tar'], code, output, b'')):
                 with self.assertRaises(ValueError):
-                    stage_game(images, self.destination('decoder-' + str(code)), profile=self.profile)
+                    stage_game(images, self.destination(f'decoder-{code}-{len(output)}'), profile=self.profile)
+
+    def test_extract_cab_member_uses_system_tar(self):
+        import subprocess
+        from tools.install_game import extract_cab_member
+        with patch('tools.install_game.subprocess.run',
+                   return_value=subprocess.CompletedProcess(['tar'], 0, b'dll', b'')) as run:
+            self.assertEqual(extract_cab_member(Path('/x/a b.cab'), 'd3dx9_26.dll'), b'dll')
+        self.assertEqual(run.call_args.args[0], ['/usr/bin/tar', '-xOf', '/x/a b.cab', 'd3dx9_26.dll'])
+        with patch('tools.install_game.subprocess.run',
+                   return_value=subprocess.CompletedProcess(['tar'], 1, b'', b'bad')):
+            with self.assertRaisesRegex(ValueError, 'could not decode the D3DX cabinet'):
+                extract_cab_member(Path('/x/a.cab'), 'd3dx9_26.dll')
 
     def test_duplicate_image_copy_and_symlink_cue_reference_are_refused(self):
         images = self.discs()

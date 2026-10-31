@@ -8,14 +8,13 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
-import subprocess
 import tempfile
 import zipfile
 
 try:
-    from .install_game import RawISO, disc_files, extract_zip
+    from .install_game import RawISO, disc_files, extract_cab_member, extract_zip
 except ImportError:
-    from install_game import RawISO, disc_files, extract_zip
+    from install_game import RawISO, disc_files, extract_cab_member, extract_zip
 
 CHECKSUMS = Path(__file__).with_name('game_checksums.json')
 
@@ -277,10 +276,7 @@ def _extract_discs(images, destination, profile, files, archives):
             cabinet = Path(temporary) / 'directx.cab'
             with RawISO(cab_image, cab_entry.offset, cab_entry.size) as stream, cabinet.open('wb') as output:
                 shutil.copyfileobj(stream, output, 1 << 20)
-            result = subprocess.run(['cabextract', '-p', '-F', 'd3dx9_26.dll', str(cabinet)], capture_output=True)
-            if result.returncode:
-                raise ValueError('cabextract could not decode the required x86 D3DX DLL')
-            (destination / 'd3dx9_26.dll').write_bytes(result.stdout)
+            (destination / 'd3dx9_26.dll').write_bytes(extract_cab_member(cabinet, 'd3dx9_26.dll'))
     return [{'role': role, 'archive': archives[role]['path'],
              'size': archives[role]['size'], 'sha256': archives[role]['sha256']} for role in sorted(roles)]
 

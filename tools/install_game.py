@@ -193,6 +193,14 @@ def verify_binary(data, expected):
         raise ValueError('expected an i386 PE, not x64')
 
 
+def extract_cab_member(cabinet, member):
+    """Read one member of a Microsoft cabinet with the system tar (libarchive), part of macOS."""
+    result=subprocess.run(['/usr/bin/tar','-xOf',str(cabinet),member],capture_output=True)
+    if result.returncode or not result.stdout:
+        raise ValueError('could not decode the D3DX cabinet')
+    return result.stdout
+
+
 def supply_d3dx(archive, destination):
     """Decode the pinned HQ redistributable cabinet when a folder lacks D3DX."""
     member='Redist/dx/Jun2005_d3dx9_26_x86.cab'
@@ -204,10 +212,9 @@ def supply_d3dx(archive, destination):
         raise ValueError('unsupported D3DX cabinet checksum')
     with tempfile.TemporaryDirectory(prefix='.nfsmw-d3dx-',dir=Path(destination).parent) as temporary:
         cab=Path(temporary)/'directx.cab';cab.write_bytes(cabinet)
-        result=subprocess.run(['cabextract','-p','-F','d3dx9_26.dll',str(cab)],capture_output=True)
-        if result.returncode:raise ValueError('cabextract could not decode D3DX')
-        verify_binary(result.stdout,D3DX_SHA)
-        (Path(destination)/'d3dx9_26.dll').write_bytes(result.stdout)
+        data=extract_cab_member(cab,'d3dx9_26.dll')
+        verify_binary(data,D3DX_SHA)
+        (Path(destination)/'d3dx9_26.dll').write_bytes(data)
 
 
 def install(backup, destination, *, patches=None, hq_source=None,

@@ -30,8 +30,10 @@ def prerequisites():
         raise ValueError('building requires macOS on Apple Silicon')
     if sys.version_info < (3, 12):
         raise ValueError('Python 3.12 or later is required')
-    missing = [name for name in ('clang', 'cmake', 'cabextract', 'rustc', 'codesign')
+    missing = [name for name in ('clang', 'cmake', 'rustc', 'codesign')
                if shutil.which(name) is None]
+    if not Path('/usr/bin/tar').is_file():
+        missing.append('/usr/bin/tar')
     if missing:
         raise ValueError('missing build tools: ' + ', '.join(missing) + '; see README.md')
 
