@@ -253,6 +253,133 @@ class PatchSourcesTests(unittest.TestCase):
             with self.assertRaises(subject.DownloadError):
                 self.fetch('mw-hq', replies)
 
+    def large(self):
+        limit = patch.object(subject, 'RESUMABLE_BYTES', 4)
+        limit.start()
+        self.addCleanup(limit.stop)
+        return self.cache / ('.' + self.specs['directx'].filename + '.partial')
+
+    def ranged(self, start, body=None):
+        size = len(PAYLOAD)
+        body = PAYLOAD[start:] if body is None else body
+        return Response(body, status=206, headers={'Content-Range': f'bytes {start}-{size - 1}/{size}',
+                                                   'Content-Length': str(len(body))})
+
+    def test_large_download_resumes_with_range_after_drop(self):
+        partial = self.large()
+        with self.assertRaises(subject.DownloadError):
+            self.fetch('directx', [Response(PAYLOAD, broken=True)])
+        self.assertEqual(partial.read_bytes(), PAYLOAD[:3])
+        self.assertEqual(partial.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(subject.partial_bytes('directx', self.cache), 3)
+        self.assertEqual(self.entries(), [partial.name])
+        result, client = self.fetch('directx', [self.ranged(3)])
+        self.assertEqual(client.calls[0][0].get_header('Range'), 'bytes=3-')
+        self.assertEqual(result.read_bytes(), PAYLOAD)
+        self.assertEqual(self.entries(), [result.name])
+        self.assertEqual(subject.partial_bytes('directx', self.cache), 0)
+
+    def test_resume_restarts_on_200_and_discards_on_bad_content_range(self):
+        partial = self.large()
+        self.cache.mkdir()
+        partial.write_bytes(b'xyz')
+        result, client = self.fetch('directx', [Response(PAYLOAD)])
+        self.assertEqual(client.calls[0][0].get_header('Range'), 'bytes=3-')
+        self.assertEqual(result.read_bytes(), PAYLOAD)
+        self.assertFalse(partial.exists())
+        result.unlink()
+        partial.write_bytes(PAYLOAD[:3])
+        bad = self.ranged(3)
+        bad.headers['Content-Range'] = 'bytes 0-2/3'
+        with self.assertRaises(subject.DownloadError):
+            self.fetch('directx', [bad])
+        self.assertEqual(subject.partial_bytes('directx', self.cache), 0)
+        self.assertNotIn(result.name, self.entries())
+        refused = urllib.error.HTTPError('https://example.test', 416, 'range', {}, io.BytesIO())
+        partial.write_bytes(PAYLOAD[:3])
+        with self.assertRaises(subject.DownloadError):
+            self.fetch('directx', [refused])
+        self.assertEqual(subject.partial_bytes('directx', self.cache), 0)
+
+    def test_wrong_final_hash_never_publishes_and_drops_partial(self):
+        partial = self.large()
+        self.cache.mkdir()
+        partial.write_bytes(PAYLOAD[:3])
+        with self.assertRaises(subject.DownloadError):
+            self.fetch('directx', [self.ranged(3, b'x' * (len(PAYLOAD) - 3))])
+        self.assertEqual(self.entries(), [partial.name])
+        self.assertEqual(partial.stat().st_size, 0)
+
+    def test_stall_timeout_not_total_budget_for_large_files(self):
+        partial = self.large()
+        clock = [0.0]
+        class Slow(Response):
+            def read(inner, count=-1):
+                clock[0] += next(inner.steps, inner.last)
+                return io.BytesIO.read(inner, min(count, 3))
+        steady = Slow(PAYLOAD)
+        steady.steps, steady.last = iter(()), 100.0
+        with patch.object(subject.time, 'monotonic', side_effect=lambda: clock[0]):
+            result, _ = self.fetch('directx', [steady])
+            self.assertGreater(clock[0], 1000)
+            self.assertEqual(result.read_bytes(), PAYLOAD)
+            result.unlink()
+            stalled = Slow(PAYLOAD)
+            stalled.steps, stalled.last = iter((1.0,)), 121.0
+            with self.assertRaises(subject.DownloadError):
+                self.fetch('directx', [stalled])
+        self.assertEqual(partial.read_bytes(), PAYLOAD[:3])
+
+    def test_progress_callback_reports_bytes(self):
+        for large in (False, True):
+            with self.subTest(large=large):
+                if large:
+                    self.large()
+                seen = []
+                client = Client([Response(PAYLOAD)])
+                cache = self.root / f'progress-{large}'
+                with patch.object(subject.urllib.request, 'build_opener', return_value=client):
+                    subject.fetch_patch('directx', cache, progress=lambda got, total: seen.append((got, total)))
+                self.assertEqual(seen[-1], (len(PAYLOAD), len(PAYLOAD)))
+                self.assertEqual([got for got, _ in seen], sorted(got for got, _ in seen))
+                again = []
+                subject.fetch_patch('directx', cache, progress=lambda got, total: again.append(got))
+                self.assertEqual(again, [len(PAYLOAD)])
+
+    def test_import_verifies_copies_and_leaves_source_untouched(self):
+        folder = self.root / 'chosen'
+        folder.mkdir()
+        source = folder / 'My download.zip'
+        source.write_bytes(PAYLOAD)
+        wrong = folder / 'wrong.zip'
+        wrong.write_bytes(b'x' * len(PAYLOAD))
+        folder.chmod(0o555)
+        self.addCleanup(folder.chmod, 0o755)
+        before = [(p.name, p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ino) for p in sorted(folder.iterdir())]
+        with self.assertRaises(ValueError):
+            subject.import_patch('widescreen', wrong, self.cache)
+        self.assertEqual(self.entries(), [])
+        with patch.object(subject.urllib.request, 'build_opener', side_effect=AssertionError('no network')):
+            result = subject.import_patch('widescreen', source, self.cache)
+        self.assertEqual(result, self.cache / self.specs['widescreen'].filename)
+        self.assertEqual(result.read_bytes(), PAYLOAD)
+        self.assertNotEqual(result.stat().st_ino, source.stat().st_ino)
+        self.assertEqual(self.entries(), [result.name])
+        after = [(p.name, p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ino) for p in sorted(folder.iterdir())]
+        self.assertEqual(after, before)
+
+    def test_import_falls_back_to_a_plain_copy_and_removes_partial(self):
+        partial = self.large()
+        self.cache.mkdir()
+        partial.write_bytes(b'abc')
+        source = self.root / 'file'
+        source.write_bytes(PAYLOAD)
+        failed = subject.subprocess.CompletedProcess(['cp'], 1, b'', b'')
+        with patch.object(subject.subprocess, 'run', return_value=failed):
+            result = subject.import_patch('directx', source, self.cache)
+        self.assertEqual(result.read_bytes(), PAYLOAD)
+        self.assertEqual(self.entries(), [result.name])
+
     def test_unknown_key_has_no_filesystem_or_network_effect(self):
         with self.assertRaises(ValueError):
             self.fetch('../unknown', [])

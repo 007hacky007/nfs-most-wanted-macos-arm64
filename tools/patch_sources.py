@@ -4,10 +4,13 @@ import hashlib
 import html.parser
 import http.client
 import http.cookiejar
+import fcntl
 import os
 from pathlib import Path
 import secrets
+import shutil
 import stat
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -17,6 +20,10 @@ USER_AGENT = 'NFSMW-native-build'
 BLOCK_BYTES = 1024 * 1024
 MAX_LISTING_BYTES = 1024 * 1024
 MAX_MIRRORS = 8
+# Large payloads resume after a dropped connection and fail only after a stall.
+RESUMABLE_BYTES = 100 * 1024 * 1024
+STALL_SECONDS = 120
+PROGRESS_SECONDS = 0.5
 
 @dataclass(frozen=True)
 class PatchSpec:
@@ -107,16 +114,22 @@ def _verified(spec, directory, expected, name=None):
     return total == spec.size and digest.hexdigest() == spec.sha256
 
 
-def _open(client, url, headers, timeout):
+class RangeRefused(DownloadError):
+    """The source cannot continue the kept partial download."""
+
+
+def _open(client, url, headers, timeout, statuses=(200,)):
     _https(url)
     try:
         response = client.open(urllib.request.Request(url, headers=headers), timeout=timeout)
     except urllib.error.HTTPError as error:
         error.close()
+        if error.code == 416 and 'Range' in headers:
+            raise RangeRefused('HTTP source cannot continue the partial download') from None
         raise DownloadError('HTTP source refused the request') from None
     try:
         _https(response.geturl())
-        if response.status != 200:
+        if response.status not in statuses:
             raise DownloadError('Expected a complete HTTP response')
     except BaseException:
         response.close()
@@ -186,18 +199,60 @@ def _candidates(key, spec, client, headers):
                 return
 
 
-def _download(client, candidate, spec, cache, directory, original):
+class _Progress:
+    """Calls progress(received, total) at most every PROGRESS_SECONDS, plus a final call."""
+    def __init__(self, callback, total):
+        self.callback, self.total, self.last = callback, total, None
+    def __call__(self, received, final=False):
+        if self.callback is None:
+            return
+        now = time.monotonic()
+        if final or self.last is None or now - self.last >= PROGRESS_SECONDS:
+            self.last = now
+            self.callback(received, self.total)
+
+
+def _publish(name, spec, cache, directory, original):
+    # Recheck the requested directory and destination before publication.
+    _directory(cache, create=False)
+    actual, opened = cache.stat(), os.fstat(directory)
+    if (actual.st_dev, actual.st_ino) != (opened.st_dev, opened.st_ino):
+        raise DownloadError('Cache directory changed during download')
+    if _state(spec.filename, directory) != original:
+        raise DownloadError('Cache destination changed during download')
+    if original is None:
+        os.link(name, spec.filename, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
+    else:
+        os.replace(name, spec.filename, src_dir_fd=directory, dst_dir_fd=directory)
+    return cache / spec.filename
+
+
+def _check_headers(response, expected_length):
+    length = response.headers.get('Content-Length')
+    encoding = response.headers.get('Content-Encoding', 'identity').lower()
+    if (length is not None and int(length) != expected_length) or encoding != 'identity':
+        raise DownloadError('Response length or encoding does not match the pinned payload')
+
+
+def _unlink(name, directory):
+    try:
+        os.unlink(name, dir_fd=directory)
+    except FileNotFoundError:
+        pass
+
+
+def _download(client, candidate, spec, cache, directory, original, progress=None):
+    if spec.size >= RESUMABLE_BYTES:
+        return _resumable(client, candidate, spec, cache, directory, original, progress)
     url, headers, timeout = candidate
     temporary = '.' + spec.filename + '.' + secrets.token_hex(8) + '.part'
     created = False
+    report = _Progress(progress, spec.size)
     try:
         budget = 20 if timeout == 6 else min(7200, max(300, spec.size / (256 * 1024)))
         deadline = time.monotonic() + budget
         with _open(client, url, headers, timeout) as response:
-            length = response.headers.get('Content-Length')
-            encoding = response.headers.get('Content-Encoding', 'identity').lower()
-            if (length is not None and int(length) != spec.size) or encoding != 'identity':
-                raise DownloadError('Response length or encoding does not match the pinned payload')
+            _check_headers(response, spec.size)
             fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
             created = True
             with os.fdopen(fd, 'wb') as output:
@@ -209,28 +264,94 @@ def _download(client, candidate, spec, cache, directory, original):
                         raise DownloadError('Response exceeds the pinned payload size')
                     output.write(chunk)
                     digest.update(chunk)
+                    report(total)
                 if total != spec.size or digest.hexdigest() != spec.sha256:
                     raise DownloadError('Payload size or SHA-256 does not match its pin')
                 output.flush()
                 os.fsync(output.fileno())
-        # Recheck the requested directory and destination before publication.
-        _directory(cache, create=False)
-        actual, opened = cache.stat(), os.fstat(directory)
-        if (actual.st_dev, actual.st_ino) != (opened.st_dev, opened.st_ino):
-            raise DownloadError('Cache directory changed during download')
-        if _state(spec.filename, directory) != original:
-            raise DownloadError('Cache destination changed during download')
-        if original is None:
-            os.link(temporary, spec.filename, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
-        else:
-            os.replace(temporary, spec.filename, src_dir_fd=directory, dst_dir_fd=directory)
-        return cache / spec.filename
+        result = _publish(temporary, spec, cache, directory, original)
+        report(spec.size, final=True)
+        return result
     finally:
         if created:
-            try:
-                os.unlink(temporary, dir_fd=directory)
-            except FileNotFoundError:
-                pass
+            _unlink(temporary, directory)
+
+
+def _partial_name(spec):
+    return '.' + spec.filename + '.partial'
+
+
+def _resumable(client, candidate, spec, cache, directory, original, progress):
+    """Continue a kept partial file with an HTTP Range request; the pin still decides."""
+    url, headers, timeout = candidate
+    partial = _partial_name(spec)
+    report = _Progress(progress, spec.size)
+    fd = os.open(partial, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+    with os.fdopen(fd, 'r+b') as output:
+        if not stat.S_ISREG(os.fstat(output.fileno()).st_mode):
+            raise DownloadError('Partial download must be a regular file')
+        try:
+            fcntl.flock(output.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise DownloadError('Another download of this file is running') from None
+        digest, kept = hashlib.sha256(), os.fstat(output.fileno()).st_size
+        if kept >= spec.size:
+            output.truncate(0)
+            kept = 0
+        while chunk := output.read(min(BLOCK_BYTES, kept - output.tell())):
+            digest.update(chunk)
+        if output.tell() != kept:
+            raise DownloadError('Partial download changed while it was checked')
+        report(kept)
+        request = dict(headers, Range=f'bytes={kept}-') if kept else headers
+        try:
+            response = _open(client, url, request, timeout, statuses=(200, 206))
+        except RangeRefused:
+            output.truncate(0)
+            raise
+        with response:
+            if response.status == 206:
+                if response.headers.get('Content-Range') != f'bytes {kept}-{spec.size - 1}/{spec.size}':
+                    output.truncate(0)
+                    raise DownloadError('Response does not continue the partial download')
+                _check_headers(response, spec.size - kept)
+            else:
+                _check_headers(response, spec.size)
+                output.seek(0)
+                output.truncate(0)
+                digest, kept = hashlib.sha256(), 0
+            total = kept
+            output.seek(kept)
+            deadline = time.monotonic() + STALL_SECONDS
+            while chunk := _read(response, min(BLOCK_BYTES, spec.size - total + 1), deadline):
+                total += len(chunk)
+                if total > spec.size:
+                    output.truncate(0)
+                    raise DownloadError('Response exceeds the pinned payload size')
+                output.write(chunk)
+                digest.update(chunk)
+                deadline = time.monotonic() + STALL_SECONDS
+                report(total)
+            output.flush()
+            if total != spec.size:
+                raise DownloadError('Download stopped before the end; the partial file is kept')
+            if digest.hexdigest() != spec.sha256:
+                output.truncate(0)
+                raise DownloadError('Payload size or SHA-256 does not match its pin')
+            os.fsync(output.fileno())
+        result = _publish(partial, spec, cache, directory, original)
+        _unlink(partial, directory)
+        report(spec.size, final=True)
+        return result
+
+
+def partial_bytes(key, cache=Path('out/downloads')) -> int:
+    """Bytes kept from an interrupted large download, 0 when there are none. Never creates anything."""
+    try:
+        info = os.lstat(Path(cache) / _partial_name(SOURCES[key]))
+    except FileNotFoundError:
+        return 0
+    return info.st_size if stat.S_ISREG(info.st_mode) else 0
 
 
 def verify_patch(key, path) -> Path:
@@ -251,8 +372,44 @@ def verify_patch(key, path) -> Path:
     return path
 
 
-def fetch_patch(key, cache=Path('out/downloads')) -> Path:
-    """Return a fully verified payload; EXE files are downloaded, never executed."""
+def import_patch(key, source, cache=Path('out/downloads')) -> Path:
+    """Copy a payload the user already has into the cache after verifying it twice.
+
+    The source is only read: it is never moved, renamed, changed or written next to.
+    """
+    source = verify_patch(key, source)
+    spec = SOURCES[key]
+    cache = _directory(cache)
+    directory = os.open(cache, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    temporary = '.' + spec.filename + '.' + secrets.token_hex(8) + '.import'
+    try:
+        original = _state(spec.filename, directory)
+        if _verified(spec, directory, original):
+            return cache / spec.filename
+        target = cache / temporary
+        # An APFS clone is instant and takes no space; other volumes get a plain copy.
+        if subprocess.run(['/bin/cp', '-c', str(source), str(target)], capture_output=True).returncode:
+            _unlink(temporary, directory)
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+            with source.open('rb') as reader, os.fdopen(fd, 'wb') as writer:
+                shutil.copyfileobj(reader, writer, BLOCK_BYTES)
+        if not _verified(spec, directory, _state(temporary, directory), temporary):
+            raise ValueError('Payload size or SHA-256 does not match ' + key)
+        result = _publish(temporary, spec, cache, directory, original)
+        if spec.size >= RESUMABLE_BYTES:
+            _unlink(_partial_name(spec), directory)
+        return result
+    finally:
+        _unlink(temporary, directory)
+        os.close(directory)
+
+
+def fetch_patch(key, cache=Path('out/downloads'), progress=None) -> Path:
+    """Return a fully verified payload; EXE files are downloaded, never executed.
+
+    progress(received, total) is called at most every PROGRESS_SECONDS and once at the end.
+    Large payloads keep a partial file in the cache and continue it on the next call.
+    """
     if key not in SOURCES:
         raise ValueError('Unknown patch source key')
     spec = SOURCES[key]
@@ -261,6 +418,8 @@ def fetch_patch(key, cache=Path('out/downloads')) -> Path:
     try:
         original = _state(spec.filename, directory)
         if _verified(spec, directory, original):
+            if progress:
+                progress(spec.size, spec.size)
             return cache / spec.filename
         # No browser state, persisted cookie store, proxy credentials or URL log.
         client = urllib.request.build_opener(urllib.request.ProxyHandler({}), HTTPSRedirect(),
@@ -270,7 +429,7 @@ def fetch_patch(key, cache=Path('out/downloads')) -> Path:
             headers['Accept'] = 'application/octet-stream'
         for candidate in _candidates(key, spec, client, headers):
             try:
-                return _download(client, candidate, spec, cache, directory, original)
+                return _download(client, candidate, spec, cache, directory, original, progress)
             except _FAILURES:
                 continue
         raise DownloadError('No verified download available for ' + key) from None
