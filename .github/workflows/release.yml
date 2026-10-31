@@ -48,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          python tools/make_builder.py --version "$VERSION" --output dist --helpers helpers --release
+          python tools/make_builder.py --version "$VERSION" --output dist --helpers helpers
 
       - name: Build disk image
         run: |

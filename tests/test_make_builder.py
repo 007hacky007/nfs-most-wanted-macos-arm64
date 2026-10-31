@@ -46,21 +46,20 @@ class MakeBuilderTests(unittest.TestCase):
                 with self.subTest(suffix=suffix), self.assertRaises(ValueError):
                     make_builder.check_bundle([Path('game/file' + suffix)], root)
 
-    def test_release_requires_helpers(self):
+    def test_every_app_needs_helpers(self):
+        """The Builder's pipeline PATH has no cmake or rustc, so an app without helpers cannot build."""
         with patch.object(make_builder, 'build_binary', side_effect=AssertionError('built')), \
                 redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as exit:
-            make_builder.main(['--version', '1.0.0', '--release'])
-        self.assertNotEqual(exit.exception.code, 0)
-        self.assertIn('--release needs --helpers', err.getvalue())
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             make_builder.main(['--version', '1.0.0'])
+        self.assertNotEqual(exit.exception.code, 0)
+        self.assertIn('--helpers', err.getvalue())
 
     def test_version_must_be_three_numbers(self):
         for version in ('', '1.0', 'v1.2.3', '1.2.3-beta', '../1.2.3', '1.2.3 '):
             with self.subTest(version=version), patch.object(make_builder, 'build_binary',
                                                              side_effect=AssertionError('built')), \
                     redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
-                make_builder.main(['--version', version, '--dev'])
+                make_builder.main(['--version', version, '--helpers', 'helpers'])
             self.assertIn('--version must look like 1.2.3', err.getvalue())
 
     def test_info_plist(self):

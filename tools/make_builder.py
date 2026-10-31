@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Build and assemble NFSMW Builder.app (ad-hoc signed).
 
---release bundles the CI-built helpers (tools/build_helpers.py output) and is what the
-release workflow uses. --dev may leave the helpers out for local testing; such a Builder
-then needs cmake and rustc like ./build.sh.
+--helpers names the tools/build_helpers.py output (innoextract and the RTPatch decoder);
+every app needs it. The Builder runs the pipeline with PATH=/usr/bin:/bin:/usr/sbin:/sbin,
+so an app without helpers could not find cmake or rustc and could never build. For quick
+UI work without helpers, use `swift run --package-path builder NFSMWBuilder` instead.
 """
 import argparse
 from pathlib import Path
@@ -92,10 +93,10 @@ def info_plist(version):
     }
 
 
-def assemble(binary, version, output, root, helper_dir=None):
+def assemble(binary, version, output, root, helper_dir):
     sources = build_sources(root)
     check_bundle(sources, root)
-    verified = helper_tools.load(helper_dir, root) if helper_dir else None
+    helper_tools.load(helper_dir, root)
     app = Path(output) / 'NFSMW Builder.app'
     if app.exists():
         shutil.rmtree(app)
@@ -108,11 +109,10 @@ def assemble(binary, version, output, root, helper_dir=None):
         target = bundled / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(root / rel, target)
-    if verified:
-        (bundled / 'helpers').mkdir()
-        for name in (*helper_tools.NAMES, 'helpers.json'):
-            shutil.copy2(Path(helper_dir) / name, bundled / 'helpers' / name)
-        helper_tools.load(bundled / 'helpers', root)
+    (bundled / 'helpers').mkdir()
+    for name in (*helper_tools.NAMES, 'helpers.json'):
+        shutil.copy2(Path(helper_dir) / name, bundled / 'helpers' / name)
+    helper_tools.load(bundled / 'helpers', root)
     make_icns(root / 'builder/Resources/AppIcon-1024.png', resources / 'AppIcon.icns')
     with open(app / 'Contents/Info.plist', 'wb') as f:
         plistlib.dump(info_plist(version), f)
@@ -125,18 +125,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--version', required=True)
     parser.add_argument('--output', default='dist')
-    parser.add_argument('--helpers', type=Path, help='tools/build_helpers.py output folder')
+    parser.add_argument('--helpers', type=Path, required=True,
+                        help='tools/build_helpers.py output folder (innoextract, rtpatch-decode, helpers.json)')
     parser.add_argument('--scratch-path', type=Path, help='SwiftPM build folder (default builder/.build)')
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument('--release', action='store_true', help='bundle the helpers (required)')
-    mode.add_argument('--dev', action='store_true', help='local test build; helpers optional')
     args = parser.parse_args(argv)
     if not VERSION.fullmatch(args.version):
         parser.error('--version must look like 1.2.3 (from a v1.2.3 tag)')
-    if args.release and not args.helpers:
-        parser.error('--release needs --helpers: a release Builder must bundle innoextract and the decoder')
-    if args.dev and not args.helpers:
-        print('warning: no helpers bundled; this Builder needs cmake and rustc like ./build.sh', file=sys.stderr)
     try:
         app = assemble(build_binary(ROOT, args.scratch_path), args.version, Path(args.output), ROOT, args.helpers)
     except ValueError as error:
