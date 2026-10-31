@@ -36,7 +36,7 @@ What you need for the Builder:
 - An Apple Silicon Mac with macOS 12 or newer. On macOS 11, build from
   Terminal as described below.
 - About 40 GB of free space while the build runs. The finished app is about
-  15 GB; the build files are removed automatically afterwards.
+  16 GB; the build files are removed automatically afterwards.
 - Internet access. The first build downloads 3.36 GB of patches, mostly the
   Most Wanted HQ package; later builds reuse them. If you already have
   `MW_HQ_1.20.9.zip`, choose Use a file I already have.
