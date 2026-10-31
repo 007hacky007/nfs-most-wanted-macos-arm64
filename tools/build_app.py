@@ -101,9 +101,15 @@ def download_failed(key):
     return f'The {name} download did not finish. Check your internet connection, then click Try again.'
 
 
+def no_space(key):
+    """The plain sentence for a download that filled the disk."""
+    return (f'There is not enough free space for the {DOWNLOAD_NAMES.get(key, key)} download. '
+            'Free some space, then click Try again.')
+
+
 def fetch_all(keys, cache):
     """Fetch pinned downloads with one running byte count over all of them."""
-    from patch_sources import SOURCES, DownloadBusy, DownloadError, fetch_patch
+    from patch_sources import SOURCES, DiskFull, DownloadBusy, DownloadError, fetch_patch
     total = sum(SOURCES[key].size for key in keys)
     done, paths = 0, {}
     for key in keys:
@@ -112,6 +118,8 @@ def fetch_all(keys, cache):
                                      progress.download(key, base + got, total))
         except DownloadBusy as error:
             raise RuntimeError(str(error)) from error
+        except DiskFull as error:
+            raise RuntimeError(no_space(key)) from error
         except DownloadError as error:
             print(f'{key}: {error}', file=sys.stderr, flush=True)
             raise RuntimeError(download_failed(key)) from error

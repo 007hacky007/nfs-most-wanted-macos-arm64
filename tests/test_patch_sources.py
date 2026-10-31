@@ -331,6 +331,22 @@ class PatchSourcesTests(unittest.TestCase):
         self.assertEqual(result.read_bytes(), PAYLOAD)
         self.assertEqual([c[0].get_header('Range') for c in client.calls], ['bytes=3-', 'bytes=3-'])
 
+    def test_full_disk_stops_at_once_and_keeps_the_partial(self):
+        import errno
+        self.large()
+        self.cache.mkdir()
+        partial = self.cache / ('.' + self.specs['official-1.3'].filename + '.partial')
+        partial.write_bytes(PAYLOAD[:3])
+        with patch.object(subject._Partial, 'append', side_effect=OSError(errno.ENOSPC, 'No space left on device')):
+            with self.assertRaises(subject.DiskFull):
+                _, client = self.fetch('official-1.3', [self.ranged(3), AssertionError('no second mirror')])
+        self.assertEqual(partial.read_bytes(), PAYLOAD[:3])
+        small = Response(PAYLOAD)
+        with patch.object(subject.os, 'fsync', side_effect=OSError(errno.ENOSPC, 'No space left on device')):
+            with self.assertRaises(subject.DiskFull):
+                self.fetch('widescreen', [small])
+        self.assertNotIn(self.specs['widescreen'].filename, self.entries())
+
     def test_locked_partial_fails_before_any_request(self):
         import fcntl
         partial = self.large()

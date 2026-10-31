@@ -1,5 +1,6 @@
 """Fetch pinned public patch payloads into a verified local cache."""
 from dataclasses import dataclass
+import errno
 import hashlib
 import html.parser
 import http.client
@@ -281,6 +282,10 @@ def _partial_name(spec):
     return '.' + spec.filename + '.partial'
 
 
+class DiskFull(DownloadError):
+    """The cache volume ran out of space; another mirror would not help."""
+
+
 class DownloadBusy(DownloadError):
     """Another process holds the partial download of the same payload."""
 
@@ -475,7 +480,9 @@ def fetch_patch(key, cache=Path('out/downloads'), progress=None) -> Path:
             for candidate in _candidates(key, spec, client, headers):
                 try:
                     return _download(client, candidate, spec, cache, directory, original, progress, partial)
-                except _FAILURES:
+                except _FAILURES as error:
+                    if isinstance(error, OSError) and error.errno == errno.ENOSPC:
+                        raise DiskFull('Not enough free space to download ' + spec.filename) from None
                     continue
         finally:
             if partial is not None:

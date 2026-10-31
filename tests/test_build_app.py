@@ -161,6 +161,14 @@ class BuildEventTests(unittest.TestCase):
         self.assertEqual(event, {'error': str(failure.exception), 'log': None})
         self.assertIn('WidescreenFix download did not finish', self.build_app.download_failed('widescreen'))
 
+    def test_full_disk_during_download_says_so(self):
+        import patch_sources
+        with patch('patch_sources.fetch_patch', side_effect=patch_sources.DiskFull('Not enough free space')), \
+                self.assertRaises(RuntimeError) as failure:
+            self.build_app.fetch_all(('mw-hq',), self.root)
+        self.assertEqual(str(failure.exception), 'There is not enough free space for the Most Wanted HQ download. '
+                                                 'Free some space, then click Try again.')
+
     def test_preparation_step_failure_names_its_log(self):
         import progress
         from tools import prepare_public_hq
