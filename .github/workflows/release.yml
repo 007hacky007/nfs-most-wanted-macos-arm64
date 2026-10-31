@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install -r requirements.txt dmgbuild==1.6.7
+
+      - name: Test
+        run: |
+          set -euo pipefail
+          python tools/run_ci_tests.py
+          swift test --package-path builder
+
+      # Boost and xz are built from pinned sources for macOS 12; reuse them while
+      # tools/build_helpers.py (which holds the pins and flags) is unchanged.
+      - uses: actions/cache@v4
+        with:
+          path: out/helpers-work/deps
+          key: helpers-deps-${{ runner.os }}-${{ hashFiles('tools/build_helpers.py') }}
+
+      - name: Build helpers
+        run: |
+          set -euo pipefail
+          python tools/build_helpers.py --output helpers --work out/helpers-work
+
+      - name: Build app
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          python tools/make_builder.py --version "$VERSION" --output dist --helpers helpers --release
+
+      - name: Build disk image
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          dmgbuild -s builder/dmg/settings.py -D app="dist/NFSMW Builder.app" "NFSMW Builder $VERSION" dist/NFSMW-Builder.dmg
+          (cd dist && shasum -a 256 NFSMW-Builder.dmg > NFSMW-Builder.dmg.sha256)
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/NFSMW-Builder.dmg dist/NFSMW-Builder.dmg.sha256 --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/NFSMW-Builder.dmg dist/NFSMW-Builder.dmg.sha256 \
+              --title "NFSMW Builder $VERSION" --generate-notes
+          fi
