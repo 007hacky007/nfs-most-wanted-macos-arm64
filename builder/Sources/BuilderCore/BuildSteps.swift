@@ -1,9 +1,12 @@
 import Foundation
 
 /// The `--progress` step ids of tools/build_app.py in order, with progress bar weights (sum 100).
+/// Measured end-to-end on an M1 Pro with the downloads cached (21 minutes): hq 248 s, bootstrap
+/// 207 s, two runtime rounds 380 s, final 189 s, package 83 s, translate 59 s, the rest under a
+/// minute each. `downloads` stands for the 3.34 GB first download at a typical connection.
 public let buildSteps: [(id: String, weight: Double)] = [
-    ("check", 2), ("downloads", 8), ("tools", 1), ("game", 6), ("patches", 2), ("hq", 8), ("variants", 6),
-    ("translate", 12), ("audio", 2), ("modules", 8), ("bootstrap", 10), ("runtime", 20), ("final", 10),
+    ("check", 1), ("downloads", 15), ("tools", 1), ("game", 2), ("patches", 1), ("hq", 17), ("variants", 2),
+    ("translate", 4), ("audio", 1), ("modules", 3), ("bootstrap", 14), ("runtime", 22), ("final", 12),
     ("package", 5),
 ]
 

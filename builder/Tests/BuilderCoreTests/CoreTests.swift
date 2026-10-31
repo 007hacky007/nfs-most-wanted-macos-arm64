@@ -73,11 +73,11 @@ final class CoreTests: XCTestCase {
 
     func testProgress() {
         XCTAssertEqual(progressFraction(atStart: "check"), 0)
-        XCTAssertEqual(progressFraction(atStart: "translate")!, 0.33, accuracy: 0.001)
+        XCTAssertEqual(progressFraction(atStart: "translate")!, 0.39, accuracy: 0.001)
         XCTAssertEqual(progressFraction(atStart: "package")!, 0.95, accuracy: 0.001)
         XCTAssertNil(progressFraction(atStart: "unknown"))
-        XCTAssertEqual(progressFraction(step: "downloads", within: 0.5)!, 0.06, accuracy: 0.001)
-        XCTAssertEqual(progressFraction(step: "downloads", within: 7)!, 0.10, accuracy: 0.001)
+        XCTAssertEqual(progressFraction(step: "downloads", within: 0.5)!, 0.085, accuracy: 0.001)
+        XCTAssertEqual(progressFraction(step: "downloads", within: 7)!, 0.16, accuracy: 0.001)
         XCTAssertNil(progressFraction(step: "setup", within: 0.5))
         XCTAssertEqual(buildSteps.reduce(0) { $0 + $1.weight }, 100)
         XCTAssertEqual(Set(buildStepNames.keys), Set(buildSteps.map(\.id)))
@@ -85,17 +85,17 @@ final class CoreTests: XCTestCase {
 
     func testDiskSpaceNamesTheShortVolume() {
         let gb: Int64 = 1_000_000_000
-        XCTAssertEqual(diskSpaceCheck(workspaceAvailable: 41_200_000_000, workspaceVolume: "Macintosh HD",
+        XCTAssertEqual(diskSpaceCheck(workspaceAvailable: 31_200_000_000, workspaceVolume: "Macintosh HD",
                                       destinationAvailable: 500 * gb, destinationVolume: "Games",
                                       sameVolume: false, cachedBytes: 0),
-                       .blocked("Only 41.2 GB free on Macintosh HD, 65.0 GB needed during the build"))
-        XCTAssertTrue(diskSpaceCheck(workspaceAvailable: 62 * gb, workspaceVolume: "Macintosh HD",
-                                     destinationAvailable: 62 * gb, destinationVolume: "Macintosh HD",
+                       .blocked("Only 31.2 GB free on Macintosh HD, 40.0 GB needed during the build"))
+        XCTAssertTrue(diskSpaceCheck(workspaceAvailable: 37 * gb, workspaceVolume: "Macintosh HD",
+                                     destinationAvailable: 37 * gb, destinationVolume: "Macintosh HD",
                                      sameVolume: true, cachedBytes: 3_400_000_000).isReady)
         XCTAssertEqual(diskSpaceCheck(workspaceAvailable: 100 * gb, workspaceVolume: "Macintosh HD",
                                       destinationAvailable: 10 * gb, destinationVolume: "Games",
                                       sameVolume: false, cachedBytes: 0),
-                       .blocked("Only 10.0 GB free on Games, 16.0 GB needed for NFSMW.app"))
+                       .blocked("Only 10.0 GB free on Games, 18.0 GB needed for NFSMW.app"))
         XCTAssertTrue(diskSpaceCheck(workspaceAvailable: 100 * gb, workspaceVolume: "Macintosh HD",
                                      destinationAvailable: 10 * gb, destinationVolume: "Macintosh HD",
                                      sameVolume: true, cachedBytes: 0).isReady)
