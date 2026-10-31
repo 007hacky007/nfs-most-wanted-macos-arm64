@@ -47,7 +47,9 @@ final class BuilderModel: ObservableObject {
     @Published var cleaningUp = false
     @Published var downloadsRemoved = false
     @Published var failureLogFile: String?
+    /// Files a cancelled, failed or not installed build left in the workspace.
     @Published var buildFilesBytes: Int64 = 0
+    @Published var removingBuildFiles = false
 
     let paths = BuilderPaths()
     let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0-dev"
@@ -106,6 +108,7 @@ final class BuilderModel: ObservableObject {
         states[.mac] = macCheck(isAppleSilicon: Self.isAppleSilicon, version: ProcessInfo.processInfo.operatingSystemVersion)
         states[.destination] = destinationCheck(destination)
         refreshDiskSpace()
+        if workspaceReady && !removingBuildFiles { refreshBuildFiles() }
         refreshCommandLineTools()
         refreshBuildTools()
     }
@@ -143,7 +146,8 @@ final class BuilderModel: ObservableObject {
             states[.diskSpace] = .blocked("Could not read the free space on this disk")
             return
         }
-        states[.diskSpace] = diskSpaceCheck(workspaceAvailable: available, workspaceVolume: workspace.name,
+        // Leftover build files are removed before the next build starts, so they count as free.
+        states[.diskSpace] = diskSpaceCheck(workspaceAvailable: available + buildFilesBytes, workspaceVolume: workspace.name,
                                             destinationAvailable: destinationAvailable, destinationVolume: target.name,
                                             sameVolume: sameVolume(paths.support, destination),
                                             cachedBytes: downloadsStatus?.cachedBytes ?? 0)

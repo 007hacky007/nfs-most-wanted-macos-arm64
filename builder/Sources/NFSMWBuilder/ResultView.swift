@@ -95,7 +95,8 @@ struct ResultView: View {
                     Button("Which copy works?") { model.showingWhichCopy = true }
                 }
                 if model.buildFilesBytes > 0 {
-                    Button("Remove build files (\(gigabytes(model.buildFilesBytes)))", action: model.removeBuildFilesAfterFailure)
+                    Button("Remove build files (\(gigabytes(model.buildFilesBytes)))", action: model.removeBuildFilesNow)
+                        .disabled(model.removingBuildFiles)
                 }
                 Spacer()
                 Button("Try again", action: model.tryAgain)

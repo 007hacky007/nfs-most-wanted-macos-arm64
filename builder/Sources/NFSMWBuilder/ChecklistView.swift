@@ -64,6 +64,9 @@ struct ChecklistView: View {
                     RowButton(label: "Choose...", action: chooseGame)]
         case (.destination, _):
             return [RowButton(label: "Change...", action: chooseDestination)]
+        case (.diskSpace, _) where model.buildFilesBytes > 0 && !model.removingBuildFiles:
+            return [RowButton(label: "Remove build files (\(gigabytes(model.buildFilesBytes)))",
+                              action: model.removeBuildFilesNow)]
         default:
             return []
         }

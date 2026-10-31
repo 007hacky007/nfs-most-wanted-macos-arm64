@@ -11,7 +11,7 @@ extension BuilderModel {
         }
         gameRunner?.cancel()
         statusRunner?.cancel()
-        (buildLog, pendingLog, buildStep, buildStepTitle, buildFraction) = ([], [], "", "", 0)
+        (buildLog, pendingLog, buildStep, buildStepTitle, buildFraction) = ([], [], "", "Removing old build files...", 0)
         (buildError, builtApp, failureLogFile, installProgress, freedBytes) = (nil, nil, nil, nil, nil)
         (userCancelled, cancelDisabled, downloadsRemoved) = (false, false, false)
         downloadBytes = nil
@@ -20,6 +20,23 @@ extension BuilderModel {
         buildStarted = Date()
         phase = .building
         beginActivity("Building NFSMW.app")
+        // Nothing from an earlier, cancelled or failed build is reused; clear it so it cannot
+        // add to the peak (the Disk row counts these files as free).
+        let (paths, version) = (paths, version)
+        background({ removeBuildFiles(paths, version: version) }, then: { [self] in
+            buildFilesBytes = 0
+            guard !shuttingDown else { return }
+            if userCancelled {
+                phase = .checklist
+                endActivity()
+                return refresh()
+            }
+            startBuild()
+        })
+    }
+
+    private func startBuild() {
+        buildStepTitle = ""
         let runner = PipelineRunner.build(paths: paths, version: version, game: gamePaths)
         buildRunner = runner
         run(runner, onEvent: { [self] event in
@@ -52,10 +69,13 @@ extension BuilderModel {
             buildRunner = nil
             flushLog()
             if status != 0 { appendLog("The build exited with status \(status).") }
-            if userCancelled || shuttingDown {
+            if shuttingDown { return }
+            if userCancelled {
                 phase = .checklist
                 checkedGame = nil
-                return refresh()
+                refresh()
+                // A cancelled build leaves tens of GB that the next build would not reuse.
+                return removeBuildFilesNow()
             }
             if status == 0, buildError == nil, let built = builtApp {
                 install(built)
@@ -67,11 +87,12 @@ extension BuilderModel {
     }
 
     func cancelBuild() {
-        guard let runner = buildRunner else { return }
+        guard phase == .building, !cancelDisabled else { return }
         userCancelled = true
         cancelDisabled = true
         appendLog("Cancelling...")
-        runner.cancel()
+        // Before the pipeline starts (old build files are still being removed) the flag is enough.
+        buildRunner?.cancel()
     }
 
     /// Retries only the install of an already built app, after the user quit NFSMW.
@@ -80,7 +101,8 @@ extension BuilderModel {
         install(built)
     }
 
-    /// Leaves the "NFSMW is running" screen; the built app stays in the workspace for the next try.
+    /// Leaves the "NFSMW is running" screen. The built app stays in the workspace; the checklist
+    /// offers Remove build files for it.
     func backToChecklist() {
         guard case .quitToInstall = phase else { return }
         phase = .checklist
@@ -143,9 +165,9 @@ extension BuilderModel {
     }
 
     private func fail(step: String, message: String) {
-        buildFilesBytes = buildFilesSize(paths, version: version)
         phase = .failed(step: step, message: Self.plain(message))
         endActivity()
+        refreshBuildFiles()
     }
 
     func tryAgain() {
@@ -154,10 +176,25 @@ extension BuilderModel {
         refresh()
     }
 
-    func removeBuildFilesAfterFailure() {
+    /// Removes what a cancelled, failed or not yet installed build left in the workspace
+    /// (renamed aside first, so a quit during the delete leaves nothing half removed).
+    func removeBuildFilesNow() {
+        guard buildRunner == nil, !removingBuildFiles else { return }
+        removingBuildFiles = true
         let (paths, version) = (paths, version)
         background({ removeBuildFiles(paths, version: version) }, then: { [self] in
-            buildFilesBytes = buildFilesSize(paths, version: version)
+            removingBuildFiles = false
+            refreshBuildFiles()
+        })
+    }
+
+    /// Measures the leftover build files off the main queue, then updates the Disk row.
+    func refreshBuildFiles() {
+        let (paths, version) = (paths, version)
+        var size: Int64 = 0
+        background({ size = buildFilesSize(paths, version: version) }, then: { [self] in
+            buildFilesBytes = size
+            refreshDiskSpace()
         })
     }
 
