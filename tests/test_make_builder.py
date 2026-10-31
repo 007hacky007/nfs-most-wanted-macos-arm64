@@ -49,11 +49,19 @@ class MakeBuilderTests(unittest.TestCase):
     def test_release_requires_helpers(self):
         with patch.object(make_builder, 'build_binary', side_effect=AssertionError('built')), \
                 redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as exit:
-            make_builder.main(['--version', '1.0', '--release'])
+            make_builder.main(['--version', '1.0.0', '--release'])
         self.assertNotEqual(exit.exception.code, 0)
         self.assertIn('--release needs --helpers', err.getvalue())
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            make_builder.main(['--version', '1.0'])
+            make_builder.main(['--version', '1.0.0'])
+
+    def test_version_must_be_three_numbers(self):
+        for version in ('', '1.0', 'v1.2.3', '1.2.3-beta', '../1.2.3', '1.2.3 '):
+            with self.subTest(version=version), patch.object(make_builder, 'build_binary',
+                                                             side_effect=AssertionError('built')), \
+                    redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+                make_builder.main(['--version', version, '--dev'])
+            self.assertIn('--version must look like 1.2.3', err.getvalue())
 
     def test_info_plist(self):
         info = make_builder.info_plist('1.2.0')

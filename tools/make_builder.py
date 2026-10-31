@@ -24,6 +24,7 @@ BUNDLE_ID = 'local.nfsmw.builder'
 # Game files, patch archives and disc images never go into the bundle.
 FORBIDDEN_SUFFIXES = ('.exe', '.dll', '.asi', '.bun', '.lzc', '.big', '.zip', '.iso', '.bin', '.cue', '.cab')
 MAX_FILE_BYTES = 2 * 1024 * 1024
+VERSION = re.compile(r'\d+\.\d+\.\d+')
 
 
 def build_sources(root):
@@ -130,6 +131,8 @@ def main(argv=None):
     mode.add_argument('--release', action='store_true', help='bundle the helpers (required)')
     mode.add_argument('--dev', action='store_true', help='local test build; helpers optional')
     args = parser.parse_args(argv)
+    if not VERSION.fullmatch(args.version):
+        parser.error('--version must look like 1.2.3 (from a v1.2.3 tag)')
     if args.release and not args.helpers:
         parser.error('--release needs --helpers: a release Builder must bundle innoextract and the decoder')
     if args.dev and not args.helpers:

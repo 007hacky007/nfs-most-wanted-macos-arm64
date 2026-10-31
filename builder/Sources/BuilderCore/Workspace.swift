@@ -21,8 +21,17 @@ public struct BuilderPaths {
     public var python: URL { support.appendingPathComponent("python") }
     public var pythonExecutable: URL { python.appendingPathComponent("bin/python3") }
 
+    /// The folder name for a version. A malformed version (empty, a path, hidden) never maps
+    /// onto the support folder itself, the private Python or another folder.
+    public static func folderName(version: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".-+"))
+        let valid = !version.isEmpty && !version.hasPrefix(".") && version != "python"
+            && version.unicodeScalars.allSatisfy(allowed.contains)
+        return valid ? version : "unknown-version"
+    }
+
     public func workspace(version: String) -> URL {
-        support.appendingPathComponent(version)
+        support.appendingPathComponent(Self.folderName(version: version))
     }
 
     public func venvPython(version: String) -> URL {
@@ -145,7 +154,7 @@ public func sweepOldWorkspaces(_ paths: BuilderPaths, keeping version: String,
         let dir = paths.support.appendingPathComponent(name)
         let leftover = name.hasPrefix(".trash-") || (name.hasPrefix(".") && name.contains(".tmp-"))
         if !leftover {
-            guard !name.hasPrefix("."), name != version,
+            guard !name.hasPrefix("."), name != BuilderPaths.folderName(version: version),
                   let marker = try? String(contentsOf: dir.appendingPathComponent(versionMarker), encoding: .utf8),
                   marker != version, !isLocked(dir) else { continue }
         }

@@ -294,6 +294,15 @@ final class EnvironmentTests: XCTestCase {
         try removeQuarantine(at: dir)
     }
 
+    func testMalformedVersionNeverNamesTheSupportFolder() {
+        let paths = BuilderPaths(support: URL(fileURLWithPath: "/s"))
+        for version in ["", ".", "..", "../x", "a/b", "python", ".hidden"] {
+            XCTAssertEqual(paths.workspace(version: version).path, "/s/unknown-version", version)
+        }
+        XCTAssertEqual(paths.workspace(version: "1.2.0").path, "/s/1.2.0")
+        XCTAssertEqual(paths.workspace(version: "0.0.0-dev").path, "/s/0.0.0-dev")
+    }
+
     func testWorkspaceIsExcludedFromBackup() throws {
         let src = tmp.appendingPathComponent("src"), support = tmp.appendingPathComponent("support")
         try write("x", to: src.appendingPathComponent("build.sh"))
