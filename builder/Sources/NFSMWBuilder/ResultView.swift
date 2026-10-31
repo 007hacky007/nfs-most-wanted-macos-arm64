@@ -94,6 +94,10 @@ struct ResultView: View {
                 if model.gameReport.map({ !$0.ok }) == true {
                     Button("Which copy works?") { model.showingWhichCopy = true }
                 }
+                if model.buildStep == "downloads" {
+                    Button("Open the download page") { NSWorkspace.shared.open(BuilderModel.hqPage) }
+                        .help("Download MW_HQ_1.20.9.zip in your browser, then choose Use a file I already have...")
+                }
                 if model.buildFilesBytes > 0 {
                     Button("Remove build files (\(gigabytes(model.buildFilesBytes)))", action: model.removeBuildFilesNow)
                         .disabled(model.removingBuildFiles)

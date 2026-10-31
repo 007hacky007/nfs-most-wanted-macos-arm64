@@ -5,6 +5,7 @@ Runs from the workspace .venv Python. Every failure, expected or not, ends with 
 {"error": ...} event and a nonzero exit status. check-game never writes anywhere.
 """
 import argparse
+import errno
 from pathlib import Path
 import signal
 import sys
@@ -18,6 +19,8 @@ import patch_sources  # noqa: E402
 from progress import emit  # noqa: E402
 
 NOT_HQ = 'This is not MW_HQ_1.20.9.zip: its size or checksum is different.'
+NO_SPACE = ('There is not enough free space to copy MW_HQ_1.20.9.zip (3.34 GB) into the download cache. '
+            'Free some space, then try again.')
 SMALL_BYTES = patch_sources.RESUMABLE_BYTES
 
 
@@ -71,6 +74,10 @@ def run(args):
             patch_sources.import_patch(args.key, chosen, cache)
         except ValueError:
             raise ValueError(NOT_HQ) from None
+        except OSError as error:
+            if error.errno == errno.ENOSPC:
+                raise OSError(NO_SPACE) from None
+            raise
         emit({'downloads': 'ready'})
     return 0
 

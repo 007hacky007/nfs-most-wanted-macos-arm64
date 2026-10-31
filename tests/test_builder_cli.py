@@ -104,6 +104,14 @@ class BuilderCliTests(unittest.TestCase):
         self.assertEqual((status, found[-1]), (0, {'downloads': 'ready'}))
         self.assertEqual(list(source.parent.iterdir()), [source])
 
+    def test_import_on_a_full_disk_says_so(self):
+        import errno
+        source = self.root / 'MW_HQ_1.20.9.zip'
+        source.write_bytes(self.payload('mw-hq'))
+        with patch.object(self.sources, 'import_patch', side_effect=OSError(errno.ENOSPC, 'No space left on device')):
+            status, found = self.call('downloads', 'import', 'mw-hq', str(source), '--cache-dir', str(self.root / 'c'))
+        self.assertEqual((status, found[-1]), (1, {'error': self.cli.NO_SPACE}))
+
     def test_fetch_reports_bytes_then_ready(self):
         def fetch(key, cache, progress=None):
             progress(1, 2)
