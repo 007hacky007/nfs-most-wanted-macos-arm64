@@ -1,7 +1,9 @@
 # dmgbuild settings for the NFSMW Builder disk image.
 # Usage: dmgbuild -s builder/dmg/settings.py -D app="dist/NFSMW Builder.app" \
 #   "NFSMW Builder <version>" dist/NFSMW-Builder.dmg
+import atexit
 import os
+import shutil
 import subprocess
 import tempfile
 
@@ -11,7 +13,9 @@ app = defines["app"]  # noqa: F821 - provided by dmgbuild
 app_name = os.path.basename(app.rstrip("/"))
 
 # HiDPI background: 1x and 2x PNGs combined into one multi-representation TIFF.
-_tiff = os.path.join(tempfile.mkdtemp(prefix="nfsmw-dmg-"), "background.tiff")
+_tmp = tempfile.mkdtemp(prefix="nfsmw-dmg-")
+atexit.register(shutil.rmtree, _tmp, True)  # dmgbuild reads the TIFF before it exits
+_tiff = os.path.join(_tmp, "background.tiff")
 subprocess.check_call([
     "tiffutil", "-cathidpicheck",
     os.path.join(here, "background.png"),
