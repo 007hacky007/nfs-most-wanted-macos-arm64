@@ -4,9 +4,7 @@ Play **Need for Speed Most Wanted (2005)** natively on your Apple Silicon Mac,
 built from your own Windows game copy. NFSMW turns your PC copy of the game
 into a Mac app with native ARM64 code, Metal graphics and CoreAudio sound.
 
-<!-- LAUNCHER SCREENSHOT TO ADD: the repository has no launcher image yet. Capture the
-     NFSMW.app launcher as docs/images/launcher.png and show it here with
-     <p align="center"><img src="docs/images/launcher.png" width="420" alt="NFSMW launcher with resolution and game mode"></p> -->
+<p align="center"><img src="docs/images/launcher.png" width="420" alt="NFSMW launcher with resolution and game mode"></p>
 
 ## What you get
 
