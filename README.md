@@ -112,6 +112,11 @@ everything for a bug report, and **Try again** returns to the checklist.
 
 Open NFSMW.app. Choose a resolution and game mode, then click Play.
 
+The app is self-contained: your game files are inside it, so it needs no game
+folder and keeps working after you move it anywhere. The app itself is never
+written to while you play. If its game files are missing or damaged, it says
+so and quits; build the app again with NFSMW Builder.
+
 Click the title screen to continue. Use arrows and Enter in menus, arrows to
 drive, and Esc to pause. The window close button and Cmd-Q request a normal
 game shutdown.
@@ -200,8 +205,9 @@ includes the 3.34 GB HQ package; the launcher lets you choose whether to use
 its visual assets or full mod behavior. Verified downloads are cached.
 
 When the build finishes, open **`out/NFSMW.app`**. Your verified game copy
-is bundled inside the app, so you can move it to Applications. Choose a
-resolution and game mode, then click Play. Your source copy is preserved.
+is bundled inside the app, so you can move it to Applications or anywhere
+else; it never reads a game folder outside the app. Choose a resolution and
+game mode, then click Play. Your source copy is preserved.
 A failed build preserves the previous app; diagnostic logs remain under `out/`.
 
 Packaging extracts the original Windows icon from your verified `speed.exe`

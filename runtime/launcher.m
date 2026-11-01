@@ -11,13 +11,20 @@ int app_full_hq_supported(void){
 #endif
 }
 
-NSString *launcher_game_folder(NSString *resources,NSString *external,NSString *previous){
-    NSFileManager *files=NSFileManager.defaultManager;
-    if(external.length&&[files fileExistsAtPath:[external stringByAppendingPathComponent:@"speed.exe"]])return external;
+/* The game always runs from the copy inside the app: Contents/Resources/game. */
+NSString *launcher_game_folder(NSString *resources){
+    if(!resources.length)return nil;
     NSString *bundled=[resources stringByAppendingPathComponent:@"game"];
-    if([files fileExistsAtPath:[bundled stringByAppendingPathComponent:@"speed.exe"]])return bundled;
-    return previous;
+    for(NSString *name in @[@"speed.exe",@"d3dx9_26.dll"]){
+        BOOL directory=NO;
+        if(![NSFileManager.defaultManager fileExistsAtPath:[bundled stringByAppendingPathComponent:name] isDirectory:&directory]||directory)
+            return nil;
+    }
+    return bundled;
 }
+
+static NSString *const missing_game=@"The game files inside NFSMW.app are missing or damaged. "
+    "Build the app again with NFSMW Builder.";
 
 int launcher_options(const char *folder,const char *mode,const char *resolution,
                      char *selected,size_t selected_size,char *error,size_t error_size){
@@ -26,7 +33,7 @@ int launcher_options(const char *folder,const char *mode,const char *resolution,
         NSString *root=folder?[NSString stringWithUTF8String:folder]:nil;
         NSString *choice=mode?[NSString stringWithUTF8String:mode]:nil;
         unsigned w=0,h=0;char tail=0;
-        if(!root.length)problem=@"Choose an installed Most Wanted game folder.";
+        if(!root.length)problem=missing_game;
         if(!resolution||sscanf(resolution,"%ux%u%c",&w,&h,&tail)!=2||w<640||h<480||w>8192||h>8192)
             problem=@"Choose a resolution between 640x480 and 8192x8192.";
         if(![@[@"standard",@"visuals",@"full"] containsObject:choice])problem=@"Unknown game mode.";
@@ -46,14 +53,14 @@ int launcher_options(const char *folder,const char *mode,const char *resolution,
             for(NSString *name in @[@"speed.exe",@"d3dx9_26.dll"]){
                 BOOL directory=NO;
                 if(![files fileExistsAtPath:[root stringByAppendingPathComponent:name] isDirectory:&directory]||directory){
-                    problem=@"Choose an installed Most Wanted game folder containing speed.exe and d3dx9_26.dll.";break;
+                    problem=missing_game;break;
                 }
             }
         }
         if(!problem&&root.length){
             int n=snprintf(selected,selected_size,"%s",root.fileSystemRepresentation);
             if(n<0||(size_t)n>=selected_size)problem=@"The installation path is too long.";
-        }else if(!problem)problem=@"Choose an installed Most Wanted game folder.";
+        }else if(!problem)problem=missing_game;
         if(problem){snprintf(error,error_size,"%s",problem.UTF8String);return 0;}
         char value[32];snprintf(value,sizeof value,"%ux%u",w,h);
         setenv("NFSRES",value,1);setenv("NFSMW_MODE",mode,1);
@@ -64,16 +71,14 @@ int launcher_options(const char *folder,const char *mode,const char *resolution,
 
 @interface MWLauncher : NSObject <NSWindowDelegate>
 @property NSWindow *window;
-@property NSTextField *folderLabel,*status;
+@property NSTextField *status;
 @property NSPopUpButton *resolution,*mode;
 @property NSButton *playButton;
 @property NSString *folder,*selected;
-@property BOOL externalFolder;
 @end
 
 @implementation MWLauncher
 - (void)refresh{
-    self.folderLabel.stringValue=self.folder.length?self.folder.lastPathComponent:@"No game folder selected";
     NSArray *modes=@[@"standard",@"visuals",@"full"];
     char selected[4096],error[1024];
     BOOL valid=launcher_options(self.folder.fileSystemRepresentation,
@@ -82,14 +87,6 @@ int launcher_options(const char *folder,const char *mode,const char *resolution,
                                selected,sizeof selected,error,sizeof error);
     self.playButton.enabled=valid;
     self.status.stringValue=valid?@"Official 1.3 and native widescreen support. Each mode has separate saves.":[NSString stringWithUTF8String:error];
-}
-- (void)chooseFolder:(id)sender{
-    (void)sender;
-    NSOpenPanel *panel=[NSOpenPanel openPanel];panel.canChooseDirectories=YES;panel.canChooseFiles=NO;
-    panel.allowsMultipleSelection=NO;panel.prompt=@"Choose";
-    panel.message=@"Select the installed Most Wanted game folder.";
-    if(self.folder.length)panel.directoryURL=[NSURL fileURLWithPath:self.folder isDirectory:YES];
-    if([panel runModal]==NSModalResponseOK){self.folder=panel.URL.path;self.externalFolder=YES;[self refresh];}
 }
 - (void)changed:(id)sender{(void)sender;[self refresh];}
 - (void)play:(id)sender{
@@ -100,8 +97,6 @@ int launcher_options(const char *folder,const char *mode,const char *resolution,
         self.status.stringValue=[NSString stringWithUTF8String:error];return;
     }
     NSUserDefaults *prefs=NSUserDefaults.standardUserDefaults;
-    [prefs setObject:self.folder forKey:@"GameFolder"];
-    if(self.externalFolder)[prefs setObject:self.folder forKey:@"ExternalGameFolder"];
     [prefs setObject:mode forKey:@"GameMode"];
     [prefs setObject:self.resolution.titleOfSelectedItem forKey:@"Resolution"];
     self.selected=[NSString stringWithUTF8String:selected];[NSApp stopModalWithCode:NSModalResponseOK];
@@ -116,21 +111,23 @@ static NSTextField *label(NSString *text,NSRect rect,NSView *view){
 
 NSString *launcher_choose_game(void){
     [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-    MWLauncher *controller=[MWLauncher new];NSUserDefaults *prefs=NSUserDefaults.standardUserDefaults;
-    NSString *external=[prefs stringForKey:@"ExternalGameFolder"];
-    controller.folder=launcher_game_folder(NSBundle.mainBundle.resourcePath,external,[prefs stringForKey:@"GameFolder"]);
-    controller.externalFolder=external.length&&[controller.folder isEqualToString:external];
-    controller.window=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,560,330)
+    NSUserDefaults *prefs=NSUserDefaults.standardUserDefaults;
+    /* Older launchers remembered a game folder outside the app; never use it again. */
+    [prefs removeObjectForKey:@"GameFolder"];[prefs removeObjectForKey:@"ExternalGameFolder"];
+    NSString *folder=launcher_game_folder(NSBundle.mainBundle.resourcePath);
+    if(!folder){
+        NSAlert *alert=[NSAlert new];alert.alertStyle=NSAlertStyleCritical;
+        alert.messageText=@"Most Wanted could not start";alert.informativeText=missing_game;
+        [alert addButtonWithTitle:@"Quit"];[NSApp activateIgnoringOtherApps:YES];[alert runModal];
+        return nil;
+    }
+    MWLauncher *controller=[MWLauncher new];controller.folder=folder;
+    controller.window=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,560,284)
         styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable backing:NSBackingStoreBuffered defer:NO];
     controller.window.title=@"Most Wanted Launcher";controller.window.releasedWhenClosed=NO;
     controller.window.delegate=controller;NSView *view=controller.window.contentView;
-    NSTextField *title=label(@"Need for Speed Most Wanted",NSMakeRect(24,275,500,28),view);
+    NSTextField *title=label(@"Need for Speed Most Wanted",NSMakeRect(24,229,500,28),view);
     title.font=[NSFont boldSystemFontOfSize:21];
-    label(@"Game files",NSMakeRect(24,233,105,22),view);
-    controller.folderLabel=label(@"",NSMakeRect(135,233,295,22),view);
-    controller.folderLabel.lineBreakMode=NSLineBreakByTruncatingMiddle;
-    NSButton *browse=[NSButton buttonWithTitle:@"Choose..." target:controller action:@selector(chooseFolder:)];
-    browse.frame=NSMakeRect(440,230,100,28);[view addSubview:browse];
     label(@"Resolution",NSMakeRect(24,187,105,22),view);
     controller.resolution=[[NSPopUpButton alloc] initWithFrame:NSMakeRect(130,184,405,28) pullsDown:NO];
     NSMutableArray *sizes=[@[@"640x480",@"800x600",@"1024x768",@"1280x720",@"1280x800",@"1280x960",@"1440x900",@"1600x900",@"1680x1050",@"1920x1080",@"1920x1200",@"2560x1440",@"2560x1600",@"3840x2160"] mutableCopy];

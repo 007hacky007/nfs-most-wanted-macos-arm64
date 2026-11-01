@@ -7,30 +7,42 @@ import unittest
 
 
 class LauncherTests(unittest.TestCase):
-    def test_packaged_game_is_selected_without_a_previous_development_path(self):
+    def test_only_the_game_inside_the_app_is_used(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);resources=root/'Resources';bundled=resources/'game'
             bundled.mkdir(parents=True);(bundled/'speed.exe').write_bytes(b'test')
-            external=root/'external';external.mkdir();(external/'speed.exe').write_bytes(b'test')
+            partial=root/'Partial';(partial/'game').mkdir(parents=True);(partial/'game/speed.exe').write_bytes(b'test')
+            (bundled/'d3dx9_26.dll').write_bytes(b'test')
+            broken=root/'Broken';(broken/'game/speed.exe').mkdir(parents=True);(broken/'game/d3dx9_26.dll').write_bytes(b'test')
             source=root/'probe.m'
             source.write_text('''#import <Foundation/Foundation.h>
 #include <assert.h>
-NSString *launcher_game_folder(NSString *,NSString *,NSString *);
+NSString *launcher_game_folder(NSString *);
 int main(int argc,char **argv){@autoreleasepool{
- NSString *r=@(argv[1]),*e=@(argv[2]),*old=@"obsolete-development-install";
- assert([launcher_game_folder(r,nil,old) isEqualToString:[r stringByAppendingPathComponent:@"game"]]);
- assert([launcher_game_folder(r,e,old) isEqualToString:e]);
- assert([launcher_game_folder(r,@"missing-external",old) isEqualToString:[r stringByAppendingPathComponent:@"game"]]);
- assert([launcher_game_folder(@"missing-resources",nil,old) isEqualToString:old]);
+ NSString *r=@(argv[1]);
+ assert([launcher_game_folder(r) isEqualToString:[r stringByAppendingPathComponent:@"game"]]);
+ assert(!launcher_game_folder(@(argv[2])));
+ assert(!launcher_game_folder(@(argv[3])));
+ assert(!launcher_game_folder(@"missing-resources"));
+ assert(!launcher_game_folder(nil));
  }return 0;}
 ''')
             binary=root/'probe'
             subprocess.run(['clang','-fobjc-arc',str(source),'runtime/launcher.m',
                             '-framework','Cocoa','-o',str(binary)],check=True,capture_output=True)
-            subprocess.run([str(binary),str(resources),str(external)],check=True,capture_output=True)
+            subprocess.run([str(binary),str(resources),str(partial),str(broken)],check=True,capture_output=True)
+
+    def test_launcher_has_no_folder_chooser_or_saved_game_path(self):
+        source=Path('runtime/launcher.m').read_text()
+        for gone in ('NSOpenPanel','chooseFolder','Choose...','setObject:self.folder'):
+            self.assertNotIn(gone,source)
+        self.assertIn('removeObjectForKey:@"GameFolder"',source)
+        self.assertIn('removeObjectForKey:@"ExternalGameFolder"',source)
 
     @unittest.skipUnless(os.environ.get('NFSMW_TEST_GUI'), 'set NFSMW_TEST_GUI for the visible Cocoa launcher test')
     def test_visible_launcher_controls(self):
+        # Outside a bundle NSBundle.mainBundle.resourcePath is the probe's folder, so root/game
+        # stands in for Contents/Resources/game.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             game = root / 'game'
@@ -43,8 +55,18 @@ int main(int argc,char **argv){@autoreleasepool{
             subprocess.run(['clang', '-fobjc-arc', '-DNFS_HQ_MODULES=1', 'tests/launcher_gui.m', 'runtime/launcher.m', '-framework', 'Cocoa', '-o', str(binary)], check=True, capture_output=True)
             capture = Path('out/launcher.png').resolve()
             capture.parent.mkdir(exist_ok=True)
-            subprocess.run([str(binary), str(game), str(capture)], check=True, timeout=30, capture_output=True)
+            subprocess.run([str(binary), 'bundled', str(capture)], check=True, timeout=30, capture_output=True)
             self.assertTrue(capture.is_file())
+
+    @unittest.skipUnless(os.environ.get('NFSMW_TEST_GUI'), 'set NFSMW_TEST_GUI for the visible Cocoa launcher test')
+    def test_missing_bundled_game_explains_and_quits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'game').mkdir()
+            (root / 'game/d3dx9_26.dll').write_bytes(b'test')
+            binary = root / 'probe'
+            subprocess.run(['clang', '-fobjc-arc', '-DNFS_HQ_MODULES=1', 'tests/launcher_gui.m', 'runtime/launcher.m', '-framework', 'Cocoa', '-o', str(binary)], check=True, capture_output=True)
+            subprocess.run([str(binary), 'missing', str(root / 'unused.png')], check=True, timeout=30, capture_output=True)
 
     def test_resolution_mode_validation_and_profile_isolation(self):
         with tempfile.TemporaryDirectory() as tmp:
