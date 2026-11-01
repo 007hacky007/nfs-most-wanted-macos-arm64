@@ -25,6 +25,16 @@ APP_BUNDLE_ID = 'local.nfsmw.native'
 APP_GAME = ('Contents', 'Resources', 'game')
 APP_GAME_UNUSABLE = ('The game inside {name} is missing or modified, so it cannot be reused. '
                      'Choose your original game copy.')
+APP_GAME_OLD = ('{name} was built by an older NFSMW Builder, which left part of your game copy out of it. '
+                'Choose your original game copy once to build the complete app.')
+# Made again from the original files by every build (tools/install_game.py, tools/hq_variants.py),
+# so a game folder's or an app's own copy is never taken over. Case-folded; a folder covers
+# everything below it.
+DERIVED = ('.nfsmw', 'install-manifest.json', 'scripts/nfsmostwanted.widescreenfix.ini',
+           'scripts/nfsmostwanted.widescreenfix.tpk')
+MACOS_BUNDLES = ('.app', '.framework', '.bundle', '.plugin', '.kext', '.pkg', '.mpkg', '.workflow')
+MACOS_FILES = ('.command', '.tool', '.sh', '.dylib', '.so', '.scpt')
+MACH_O = {bytes.fromhex(magic) for magic in ('feedface', 'cefaedfe', 'feedfacf', 'cffaedfe', 'cafebabe', 'bebafeca')}
 
 
 class AppGameError(ValueError):
@@ -35,10 +45,11 @@ def app_game(path):
     """The game folder inside an NFSMW.app built earlier, or None when `path` is not an app.
 
     An app carries the installed tree: the original files (the seven the official patch
-    replaces already at 1.3) plus everything the build derived from them under .nfsmw,
-    scripts and install-manifest.json. Only the original files are checked and staged,
-    exactly as for an installed game folder; everything derived is built again from them
-    and the pinned downloads, so nothing produced by an older Builder is reused.
+    replaces already at 1.3), the rest of the player's copy (extras) and everything the build
+    derived from them (DERIVED). The original files are checked and staged exactly as for an
+    installed game folder, and the extras against the inventory the build recorded in
+    install-manifest.json; everything derived is built again from them and the pinned
+    downloads, so nothing produced by an older Builder is reused.
     """
     path = Path(path)
     if path.suffix.casefold() != '.app' or path.is_symlink() or not path.is_dir():
@@ -357,8 +368,53 @@ def _extract_discs(images, destination, profile, files, archives):
             with RawISO(cab_image, cab_entry.offset, cab_entry.size) as stream, cabinet.open('wb') as output:
                 shutil.copyfileobj(stream, output, 1 << 20)
             (destination / 'd3dx9_26.dll').write_bytes(extract_cab_member(cabinet, 'd3dx9_26.dll'))
+        extras = _disc_extras(roles, archives, files, destination, seen)
     return [{'role': role, 'archive': archives[role]['path'],
-             'size': archives[role]['size'], 'sha256': archives[role]['sha256']} for role in sorted(roles)]
+             'size': archives[role]['size'], 'sha256': archives[role]['sha256']} for role in sorted(roles)], extras
+
+
+def _disc_extras(roles, archives, files, destination, seen):
+    """Write every other file of the discs into `destination` (AutoRun, DirectX, Support and
+    the other Windows-only extras), less Finder files and macOS code. The four archives stay
+    out: they are the installer's packed copy of the game files, which are in `destination`
+    unpacked. A name on several discs is written once; a different copy on a later disc goes
+    into a folder named after that disc, such as Disc 2/bin.dat. -> the relative paths written."""
+    written, extras = {}, []
+    for role in sorted(roles):
+        image, index, _ = roles[role]
+        for key, item in sorted(index.items()):
+            name = _path(item.name)
+            if key == archives[role]['path'].casefold() or _finder_file(name):
+                continue
+            with RawISO(image, item.offset, item.size) as stream:
+                head = stream.read(4)
+            if _macos_code(name, head):
+                print(f'left out of the app (macOS code): Disc {role + 1}: {name}', flush=True)
+                continue
+            with RawISO(image, item.offset, item.size) as stream:
+                found = _digest(stream)
+            if key in files or key in written:
+                if key in files and files[key]['source'].get('disc_path', '').casefold() == key \
+                        and files[key]['source'].get('role') == role:
+                    continue  # staged as a game file
+                staged = destination / (files[key]['path'] if key in files else written[key])
+                with staged.open('rb') as stream:
+                    if _matches(_digest(stream), found):
+                        continue
+                name = f'Disc {role + 1}/{name}'
+                key = name.casefold()
+            try:
+                _claim(seen, name)
+            except ValueError:
+                print(f'left out of the app (it clashes with a game file): Disc {role + 1}: {name}', flush=True)
+                continue
+            target = destination / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with RawISO(image, item.offset, item.size) as stream, target.open('wb') as output:
+                shutil.copyfileobj(stream, output, 1 << 20)
+            written[key] = name
+            extras.append(name)
+    return extras
 
 
 REQUIRED_RELEASE = ('Need for Speed Most Wanted (2005) for PC, USA English Black Edition (4 CDs), '
@@ -389,6 +445,64 @@ def _layout(sources):
             return ('discs', images) if images else ('none', [])
         return 'folder', [root]
     return 'discs', sources
+
+
+def _finder_file(relative):
+    return any(part == '.DS_Store' or part.startswith('._') or part == '__MACOSX' for part in relative.split('/'))
+
+
+def _derived(key):
+    return any(key == name or key.startswith(name + '/') for name in DERIVED)
+
+
+def _macos_code(relative, head):
+    """No macOS code from the player's copy goes into the app: the game is Windows files only,
+    and a Mac program hidden in a downloaded copy must not end up inside a signed app."""
+    parts = relative.casefold().split('/')
+    return (any(part.endswith(MACOS_BUNDLES) for part in parts[:-1]) or parts[-1].endswith(MACOS_FILES)
+            or head in MACH_O)
+
+
+def _folder_extras(root, available, files, log=False):
+    """Everything in the game folder `root` (its _folder_files() `available`) besides the
+    profiled and derived files: the Windows-only extras of the player's copy, less Finder files
+    and macOS code. -> [(relative, path)]."""
+    extras = []
+    for key, path in sorted(available.items()):
+        relative = _path(path.relative_to(root).as_posix())
+        if key in files or _derived(key) or _finder_file(relative):
+            continue
+        with path.open('rb') as stream:
+            head = stream.read(4)
+        if _macos_code(relative, head):
+            if log:
+                print(f'left out of the app (macOS code): {relative}', flush=True)
+            continue
+        extras.append((relative, path))
+    return extras
+
+
+def _inventory(pairs):
+    """Files, bytes and an aggregate SHA-256 of (relative, path) pairs: sorted case-folded paths,
+    each followed by NUL and the file's raw SHA-256 digest."""
+    aggregate, size, rows = hashlib.sha256(), 0, []
+    for relative, path in pairs:
+        with path.open('rb') as stream:
+            rows.append((relative.casefold(), _digest(stream)))
+    for key, row in sorted(rows):
+        aggregate.update(key.encode('utf-8') + b'\0' + bytes.fromhex(row['sha256']))
+        size += row['size']
+    return {'files': len(rows), 'bytes': size, 'sha256': aggregate.hexdigest()}
+
+
+def _recorded_extras(game):
+    """The extras inventory an app's build recorded, or None (an app from an older Builder)."""
+    try:
+        manifest = json.loads((Path(game) / 'install-manifest.json').read_text())
+        extras = manifest['source']['extras']
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return extras if isinstance(extras, dict) else None
 
 
 def _check_folder(root, files, report, add):
@@ -531,6 +645,13 @@ def check_sources(sources, *, profile=None, limit=20):
         report['kind'] = kind
         if kind == 'folder':
             _check_folder(inputs[0], files, report, add)
+            if report['app']:
+                recorded = _recorded_extras(inputs[0])
+                if recorded is None:
+                    raise AppGameError(APP_GAME_OLD.format(name=report['app']))
+                found = _inventory(_folder_extras(inputs[0], _folder_files(inputs[0]), files))
+                if found != recorded:
+                    raise AppGameError(APP_GAME_UNUSABLE.format(name=report['app']))
         elif kind == 'discs':
             _check_discs(inputs, profile, files, archives, report, add)
             if not report['invalid'] and not report['wrong'] and not report['discs']['missing']:
@@ -557,7 +678,8 @@ def describe(report):
     if report['ok']:
         return report['version'] or 'Supported game copy'
     if report.get('app'):
-        return APP_GAME_UNUSABLE.format(name=report['app'])
+        old = APP_GAME_OLD.format(name=report['app'])
+        return old if old in report['invalid'] else APP_GAME_UNUSABLE.format(name=report['app'])
     prefix = 'This is not the supported game copy. NFSMW Builder needs ' + REQUIRED_RELEASE + '. '
     discs = report.get('discs') or {}
     if report['kind'] == 'none' and not report['invalid']:
@@ -605,7 +727,8 @@ def accepted_copies(profile=None):
 
 
 def stage_game(sources, destination, *, profile=None):
-    """Stage verified payload files into an existing empty caller-owned directory.
+    """Stage verified payload files, and the rest of the copy beside them (its extras, recorded
+    in the returned manifest), into an existing empty caller-owned directory.
 
     The optional checksum profile is for small internal fixtures, not a CLI bypass.
     Failure may leave partial staging files; inputs are always read-only.
@@ -617,6 +740,7 @@ def stage_game(sources, destination, *, profile=None):
     sources = [Path(source) for source in sources]
     if not sources or any(source.is_symlink() for source in sources):
         raise ValueError('supply game sources without symlinks')
+    app_name = sources[0].name if sources else ''
     sources, from_app = _from_app(sources)
     folder = len(sources) == 1 and sources[0].is_dir()
     if folder:
@@ -644,8 +768,29 @@ def stage_game(sources, destination, *, profile=None):
             target = destination / row['path']
             target.parent.mkdir(parents=True, exist_ok=True)
             _clone(source, target)
+        # The rest of the copy goes in as it is (APFS clones keep a download's quarantine).
+        extras, directories = [], _directories(files)
+        for relative, source in _folder_extras(sources[0], available, files, log=True):
+            # In a game folder, under its usual name (GLOBAL, not global), on every file system.
+            parts = relative.split('/')
+            for count in range(len(parts) - 1, 0, -1):
+                known = directories.get('/'.join(parts[:count]).casefold())
+                if known:
+                    relative = '/'.join([known, *parts[count:]])
+                    break
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _clone(source, target)
+            extras.append(relative)
     else:
-        manifest['archives'] = _extract_discs(_images(sources), destination, profile, files, archives)
+        manifest['archives'], extras = _extract_discs(_images(sources), destination, profile, files, archives)
+    manifest['extras'] = _inventory((relative, destination / relative) for relative in extras)
+    if from_app:
+        recorded = _recorded_extras(sources[0])
+        if recorded is None:
+            raise AppGameError(APP_GAME_OLD.format(name=app_name))
+        if recorded != manifest['extras']:
+            raise AppGameError(APP_GAME_UNUSABLE.format(name=app_name))
     for row in files.values():
         staged = destination / row['path']
         if staged.is_file():

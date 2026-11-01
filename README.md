@@ -149,13 +149,16 @@ Open the new Builder and it finds your NFSMW.app (in the destination you used,
 otherwise in Applications) and uses the game inside it, so you do not need
 your discs again. The game row says so and the button reads
 **Update NFSMW.app (old -> new)**. The app keeps your original game files
-next to everything the build made from them; the Builder checks those
-original files exactly like a game folder and makes the rest again from them
-and the pinned downloads, so nothing from the older version is carried over.
+and the rest of your game copy next to everything the build made from them;
+the Builder checks those original files exactly like a game folder, checks
+the rest against the inventory the build recorded in `install-manifest.json`
+and makes everything else again from them and the pinned downloads, so
+nothing from the older version is carried over.
 The old app is only read and stays in place until the new one is complete; on
 the same disk the files are cloned, not copied. If the game inside it is
-missing or modified, the row asks for your original game copy instead. Quit
-NFSMW before you click Update. Saves and settings are kept.
+missing or modified, or the app comes from an earlier Builder that left the
+extras of your copy out, the row asks for your original game copy instead.
+Quit NFSMW before you click Update. Saves and settings are kept.
 
 ## Which game copy works
 
@@ -278,8 +281,17 @@ below explains which files each checksum describes.
 These checks cover the identified edition and files. They do not establish
 support for another release just because it reports the same version number.
 
-Extra saves or configuration files in a supplied installation are not imported.
-The builder copies only recognized game files. A damaged or incompatible
+The app carries the complete game copy. Besides the checked game files,
+everything else in a supplied installation goes in as it is, Windows-only
+extras and mods included. From the discs, every other file on them goes in
+(AutoRun, DirectX, Support and the rest); a file of the same name with other
+contents on a later disc goes into a folder named after that disc, such as
+`Disc 2/bin.dat`. Only the four installer archives stay out, because the
+game files they hold are in the app unpacked, and so do Finder's `.DS_Store`
+files and macOS programs: the game is Windows files only, so a Mac program
+hidden in a downloaded copy never ends up inside the signed app, and the build
+log names each one it leaves out. The files cloned from your copy keep their
+download quarantine; only what the build makes loses it. A damaged or incompatible
 required file stops the build instead of producing a partially patched app.
 
 ## NFSMW Builder internals

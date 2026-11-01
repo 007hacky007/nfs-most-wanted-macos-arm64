@@ -43,6 +43,26 @@ class PackageAppTests(unittest.TestCase):
             subprocess.run(['codesign','--verify','--deep','--strict',str(output)],check=True,capture_output=True)
             self.assertEqual((game/'speed.exe').read_bytes(),b'owned test payload')
 
+    def test_the_whole_game_goes_in_and_its_quarantine_stays(self):
+        """Everything in the installed tree goes in. Files from the player's copy keep their
+        quarantine; Finder info, which codesign --strict refuses, does not come along."""
+        from tools.package_app import package_app
+        with tempfile.TemporaryDirectory()as temporary:
+            binary,game,output=self.fixture(Path(temporary))
+            (game/'DirectX').mkdir();(game/'DirectX/DXSETUP.exe').write_bytes(b'windows extra')
+            (game/'.nfsmw').mkdir();(game/'.nfsmw/runtime.exe').write_bytes(b'derived')
+            mark='0081;00000000;Test;'
+            subprocess.run(['/usr/bin/xattr','-w','com.apple.quarantine',mark,str(game/'DirectX/DXSETUP.exe')],check=True)
+            subprocess.run(['/usr/bin/xattr','-wx','com.apple.FinderInfo','00'*31+'01',str(game/'speed.exe')],check=True)
+            package_app(binary,game,output)
+            bundled=output/'Contents/Resources/game'
+            self.assertEqual(sorted(p.relative_to(bundled).as_posix() for p in bundled.rglob('*') if p.is_file()),
+                             ['.nfsmw/runtime.exe','DirectX/DXSETUP.exe','d3dx9_26.dll','speed.exe'])
+            found=subprocess.run(['/usr/bin/xattr','-p','com.apple.quarantine',str(bundled/'DirectX/DXSETUP.exe')],
+                                 capture_output=True,text=True)
+            self.assertEqual(found.stdout.strip(),mark)
+            subprocess.run(['codesign','--verify','--deep','--strict',str(output)],check=True,capture_output=True)
+
     def test_failed_replacement_and_symlink_inputs_preserve_existing_app(self):
         from tools.package_app import package_app
         with tempfile.TemporaryDirectory()as temporary:

@@ -73,6 +73,17 @@ BUILDER_VERSION_KEY='NFSBuilderVersion'
 VERSION=re.compile(r'[0-9]+(\.[0-9]+){0,3}(-[A-Za-z0-9.]+)?')
 
 
+def copy_game(game,target):
+    """The whole installed tree, as APFS clones where the volume can (else a copy). Extended
+    attributes come along, so a download's quarantine stays on the files from the player's
+    copy; only Finder info and resource forks go, which codesign --strict refuses in a bundle."""
+    if subprocess.run(['/bin/cp','-c','-R',str(game),str(target)],capture_output=True).returncode:
+        shutil.rmtree(target,ignore_errors=True)
+        shutil.copytree(game,target,copy_function=shutil.copyfile)
+    for name in ('com.apple.FinderInfo','com.apple.ResourceFork'):
+        subprocess.run(['/usr/bin/xattr','-dr',name,str(target)],capture_output=True)
+
+
 def package_app(binary,game,output=Path('out/NFSMW.app'),builder_version=None):
     binary,output=Path(binary),Path(output)
     if builder_version is not None and not VERSION.fullmatch(builder_version):
@@ -104,7 +115,7 @@ def package_app(binary,game,output=Path('out/NFSMW.app'),builder_version=None):
         shutil.copyfile(binary,executable);executable.chmod(0o755)
         for relative in ('LICENSE','third_party/nfsu2-web-LICENSE','third_party/WidescreenFix-LICENSE'):
             shutil.copyfile(ROOT/relative,resources/Path(relative).name)
-        shutil.copytree(game,resources/'game',copy_function=shutil.copyfile)
+        copy_game(game,resources/'game')
         info={'CFBundleExecutable':'NFSMW','CFBundleIdentifier':BUNDLE_ID,
               'CFBundleName':'NFSMW','CFBundleDisplayName':'NFSMW',
               'CFBundlePackageType':'APPL','CFBundleVersion':'9','CFBundleShortVersionString':'0.3.6',

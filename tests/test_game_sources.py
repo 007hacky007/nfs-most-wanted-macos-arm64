@@ -87,10 +87,10 @@ class GameSourcesTests(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(data)
         (source / 'scripts').mkdir()
-        (source / 'scripts/mod.asi').write_bytes(b'not copied')
+        (source / 'scripts/mod.asi').write_bytes(b'mod')
         return source
 
-    def discs(self, overrides=None, raw=False):
+    def discs(self, overrides=None, raw=False, extras=None):
         images = []
         for role in range(4):
             row = self.profile['files'][role]
@@ -100,6 +100,7 @@ class GameSourcesTests(unittest.TestCase):
             if role == 0:
                 files.update({name: data for name, data in list(self.payload.items())[4:-1]})
                 files['d3dx.cab'] = b'cab'
+            files.update((extras or {}).get(role, {}))
             image = self.root / f'unnamed-{3-role}.bin'
             logical = iso_bytes(files)
             if raw:
@@ -114,16 +115,23 @@ class GameSourcesTests(unittest.TestCase):
         with patch('tools.game_sources.extract_cab_member', return_value=b'd3dx'):
             return stage_game(sources, destination, profile=self.profile)
 
-    def test_folder_normalizes_expected_paths_and_ignores_mods(self):
+    def test_folder_normalizes_expected_paths_and_keeps_the_rest_of_the_copy(self):
         source = self.folder()
         (source / 'speed.exe').write_bytes(b'patched')
+        (source / 'global/readme.txt').write_bytes(b'windows extra')
+        (source / '.DS_Store').write_bytes(b'finder')
         destination = self.destination()
         manifest = stage_game([source], destination, profile=self.profile)
         self.assertEqual((destination / 'GLOBAL/One.bin').read_bytes(), b'one')
         self.assertEqual((destination / 'speed.exe').read_bytes(), b'patched')
-        self.assertFalse((destination / 'scripts').exists())
+        # The whole copy goes in: mods and other Windows-only extras too, under the usual names.
+        self.assertEqual((destination / 'scripts/mod.asi').read_bytes(), b'mod')
+        self.assertIn('readme.txt', os.listdir(destination / 'GLOBAL'))
+        self.assertFalse((destination / '.DS_Store').exists())
         self.assertTrue((source / 'scripts/mod.asi').exists())
         self.assertEqual(len(manifest['files']), 9)
+        self.assertEqual(manifest['extras'], game_sources._inventory(
+            [('scripts/mod.asi', source / 'scripts/mod.asi'), ('GLOBAL/readme.txt', source / 'global/readme.txt')]))
         self.assertNotIn(str(self.root), json.dumps(manifest))
         self.assertEqual(next(r['variant'] for r in manifest['files'] if r['path'] == 'speed.exe'), 'official-1.3')
 
@@ -445,14 +453,17 @@ class GameSourcesTests(unittest.TestCase):
                          [('source', 7250800), ('official-1.3', 7254894)])
         self.assertIn('Most Wanted (2012)', accepted['not_supported'])
 
-    def app(self, name='NFSMW.app', bundle='local.nfsmw.native'):
-        """An NFSMW.app as the build leaves it: the installed tree, patched, with derived files."""
+    def app(self, name='NFSMW.app', bundle='local.nfsmw.native', record=True):
+        """An NFSMW.app as the build leaves it: the installed tree, patched, with the extras of
+        the copy (scripts/mod.asi) and derived files, and the extras recorded."""
         source = self.folder()
         (source / 'speed.exe').write_bytes(b'patched')
         for name_, data in (('.nfsmw/full/speed.exe', b'hq'), ('.nfsmw/runtime.exe', b'runtime'),
-                            ('install-manifest.json', b'{}')):
+                            ('scripts/NFSMostWanted.WidescreenFix.ini', b'[MAIN]\n')):
             (source / name_).parent.mkdir(parents=True, exist_ok=True)
             (source / name_).write_bytes(data)
+        extras = game_sources._inventory([('scripts/mod.asi', source / 'scripts/mod.asi')])
+        (source / 'install-manifest.json').write_text(json.dumps({'source': {'extras': extras}} if record else {}))
         app = self.root / name
         (app / 'Contents/Resources').mkdir(parents=True)
         (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': bundle,
@@ -477,9 +488,10 @@ class GameSourcesTests(unittest.TestCase):
         manifest = stage_game([app], destination, profile=self.profile)
         self.assertEqual(manifest['source_kind'], 'folder')
         self.assertEqual((destination / 'speed.exe').read_bytes(), b'patched')
-        # Everything an older build derived is left behind and built again.
-        for derived in ('.nfsmw', 'scripts', 'install-manifest.json'):
+        # Everything an older build derived is left behind and built again; the extras stay.
+        for derived in ('.nfsmw', 'scripts/NFSMostWanted.WidescreenFix.ini', 'install-manifest.json'):
             self.assertFalse((destination / derived).exists())
+        self.assertEqual((destination / 'scripts/mod.asi').read_bytes(), b'mod')
         (destination / 'GLOBAL/One.bin').write_bytes(b'changed in the new build')
         self.assertEqual((app / 'Contents/Resources/game/global/one.bin').read_bytes(), b'one')
         self.assertEqual([entry for entry in self.snapshot() if entry[0].startswith('NFSMW.app')],
@@ -502,6 +514,66 @@ class GameSourcesTests(unittest.TestCase):
         self.assertIn('missing or modified', report['message'])
         (app / 'Contents/Resources/game').mkdir()
         self.assertIn('missing or modified', self.check([app])['message'])
+
+    def test_no_file_of_the_copy_in_an_app_is_ignored(self):
+        """A missing or changed extra is found like a game file, and an app from an older Builder,
+        which left the extras out, is not reused."""
+        for change in ('missing', 'changed'):
+            with self.subTest(change):
+                app = self.app()
+                extra = app / 'Contents/Resources/game/scripts/mod.asi'
+                extra.unlink() if change == 'missing' else extra.write_bytes(b'changed')
+                report = self.check([app])
+                self.assertEqual((report['ok'], report['kind']), (False, 'app'))
+                self.assertIn('missing or modified', report['message'])
+                with self.assertRaisesRegex(ValueError, 'missing or modified'):
+                    stage_game([app], self.destination(f'stage-{change}'), profile=self.profile)
+                shutil.rmtree(app)
+        app = self.app(record=False)
+        report = self.check([app])
+        self.assertEqual((report['ok'], report['kind']), (False, 'app'))
+        self.assertEqual(report['message'], 'NFSMW.app was built by an older NFSMW Builder, which left part of '
+                                            'your game copy out of it. Choose your original game copy once to '
+                                            'build the complete app.')
+        with self.assertRaisesRegex(ValueError, 'older NFSMW Builder'):
+            stage_game([app], self.destination('stage-old'), profile=self.profile)
+
+    def test_no_macos_code_from_the_copy(self):
+        """A downloaded copy may hide a Mac program: it never goes into the game, and the files
+        cloned from the copy keep the download's quarantine."""
+        source = self.folder()
+        shutil.copy('/usr/bin/true', source / 'readme.txt')                # a Mach-O under another name
+        (source / 'Tool.app/Contents/MacOS').mkdir(parents=True)
+        shutil.copy('/usr/bin/true', source / 'Tool.app/Contents/MacOS/Tool')
+        (source / 'scripts/run.command').write_text('#!/bin/sh\n')
+        mark = '0081;00000000;Test;'
+        subprocess.run(['/usr/bin/xattr', '-w', 'com.apple.quarantine', mark, str(source / 'scripts/mod.asi')],
+                       check=True)
+        destination = self.destination()
+        manifest = stage_game([source], destination, profile=self.profile)
+        for name in ('readme.txt', 'Tool.app', 'scripts/run.command'):
+            self.assertFalse((destination / name).exists(), name)
+        self.assertEqual(manifest['extras']['files'], 1)
+        found = subprocess.run(['/usr/bin/xattr', '-p', 'com.apple.quarantine', str(destination / 'scripts/mod.asi')],
+                               capture_output=True, text=True)
+        self.assertEqual(found.stdout.strip(), mark)
+        images = self.discs(extras={0: {'AutoRun.exe': b'MZ windows', 'Mac.dylib': b'library',
+                                        'helper': Path('/usr/bin/true').read_bytes()[:4096]},
+                                    # The same name on another disc: once, or beside the first disc's.
+                                    1: {'AutoRun.exe': b'MZ windows', 'bin.dat': b'disc1'},
+                                    2: {'AutoRun.exe': b'MZ other', 'bin.dat': b'disc0'}})
+        destination = self.destination('discs')
+        manifest = self.stage_discs(images, destination)
+        self.assertEqual((destination / 'AutoRun.exe').read_bytes(), b'MZ windows')
+        self.assertEqual((destination / 'd3dx.cab').read_bytes(), b'cab')
+        self.assertEqual((destination / 'bin.dat').read_bytes(), b'disc0')
+        self.assertEqual((destination / 'Disc 2/bin.dat').read_bytes(), b'disc1')
+        self.assertEqual((destination / 'Disc 3/AutoRun.exe').read_bytes(), b'MZ other')
+        self.assertFalse((destination / 'Disc 2/AutoRun.exe').exists())
+        self.assertFalse((destination / 'Disc 3/bin.dat').exists())
+        for name in ('Mac.dylib', 'helper', '0compressed.zip'):
+            self.assertFalse((destination / name).exists(), name)
+        self.assertEqual(manifest['extras']['files'], 4)  # AutoRun.exe, the cabinet and the two other copies
 
     def test_other_apps_are_not_game_copies(self):
         app = self.app('Other.app', bundle='com.example.other')

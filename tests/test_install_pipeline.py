@@ -59,7 +59,9 @@ class InstallPipelineTests(unittest.TestCase):
                 self.assertEqual((destination/'speed.exe').read_bytes(),pe)
                 self.assertEqual((destination/'.nfsmw/visuals/CARS/BASE/GEOMETRY.BIN').read_bytes(),b'HQ model')
                 self.assertTrue((destination/'.nfsmw/full/CARS/ADDED/GEOMETRY.BIN').is_file())
-                self.assertFalse((destination/'userdata').exists())
+                # The whole copy goes in, so the saves a player kept in it are there too.
+                self.assertEqual((destination/'userdata/save').read_bytes(),b'keep save')
+                self.assertEqual(manifest['source']['extras']['files'],1)
                 self.assertTrue((destination/'install-manifest.json').is_file())
                 self.assertNotIn(str(root),json.dumps(manifest))
         for name,data in originals.items():self.assertEqual((base/name).read_bytes(),data)
