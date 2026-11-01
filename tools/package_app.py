@@ -1,4 +1,4 @@
-"""Package a native executable and an optional private game copy atomically."""
+"""Package a native executable and its private game copy into a self-contained app, atomically."""
 import argparse
 from pathlib import Path
 import plistlib
@@ -64,7 +64,11 @@ def write_app_icon(icon,destination):
                        check=True,capture_output=True)
 
 
-def package_app(binary,game=None,output=Path('out/NFSMW.app')):
+# The launcher refuses an app whose Contents/Resources/game lacks these (runtime/launcher.m).
+REQUIRED_GAME_FILES=('speed.exe','d3dx9_26.dll')
+
+
+def package_app(binary,game,output=Path('out/NFSMW.app')):
     binary,output=Path(binary),Path(output)
     if binary.is_symlink() or not binary.is_file():raise ValueError('native executable must be a regular file, not a symlink')
     with binary.open('rb')as stream:header=stream.read(8)
@@ -74,13 +78,17 @@ def package_app(binary,game=None,output=Path('out/NFSMW.app')):
         info=output/'Contents/Info.plist'
         if info.is_symlink() or not info.is_file() or plistlib.loads(info.read_bytes()).get('CFBundleIdentifier')!=BUNDLE_ID:
             raise FileExistsError('refusing to replace an unrelated app or folder')
-    if game is not None:
-        game=Path(game)
-        if game.is_symlink() or not game.is_dir():raise ValueError('game folder must not be a symlink')
-        if output.parent.resolve().is_relative_to(game.resolve()):raise ValueError('app output must be outside the game folder')
-        for path in game.rglob('*'):
-            if path.is_symlink():raise ValueError('game symlinks cannot be included in the app')
-    icon=windows_icon(game/'speed.exe') if game is not None else None
+    # The app carries all game data and never reads a game folder elsewhere.
+    if game is None:raise ValueError('a prepared game folder is required: the app must contain the game')
+    game=Path(game)
+    if game.is_symlink() or not game.is_dir():raise ValueError('game folder must be a folder, not a symlink')
+    if output.parent.resolve().is_relative_to(game.resolve()):raise ValueError('app output must be outside the game folder')
+    for name in REQUIRED_GAME_FILES:
+        if (game/name).is_symlink() or not (game/name).is_file():
+            raise ValueError(f'game folder has no {name}; it must be a prepared game folder')
+    for path in game.rglob('*'):
+        if path.is_symlink():raise ValueError('game symlinks cannot be included in the app')
+    icon=windows_icon(game/'speed.exe')
     output.parent.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.nfsmw-app-',dir=output.parent)as temporary:
         temporary=Path(temporary);staged=temporary/'NFSMW.app';contents=staged/'Contents'
@@ -89,15 +97,14 @@ def package_app(binary,game=None,output=Path('out/NFSMW.app')):
         shutil.copyfile(binary,executable);executable.chmod(0o755)
         for relative in ('LICENSE','third_party/nfsu2-web-LICENSE','third_party/WidescreenFix-LICENSE'):
             shutil.copyfile(ROOT/relative,resources/Path(relative).name)
-        if game is not None:shutil.copytree(game,resources/'game',copy_function=shutil.copyfile)
+        shutil.copytree(game,resources/'game',copy_function=shutil.copyfile)
         info={'CFBundleExecutable':'NFSMW','CFBundleIdentifier':BUNDLE_ID,
               'CFBundleName':'NFSMW','CFBundleDisplayName':'NFSMW',
               'CFBundlePackageType':'APPL','CFBundleVersion':'9','CFBundleShortVersionString':'0.3.6',
               'LSMinimumSystemVersion':'11.0','NSHighResolutionCapable':True,
               'NSPrincipalClass':'NSApplication','NSQuitAlwaysKeepsWindows':False}
-        if icon is not None:
-            write_app_icon(icon,resources/'NFSMW.icns')
-            info['CFBundleIconFile']='NFSMW.icns'
+        write_app_icon(icon,resources/'NFSMW.icns')
+        info['CFBundleIconFile']='NFSMW.icns'
         (contents/'Info.plist').write_bytes(plistlib.dumps(info))
         subprocess.run(['codesign','--force','--sign','-',str(staged)],check=True,capture_output=True)
         subprocess.run(['codesign','--verify','--deep','--strict',str(staged)],check=True,capture_output=True)
@@ -113,7 +120,8 @@ def package_app(binary,game=None,output=Path('out/NFSMW.app')):
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary',type=Path,default=Path('out/nfsmw_boot'))
-    parser.add_argument('--game',type=Path)
+    parser.add_argument('--game',type=Path,required=True,
+                        help='prepared game folder (for example out/installed); it is copied into the app')
     parser.add_argument('--output',type=Path,default=Path('out/NFSMW.app'))
     arguments=parser.parse_args()
     package_app(arguments.binary,arguments.game,arguments.output)

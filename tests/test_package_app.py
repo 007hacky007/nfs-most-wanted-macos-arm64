@@ -21,6 +21,7 @@ class PackageAppTests(unittest.TestCase):
         binary=root/'native'
         subprocess.run(['clang','-arch','arm64',str(source),'-o',str(binary)],check=True,capture_output=True)
         game=root/'game';game.mkdir();(game/'speed.exe').write_bytes(b'owned test payload')
+        (game/'d3dx9_26.dll').write_bytes(b'owned test library')
         return binary,game,root/'NFSMW.app'
 
     def test_signed_app_contains_private_game_copy_and_native_binary(self):
@@ -61,6 +62,22 @@ class PackageAppTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'symlink'):package_app(binary,game,output)
             self.assertEqual(sentinel.read_bytes(),b'owned test payload')
             self.assertFalse(list(root.glob('.nfsmw-app-*')))
+
+    def test_app_without_game_data_is_refused(self):
+        from tools.package_app import package_app
+        with tempfile.TemporaryDirectory()as temporary:
+            root=Path(temporary);binary,game,output=self.fixture(root)
+            with self.assertRaisesRegex(ValueError,'game folder is required'):package_app(binary,None,output)
+            (game/'d3dx9_26.dll').unlink()
+            with self.assertRaisesRegex(ValueError,'d3dx9_26.dll'):package_app(binary,game,output)
+            empty=root/'empty';empty.mkdir()
+            with self.assertRaisesRegex(ValueError,'speed.exe'):package_app(binary,empty,output)
+            self.assertFalse(output.exists())
+            command=subprocess.run([sys.executable,'tools/package_app.py','--binary',str(binary),'--output',str(output)],
+                                   capture_output=True,text=True)
+            self.assertEqual(command.returncode,2)
+            self.assertIn('--game',command.stderr)
+            self.assertFalse(output.exists())
 
 
 if __name__=='__main__':unittest.main()
