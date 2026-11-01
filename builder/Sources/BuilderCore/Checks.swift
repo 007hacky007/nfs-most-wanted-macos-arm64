@@ -54,6 +54,61 @@ public func gigabytes(_ bytes: Int64) -> String {
     String(format: "%.1f GB", Double(bytes) / 1_000_000_000)
 }
 
+/// "612 MB", "32.7 GB": sizes as Finder shows them, also for leftovers well under a gigabyte.
+public func sizeText(_ bytes: Int64) -> String {
+    ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+}
+
+/// The texts of the controls that delete files.
+///
+/// Temporary files are what `removeBuildFiles` deletes: everything a build wrote in this
+/// version's workspace (out/, gen/ and the rest: the extracted and prepared game files, the
+/// translated and compiled code, the step logs and an NFSMW.app that was built but not
+/// installed). It keeps the bundled build scripts, their .venv packages, the private Python,
+/// the download cache, an installed NFSMW.app, the player's game copy, saves and settings.
+///
+/// Downloads are the Builder's own download cache (`BuilderPaths.cache`): the official 1.3
+/// patch, WidescreenFix and Most Wanted HQ, also a partial download. NFSMW.app holds all it
+/// needs, so it keeps working without them.
+public enum CleanupText {
+    public static let deleting = "Deleting temporary files..."
+    public static let deletingOld = "Deleting old temporary files..."
+
+    public static func button(bytes: Int64) -> String { "Delete temporary files (\(sizeText(bytes)))" }
+
+    /// After the automatic delete that follows a successful install.
+    public static func deleted(freed: Int64) -> String {
+        "Temporary files deleted, \(sizeText(freed)) freed. NFSMW.app and your game are unchanged; "
+            + "Python and the downloads are kept for the next build."
+    }
+
+    /// The first caption line under a delete button: exactly where it deletes, with ~ for the
+    /// home folder so no user name shows.
+    static func tilde(_ url: URL) -> String { (url.path as NSString).abbreviatingWithTildeInPath }
+
+    /// `workspace` is `BuilderPaths.workspace(version:)`; its build scripts and .venv stay.
+    public static func deletesLine(workspace: URL) -> String {
+        "Deletes the build's files in \(tilde(workspace)); the build scripts and Python packages there stay"
+    }
+
+    /// For the leftovers of a cancelled, failed or not installed build (checklist and failure screen).
+    public static let leftoverCaption = "Only what that build left in the Builder's own work folder, "
+        + "including an NFSMW.app it built but did not install, and its step logs. "
+        + "An installed NFSMW.app, your game copy, saves, settings, Python and the downloads stay."
+
+    /// `cache` is `BuilderPaths.cache`, which the Builder empties.
+    public static func downloadsDeletesLine(cache: URL) -> String { "Deletes \(tilde(cache))" }
+
+    public static func downloadsButton(bytes: Int64) -> String { "Delete downloads (\(sizeText(bytes)))" }
+
+    public static func downloadsCaption(bytes: Int64) -> String {
+        "The official patch, WidescreenFix and Most Wanted HQ. NFSMW.app does not need them and keeps working; "
+            + "the next build downloads them again, \(sizeText(bytes))."
+    }
+
+    public static let downloadsDeleted = "Downloads deleted. NFSMW.app is unchanged; the next build downloads them again."
+}
+
 /// `cachedBytes` are downloads already in the cache, which the build does not need again.
 /// On the same volume the finished app is moved, not copied, so it needs no extra space.
 public func diskSpaceCheck(workspaceAvailable: Int64, workspaceVolume: String,

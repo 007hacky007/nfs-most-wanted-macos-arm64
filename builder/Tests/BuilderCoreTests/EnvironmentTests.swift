@@ -255,7 +255,7 @@ final class EnvironmentTests: XCTestCase {
         let packages = CheckState.blocked("Packages need to be set up again (small download)")
         try write("numpy\nscipy\n", to: req)
         XCTAssertEqual(buildToolsCheck(paths: paths, version: "1"), packages)
-        // Python present, venv removed (Remove build files).
+        // Python present, venv removed.
         try fm.removeItem(at: ws.appendingPathComponent(".venv"))
         XCTAssertEqual(buildToolsCheck(paths: paths, version: "1"), packages)
     }

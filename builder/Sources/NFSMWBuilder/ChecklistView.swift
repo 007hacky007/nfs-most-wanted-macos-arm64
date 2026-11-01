@@ -10,7 +10,8 @@ struct ChecklistView: View {
         VStack(alignment: .leading, spacing: 0) {
             ForEach(CheckID.allCases, id: \.self) { id in
                 CheckRow(title: title(for: id), tooltip: id == .gameCopy ? model.gameTooltip : nil,
-                         state: model.states[id] ?? .checking("Checking..."), buttons: buttons(for: id))
+                         state: model.states[id] ?? .checking("Checking..."), buttons: buttons(for: id),
+                         note: note(for: id))
                 if id != CheckID.allCases.last { Divider() }
             }
             Button(action: model.build) {
@@ -34,6 +35,13 @@ struct ChecklistView: View {
 
     private func title(for id: CheckID) -> String {
         id == .gameCopy ? model.gameTitle : id.title
+    }
+
+    /// Under the Disk row's delete button: where it deletes and what stays.
+    private func note(for id: CheckID) -> String? {
+        guard id == .diskSpace, model.buildFilesBytes > 0, !model.removingBuildFiles else { return nil }
+        return CleanupText.deletesLine(workspace: model.paths.workspace(version: model.version)) + "\n"
+            + CleanupText.leftoverCaption
     }
 
     private func buttons(for id: CheckID) -> [RowButton] {
@@ -65,7 +73,7 @@ struct ChecklistView: View {
         case (.destination, _):
             return [RowButton(label: "Change...", action: chooseDestination)]
         case (.diskSpace, _) where model.buildFilesBytes > 0 && !model.removingBuildFiles:
-            return [RowButton(label: "Remove build files (\(gigabytes(model.buildFilesBytes)))",
+            return [RowButton(label: CleanupText.button(bytes: model.buildFilesBytes),
                               action: model.removeBuildFilesNow)]
         default:
             return []
@@ -162,6 +170,8 @@ struct CheckRow: View {
     var tooltip: String?
     let state: CheckState
     let buttons: [RowButton]
+    /// Small print below the message, such as what a delete button deletes.
+    var note: String? = nil
 
     /// Up to two buttons sit beside the message; more go on their own line below it, so the
     /// message keeps the width it needs.
@@ -178,6 +188,13 @@ struct CheckRow: View {
                     .fixedSize(horizontal: false, vertical: true)
                 if buttons.count > 2 {
                     HStack { buttonViews }.padding(.top, 6)
+                }
+                if let note = note {
+                    Text(note)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 2)
                 }
             }
             Spacer(minLength: 8)

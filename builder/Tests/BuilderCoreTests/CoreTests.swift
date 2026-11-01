@@ -115,4 +115,35 @@ enum AcceptedFileFixture {
         let json = #"{"kind": "\#(kind)", "size": \#(size), "sha256": "\#(sha256)"}"#
         return try! JSONDecoder().decode(AcceptedFile.self, from: Data(json.utf8))
     }
+
+    /// Sizes on the delete buttons read like Finder, also for leftovers under a gigabyte.
+    func testSizeText() {
+        XCTAssertEqual(sizeText(612_000_000), "612 MB")
+        XCTAssertEqual(sizeText(32_700_000_000), "32.7 GB")
+    }
+
+    /// The delete controls name what they delete, its size and what stays.
+    func testCleanupTexts() {
+        XCTAssertEqual(CleanupText.deleting, "Deleting temporary files...")
+        XCTAssertEqual(CleanupText.button(bytes: 612_000_000), "Delete temporary files (612 MB)")
+        XCTAssertEqual(CleanupText.deleted(freed: 32_700_000_000),
+                       "Temporary files deleted, 32.7 GB freed. NFSMW.app and your game are unchanged; "
+                       + "Python and the downloads are kept for the next build.")
+        XCTAssertEqual(CleanupText.downloadsButton(bytes: 3_359_162_163), "Delete downloads (3.36 GB)")
+        XCTAssertTrue(CleanupText.downloadsCaption(bytes: 3_359_162_163)
+            .hasSuffix("the next build downloads them again, 3.36 GB."))
+        XCTAssertTrue(CleanupText.leftoverCaption.contains("an NFSMW.app it built but did not install"))
+        XCTAssertTrue(CleanupText.leftoverCaption.hasSuffix("An installed NFSMW.app, your game copy, saves, settings, Python and the downloads stay."))
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let paths = BuilderPaths(support: home.appendingPathComponent("Library/Application Support/NFSMW Builder"))
+        XCTAssertEqual(CleanupText.deletesLine(workspace: paths.workspace(version: "1.3.1")),
+                       "Deletes the build's files in ~/Library/Application Support/NFSMW Builder/1.3.1; "
+                       + "the build scripts and Python packages there stay")
+        XCTAssertEqual(CleanupText.downloadsDeletesLine(cache: home.appendingPathComponent("Library/Caches/NFSMW/downloads")),
+                       "Deletes ~/Library/Caches/NFSMW/downloads")
+        for text in [CleanupText.deleted(freed: 1), CleanupText.leftoverCaption, CleanupText.downloadsCaption(bytes: 1),
+                     CleanupText.downloadsDeleted] {
+            XCTAssertNil(text.range(of: "[\\u2013\\u2014]", options: .regularExpression), "hyphen-minus only")
+        }
+    }
 }

@@ -58,19 +58,29 @@ struct ResultView: View {
             .controlSize(.large)
             Spacer()
             if model.cleaningUp {
-                Text("Removing build files...").font(.caption).foregroundColor(.secondary)
+                Text(CleanupText.deleting).font(.caption).foregroundColor(.secondary)
             } else if let freed = model.freedBytes {
-                Text("Build files removed, \(gigabytes(freed)) freed. Python and the downloads are kept for the next build.")
+                Text(CleanupText.deleted(freed: freed))
                     .font(.caption)
                     .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if model.ownsCache && !model.cleaningUp {
                 if model.downloadsRemoved {
-                    Text("Downloads removed").font(.caption).foregroundColor(.secondary)
+                    Text(CleanupText.downloadsDeleted).font(.caption).foregroundColor(.secondary)
                 } else {
-                    Button("Remove downloads (\(gigabytes(model.cachedBytes)))", action: model.removeDownloads)
-                        .controlSize(.small)
-                        .help("Frees the downloaded patches and Most Wanted HQ. A new build downloads them again.")
+                    let cached = model.cachedBytes
+                    VStack(spacing: 4) {
+                        Button(CleanupText.downloadsButton(bytes: cached), action: model.removeDownloads)
+                            .controlSize(.small)
+                        Text(CleanupText.downloadsDeletesLine(cache: model.paths.cache) + "\n"
+                             + CleanupText.downloadsCaption(bytes: cached))
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
         }
@@ -99,12 +109,20 @@ struct ResultView: View {
                         .help("Download MW_HQ_1.20.9.zip in your browser, then choose Use a file I already have...")
                 }
                 if model.buildFilesBytes > 0 {
-                    Button("Remove build files (\(gigabytes(model.buildFilesBytes)))", action: model.removeBuildFilesNow)
+                    Button(CleanupText.button(bytes: model.buildFilesBytes), action: model.removeBuildFilesNow)
                         .disabled(model.removingBuildFiles)
+
                 }
                 Spacer()
                 Button("Try again", action: model.tryAgain)
                     .keyboardShortcut(.defaultAction)
+            }
+            if model.buildFilesBytes > 0 {
+                Text(CleanupText.deletesLine(workspace: model.paths.workspace(version: model.version)) + "\n"
+                     + CleanupText.leftoverCaption)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .sheet(isPresented: $model.showingWhichCopy) { WhichCopyView(model: model) }

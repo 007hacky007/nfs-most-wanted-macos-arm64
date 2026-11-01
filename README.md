@@ -95,16 +95,21 @@ automatically during the build, and red rows need you.
   with that name is never touched.
 - **Free disk space**: about 45 GB while building, plus 18 GB on the
   destination disk when it is a different disk. If an earlier build was
-  cancelled or failed, **Remove build files** frees its space.
+  cancelled or failed, **Delete temporary files** shows and frees its space.
+  It deletes only what that build left in the Builder's work folder,
+  including an NFSMW.app it built but did not install; an installed
+  NFSMW.app, your game copy, saves, settings, Python and the downloads stay.
 
 Fix the red rows, then click **Build NFSMW.app**. The build takes about 25
 minutes, longer on the first build while Most Wanted HQ downloads, and you can
 keep using your Mac. **Cancel** stops it and removes its files.
 
 When it finishes, NFSMW.app is in the destination folder. Click **Play** or
-**Show in Finder**. The build files are removed automatically; the Builder's
-Python and the downloads are kept for the next build. **Remove downloads**
-frees the 3.4 GB of downloads too.
+**Show in Finder**. The temporary files are deleted automatically and the
+window says how much space that freed; NFSMW.app, your game copy, the
+Builder's Python and the downloads are kept. **Delete downloads** deletes
+the cached official patch, WidescreenFix and Most Wanted HQ (3.4 GB) too;
+NFSMW.app keeps working, and the next build downloads them again.
 
 If a step fails, the Builder names it in plain words. **Copy log** copies
 everything for a bug report, and **Try again** returns to the checklist.

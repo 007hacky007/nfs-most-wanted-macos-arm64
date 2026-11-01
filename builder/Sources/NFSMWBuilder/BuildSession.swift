@@ -11,7 +11,7 @@ extension BuilderModel {
         }
         gameRunner?.cancel()
         statusRunner?.cancel()
-        (buildLog, pendingLog, buildStep, buildStepTitle, buildFraction) = ([], [], "", "Removing old build files...", 0)
+        (buildLog, pendingLog, buildStep, buildStepTitle, buildFraction) = ([], [], "", CleanupText.deletingOld, 0)
         (buildError, builtApp, failureLogFile, installProgress, freedBytes) = (nil, nil, nil, nil, nil)
         (userCancelled, cancelDisabled, downloadsRemoved) = (false, false, false)
         downloadBytes = nil
@@ -103,7 +103,7 @@ extension BuilderModel {
     }
 
     /// Leaves the "NFSMW is running" screen. The built app stays in the workspace; the checklist
-    /// offers Remove build files for it.
+    /// offers Delete temporary files for it.
     func backToChecklist() {
         guard case .quitToInstall = phase else { return }
         phase = .checklist
