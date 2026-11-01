@@ -288,10 +288,13 @@ extras and mods included. From the discs, every other file on them goes in
 contents on a later disc goes into a folder named after that disc, such as
 `Disc 2/bin.dat`. Only the four installer archives stay out, because the
 game files they hold are in the app unpacked, and so do Finder's `.DS_Store`
-files and macOS programs: the game is Windows files only, so a Mac program
-hidden in a downloaded copy never ends up inside the signed app, and the build
-log names each one it leaves out. The files cloned from your copy keep their
-download quarantine; only what the build makes loses it. A damaged or incompatible
+files and macOS code (apps and other bundles, Mac programs, scripts and
+libraries): the game is Windows files only, so a Mac program hidden in a
+downloaded copy never ends up inside the signed app, and the build log names
+each one it leaves out. No game file in the app is executable (the game only
+reads them). The files from your copy keep their download quarantine, and so do
+the files unpacked from a quarantined disc image; only what the build makes
+loses it. A damaged or incompatible
 required file stops the build instead of producing a partially patched app.
 
 ## NFSMW Builder internals

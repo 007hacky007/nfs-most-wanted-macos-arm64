@@ -1,4 +1,5 @@
 """Source staging uses only pinned files and never modifies supplied copies."""
+import contextlib
 import hashlib
 import io
 import json
@@ -546,19 +547,34 @@ class GameSourcesTests(unittest.TestCase):
         (source / 'Tool.app/Contents/MacOS').mkdir(parents=True)
         shutil.copy('/usr/bin/true', source / 'Tool.app/Contents/MacOS/Tool')
         (source / 'scripts/run.command').write_text('#!/bin/sh\n')
+        (source / 'global/readme.dat').write_text('#!/bin/sh\necho hidden\n')   # a script with a game name
+        (source / 'Helper/Contents/Resources').mkdir(parents=True)          # a bundle without an extension
+        (source / 'Helper/Contents/Info.plist').write_text('<plist/>')
+        (source / 'Helper/Contents/Resources/data.bin').write_text('data')
+        (source / 'scripts/tool.jar').write_text('PK')
+        (source / 'scripts/Open.TERMINAL').write_text('<plist/>')
+        (source / 'scripts/mod.asi').chmod(0o755)
         mark = '0081;00000000;Test;'
         subprocess.run(['/usr/bin/xattr', '-w', 'com.apple.quarantine', mark, str(source / 'scripts/mod.asi')],
                        check=True)
         destination = self.destination()
-        manifest = stage_game([source], destination, profile=self.profile)
-        for name in ('readme.txt', 'Tool.app', 'scripts/run.command'):
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            manifest = stage_game([source], destination, profile=self.profile)
+        for name in ('readme.txt', 'Tool.app', 'scripts/run.command', 'GLOBAL/readme.dat', 'Helper',
+                     'scripts/tool.jar', 'scripts/Open.TERMINAL'):
             self.assertFalse((destination / name).exists(), name)
+            self.assertIn(f'left out of the app (macOS code): {name.replace("GLOBAL", "global")}\n',
+                          log.getvalue())
+        self.assertEqual(log.getvalue().count('Helper'), 1, 'a bundle is left out whole, named once')
         self.assertEqual(manifest['extras']['files'], 1)
+        self.assertEqual(stat.S_IMODE((destination / 'scripts/mod.asi').stat().st_mode), 0o644)
         found = subprocess.run(['/usr/bin/xattr', '-p', 'com.apple.quarantine', str(destination / 'scripts/mod.asi')],
                                capture_output=True, text=True)
         self.assertEqual(found.stdout.strip(), mark)
         images = self.discs(extras={0: {'AutoRun.exe': b'MZ windows', 'Mac.dylib': b'library',
-                                        'helper': Path('/usr/bin/true').read_bytes()[:4096]},
+                                        'helper': Path('/usr/bin/true').read_bytes()[:4096],
+                                        'readme.dat': b'#!/usr/bin/perl\n', 'tool.jar': b'PK'},
                                     # The same name on another disc: once, or beside the first disc's.
                                     1: {'AutoRun.exe': b'MZ windows', 'bin.dat': b'disc1'},
                                     2: {'AutoRun.exe': b'MZ other', 'bin.dat': b'disc0'}})
@@ -571,9 +587,40 @@ class GameSourcesTests(unittest.TestCase):
         self.assertEqual((destination / 'Disc 3/AutoRun.exe').read_bytes(), b'MZ other')
         self.assertFalse((destination / 'Disc 2/AutoRun.exe').exists())
         self.assertFalse((destination / 'Disc 3/bin.dat').exists())
-        for name in ('Mac.dylib', 'helper', '0compressed.zip'):
+        for name in ('Mac.dylib', 'helper', 'readme.dat', 'tool.jar', '0compressed.zip'):
             self.assertFalse((destination / name).exists(), name)
         self.assertEqual(manifest['extras']['files'], 4)  # AutoRun.exe, the cabinet and the two other copies
+
+    def test_files_from_a_quarantined_disc_image_keep_its_quarantine(self):
+        """Every file written from a downloaded image (ZIP members, disc root files, the D3DX
+        library, the extras) gets the image's own quarantine; an image without one gives none."""
+        images = self.discs(extras={0: {'AutoRun.exe': b'MZ windows'}})
+        marks = {}
+        for role, image in enumerate(images[:3]):
+            marks[role] = f'0081;0000000{role};Test{role};'
+            subprocess.run(['/usr/bin/xattr', '-w', 'com.apple.quarantine', marks[role], str(image)], check=True)
+        destination = self.destination()
+        self.stage_discs(images, destination)
+        expected = {'GLOBAL/One.bin': marks[0], 'CARS/Two.bin': marks[1], 'TRACKS/Three.bin': marks[2],
+                    'SOUND/Four.bin': None, 'speed.exe': marks[0], 'server.dll': marks[0],
+                    'd3dx9_26.dll': marks[0], 'AutoRun.exe': marks[0], 'd3dx.cab': marks[0]}
+        for name, mark in expected.items():
+            value = game_sources.quarantine(destination / name)
+            self.assertEqual(value.decode() if value else None, mark, name)
+
+    def test_a_fallback_copy_keeps_the_exact_quarantine_or_fails(self):
+        source = self.root / 'source.bin'
+        source.write_bytes(b'original')
+        source.chmod(0o755)
+        mark = b'0081;00000000;Test;'
+        game_sources.set_quarantine(source, mark)
+        with patch.object(game_sources, '_CLONEFILE', None):
+            game_sources._clone(source, self.root / 'copy.bin')
+            self.assertEqual(game_sources.quarantine(self.root / 'copy.bin'), mark)
+            self.assertEqual(stat.S_IMODE((self.root / 'copy.bin').stat().st_mode), 0o644)
+            with patch.object(game_sources, '_SETXATTR', lambda *args: -1), \
+                    self.assertRaisesRegex(OSError, 'cannot keep the quarantine'):
+                game_sources._clone(source, self.root / 'lost.bin')
 
     def test_other_apps_are_not_game_copies(self):
         app = self.app('Other.app', bundle='com.example.other')

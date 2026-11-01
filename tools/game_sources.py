@@ -1,6 +1,7 @@
 """Verify and stage the supported user's own game files without running them."""
 from contextlib import ExitStack
 import ctypes
+import errno
 import hashlib
 import io
 import json
@@ -10,6 +11,7 @@ import plistlib
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -32,9 +34,17 @@ APP_GAME_OLD = ('{name} was built by an older NFSMW Builder, which left part of 
 # everything below it.
 DERIVED = ('.nfsmw', 'install-manifest.json', 'scripts/nfsmostwanted.widescreenfix.ini',
            'scripts/nfsmostwanted.widescreenfix.tpk')
-MACOS_BUNDLES = ('.app', '.framework', '.bundle', '.plugin', '.kext', '.pkg', '.mpkg', '.workflow')
-MACOS_FILES = ('.command', '.tool', '.sh', '.dylib', '.so', '.scpt')
+# macOS code, which never comes from the player's copy into the app (_macos_code): a folder
+# with a bundle or package extension or a Contents/Info.plist inside is left out whole; a file
+# with one of these extensions, a script (#!) or a Mach-O head is left out. Case-folded.
+MACOS_BUNDLES = ('.app', '.appex', '.framework', '.bundle', '.plugin', '.kext', '.pkg', '.mpkg', '.workflow',
+                 '.action', '.xpc', '.prefpane', '.saver', '.qlgenerator', '.mdimporter', '.scptd', '.wdgt',
+                 '.component', '.systemextension')
+MACOS_FILES = ('.command', '.tool', '.sh', '.bash', '.zsh', '.csh', '.ksh', '.fish', '.py', '.pl', '.rb', '.php',
+               '.scpt', '.applescript', '.terminal', '.dylib', '.so', '.jar', '.pkg', '.mpkg')
 MACH_O = {bytes.fromhex(magic) for magic in ('feedface', 'cefaedfe', 'feedfacf', 'cffaedfe', 'cafebabe', 'bebafeca')}
+QUARANTINE = b'com.apple.quarantine'
+XATTR_NOFOLLOW = 0x0001
 
 
 class AppGameError(ValueError):
@@ -95,19 +105,85 @@ _CLONEFILE = _load_clonefile()
 CLONE_NOFOLLOW = 0x0001
 
 
+def _load_xattr():
+    if sys.platform != 'darwin':
+        return None, None
+    libc = ctypes.CDLL(None, use_errno=True)
+    get, put = libc.getxattr, libc.setxattr
+    get.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int)
+    get.restype = ctypes.c_ssize_t
+    put.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int)
+    put.restype = ctypes.c_int
+    return get, put
+
+
+_GETXATTR, _SETXATTR = _load_xattr()
+
+
+def quarantine(path):
+    """The com.apple.quarantine value of `path` (not followed if a symlink), or None."""
+    if _GETXATTR is None:
+        return None
+    name = os.fsencode(path)
+    size = _GETXATTR(name, QUARANTINE, None, 0, 0, XATTR_NOFOLLOW)
+    if size >= 0:
+        buffer = ctypes.create_string_buffer(size)
+        size = _GETXATTR(name, QUARANTINE, buffer, size, 0, XATTR_NOFOLLOW)
+        if size >= 0:
+            return buffer.raw[:size]
+    number = ctypes.get_errno()
+    if number in (errno.ENOATTR, errno.ENOTSUP):
+        return None
+    raise OSError(number, f'cannot read the quarantine of {path}: {os.strerror(number)}')
+
+
+def set_quarantine(path, value):
+    """Puts the quarantine `value` (from quarantine()) on `path`; None leaves it as it is."""
+    if value is None:
+        return
+    if _SETXATTR is None or _SETXATTR(os.fsencode(path), QUARANTINE, value, len(value), 0, XATTR_NOFOLLOW):
+        number = ctypes.get_errno() if _SETXATTR is not None else errno.ENOTSUP
+        raise OSError(number, f'cannot keep the quarantine on {path}: {os.strerror(number)}')
+
+
+def keep_quarantine(source, target):
+    """After a plain copy of `source` (a file or a folder) to `target`: every item of the copy
+    gets the quarantine its original has, exactly, or the copy fails. A download's quarantine
+    must not get lost in a fallback copy of the player's game files."""
+    source, target = Path(source), Path(target)
+    pairs = [(source, target)]
+    if source.is_dir() and not source.is_symlink():
+        for directory, subdirs, names in os.walk(source):
+            for name in subdirs + names:
+                path = Path(directory) / name
+                pairs.append((path, target / path.relative_to(source)))
+    for original, copy in pairs:
+        set_quarantine(copy, quarantine(original))
+
+
+def copy_keeping_quarantine(source, target):
+    """A plain copy of `source` (a file or a folder) with its extended attributes and its exact
+    quarantine (keep_quarantine), for when an APFS clone is not possible."""
+    result = subprocess.run(['/bin/cp', '-pR' if Path(source).is_dir() else '-p', str(source), str(target)],
+                            capture_output=True, text=True)
+    if result.returncode:
+        raise OSError(f'could not copy {Path(source).name}: {result.stderr.strip()}')
+    keep_quarantine(source, target)
+
+
 def _clone(source, target):
-    """An APFS clone when both are on one APFS volume, else a plain copy.
+    """An APFS clone when both are on one APFS volume, else a plain copy that keeps the
+    quarantine (copy_keeping_quarantine).
 
     A clone takes no extra space and shares nothing writable: later changes to the copy
     never reach the source, so a chosen NFSMW.app is only ever read.
     """
     # Another volume or file system (EXDEV, ENOTSUP) falls back to copying; so does anything
     # else, and copying reports a real problem itself.
-    if _CLONEFILE is not None and _CLONEFILE(os.fsencode(source), os.fsencode(target), CLONE_NOFOLLOW) == 0:
-        # A clone keeps the source's mode; the staged copy is an ordinary writable file, as a copy is.
-        os.chmod(target, 0o644)
-        return
-    shutil.copyfile(source, target)
+    if _CLONEFILE is None or _CLONEFILE(os.fsencode(source), os.fsencode(target), CLONE_NOFOLLOW) != 0:
+        copy_keeping_quarantine(source, target)
+    # The staged copy is an ordinary writable data file: the game only reads it, never runs it.
+    os.chmod(target, 0o644)
 
 
 def _path(name):
@@ -356,18 +432,25 @@ def _extract_discs(images, destination, profile, files, archives):
                 raise ValueError(f'required disc root file absent: {row["path"]}')
             _claim(seen, row['path'])
             roots.append((row, image, entry))
-        for archive in opened:
+        # Every file written from a disc image gets the image's quarantine (a downloaded image
+        # keeps macOS's check on what came out of it), as an APFS clone of a folder keeps it.
+        for role, archive in zip(sorted(roles), opened):
             extract_zip(archive, destination)
+            mark = quarantine(roles[role][0])
+            for info in archive.infolist():
+                set_quarantine(destination / info.filename.rstrip('/'), mark)
         for row, image, entry in roots:
             target = destination / row['path']
             target.parent.mkdir(parents=True, exist_ok=True)
             with RawISO(image, entry.offset, entry.size) as stream, target.open('wb') as output:
                 shutil.copyfileobj(stream, output, 1 << 20)
+            set_quarantine(target, quarantine(image))
         with tempfile.TemporaryDirectory(prefix='nfsmw-cab-') as temporary:
             cabinet = Path(temporary) / 'directx.cab'
             with RawISO(cab_image, cab_entry.offset, cab_entry.size) as stream, cabinet.open('wb') as output:
                 shutil.copyfileobj(stream, output, 1 << 20)
             (destination / 'd3dx9_26.dll').write_bytes(extract_cab_member(cabinet, 'd3dx9_26.dll'))
+            set_quarantine(destination / 'd3dx9_26.dll', quarantine(cab_image))
         extras = _disc_extras(roles, archives, files, destination, seen)
     return [{'role': role, 'archive': archives[role]['path'],
              'size': archives[role]['size'], 'sha256': archives[role]['sha256']} for role in sorted(roles)], extras
@@ -382,14 +465,18 @@ def _disc_extras(roles, archives, files, destination, seen):
     written, extras = {}, []
     for role in sorted(roles):
         image, index, _ = roles[role]
+        bundles, logged, mark = _macos_bundles(index), set(), quarantine(image)
         for key, item in sorted(index.items()):
             name = _path(item.name)
             if key == archives[role]['path'].casefold() or _finder_file(name):
                 continue
             with RawISO(image, item.offset, item.size) as stream:
                 head = stream.read(4)
-            if _macos_code(name, head):
-                print(f'left out of the app (macOS code): Disc {role + 1}: {name}', flush=True)
+            left_out = _macos_code(name, head, bundles)
+            if left_out:
+                if left_out not in logged:
+                    print(f'left out of the app (macOS code): Disc {role + 1}: {left_out}', flush=True)
+                logged.add(left_out)
                 continue
             with RawISO(image, item.offset, item.size) as stream:
                 found = _digest(stream)
@@ -412,6 +499,7 @@ def _disc_extras(roles, archives, files, destination, seen):
             target.parent.mkdir(parents=True, exist_ok=True)
             with RawISO(image, item.offset, item.size) as stream, target.open('wb') as output:
                 shutil.copyfileobj(stream, output, 1 << 20)
+            set_quarantine(target, mark)
             written[key] = name
             extras.append(name)
     return extras
@@ -455,28 +543,50 @@ def _derived(key):
     return any(key == name or key.startswith(name + '/') for name in DERIVED)
 
 
-def _macos_code(relative, head):
+def _macos_bundles(keys):
+    """The folders among `keys` (the case-folded relative paths of a copy's files) that are macOS
+    bundles or packages: a name with a bundle extension, or a Contents/Info.plist inside."""
+    bundles = set()
+    for key in keys:
+        parts = key.split('/')
+        for count in range(1, len(parts)):
+            if parts[count - 1].endswith(MACOS_BUNDLES):
+                bundles.add('/'.join(parts[:count]))
+        if len(parts) > 2 and parts[-2:] == ['contents', 'info.plist']:
+            bundles.add('/'.join(parts[:-2]))
+    return bundles
+
+
+def _macos_code(relative, head, bundles):
     """No macOS code from the player's copy goes into the app: the game is Windows files only,
-    and a Mac program hidden in a downloaded copy must not end up inside a signed app."""
-    parts = relative.casefold().split('/')
-    return (any(part.endswith(MACOS_BUNDLES) for part in parts[:-1]) or parts[-1].endswith(MACOS_FILES)
-            or head in MACH_O)
+    and a Mac program hidden in a downloaded copy must not end up inside a signed app.
+    -> what is left out for `relative` (a file with the first bytes `head`): the bundle it is in
+    (_macos_bundles), the file itself, or None when it is not macOS code."""
+    parts = relative.split('/')
+    for count in range(1, len(parts)):
+        if '/'.join(parts[:count]).casefold() in bundles:
+            return '/'.join(parts[:count])
+    if parts[-1].casefold().endswith(MACOS_FILES) or head[:2] == b'#!' or head[:4] in MACH_O:
+        return relative
+    return None
 
 
 def _folder_extras(root, available, files, log=False):
     """Everything in the game folder `root` (its _folder_files() `available`) besides the
     profiled and derived files: the Windows-only extras of the player's copy, less Finder files
     and macOS code. -> [(relative, path)]."""
-    extras = []
+    extras, bundles, logged = [], _macos_bundles(available), set()
     for key, path in sorted(available.items()):
         relative = _path(path.relative_to(root).as_posix())
         if key in files or _derived(key) or _finder_file(relative):
             continue
         with path.open('rb') as stream:
             head = stream.read(4)
-        if _macos_code(relative, head):
-            if log:
-                print(f'left out of the app (macOS code): {relative}', flush=True)
+        left_out = _macos_code(relative, head, bundles)
+        if left_out:
+            if log and left_out not in logged:
+                print(f'left out of the app (macOS code): {left_out}', flush=True)
+            logged.add(left_out)
             continue
         extras.append((relative, path))
     return extras

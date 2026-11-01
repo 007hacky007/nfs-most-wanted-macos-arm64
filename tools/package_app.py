@@ -4,11 +4,17 @@ from pathlib import Path
 import plistlib
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import tempfile
 
 import pefile
+
+try:
+    from .game_sources import copy_keeping_quarantine
+except ImportError:
+    from game_sources import copy_keeping_quarantine
 
 ROOT=Path(__file__).resolve().parents[1]
 BUNDLE_ID='local.nfsmw.native'
@@ -74,14 +80,18 @@ VERSION=re.compile(r'[0-9]+(\.[0-9]+){0,3}(-[A-Za-z0-9.]+)?')
 
 
 def copy_game(game,target):
-    """The whole installed tree, as APFS clones where the volume can (else a copy). Extended
-    attributes come along, so a download's quarantine stays on the files from the player's
-    copy; only Finder info and resource forks go, which codesign --strict refuses in a bundle."""
+    """The whole installed tree, as APFS clones where the volume can (else a copy that keeps the
+    quarantine or fails). Extended attributes come along, so a download's quarantine stays on the
+    files from the player's copy; only Finder info and resource forks go, which codesign --strict
+    refuses in a bundle. No game file is executable: the game only reads them."""
     if subprocess.run(['/bin/cp','-c','-R',str(game),str(target)],capture_output=True).returncode:
         shutil.rmtree(target,ignore_errors=True)
-        shutil.copytree(game,target,copy_function=shutil.copyfile)
+        copy_keeping_quarantine(game,target)
     for name in ('com.apple.FinderInfo','com.apple.ResourceFork'):
         subprocess.run(['/usr/bin/xattr','-dr',name,str(target)],capture_output=True)
+    for path in Path(target).rglob('*'):
+        mode=path.lstat().st_mode
+        if stat.S_ISREG(mode) and mode&0o111:path.chmod(stat.S_IMODE(mode)&~0o111)
 
 
 def package_app(binary,game,output=Path('out/NFSMW.app'),builder_version=None):
