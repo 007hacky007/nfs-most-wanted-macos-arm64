@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import plistlib
 import subprocess
 import tempfile
 import unittest
@@ -32,6 +33,88 @@ int main(int argc,char **argv){@autoreleasepool{
                             '-framework','Cocoa','-o',str(binary)],check=True,capture_output=True)
             subprocess.run([str(binary),str(resources),str(partial),str(broken)],check=True,capture_output=True)
 
+    def test_update_check_gate_request_and_offer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);source=root/'probe.m'
+            source.write_text(r'''#import <Foundation/Foundation.h>
+#include <assert.h>
+int launcher_compare_versions(NSString *,NSString *);
+BOOL launcher_update_due(NSUserDefaults *,NSDate *);
+BOOL launcher_check_for_updates(NSUserDefaults *,NSString *,NSDate *,void (^)(NSDictionary *));
+NSDictionary *launcher_update_offer(NSData *,NSString *,NSString *);
+typedef void (^LauncherFetch)(NSURLRequest *,void (^)(NSData *));
+extern LauncherFetch launcher_update_fetch;
+@interface Prefs : NSUserDefaults
+@property NSMutableDictionary *values;
+@end
+@implementation Prefs
+- (id)objectForKey:(NSString *)key{return self.values[key];}
+- (NSString *)stringForKey:(NSString *)key{return self.values[key];}
+- (void)setObject:(id)value forKey:(NSString *)key{self.values[key]=value;}
+@end
+static NSData *release(NSString *tag,NSString *page,NSString *asset,NSString *url){
+    return [NSJSONSerialization dataWithJSONObject:@{@"tag_name":tag,@"html_url":page,
+        @"assets":@[@{@"name":@"NFSMW-Builder.dmg.sha256",@"browser_download_url":@"https://github.com/o/r/x.sha256"},
+                    @{@"name":asset,@"browser_download_url":url}]} options:0 error:nil];
+}
+int main(void){@autoreleasepool{
+    assert(launcher_compare_versions(@"0.4.0",@"0.3.6")>0);assert(launcher_compare_versions(@"0.10.0",@"0.9.9")>0);
+    assert(launcher_compare_versions(@"1.0",@"1.0.0")==0);assert(launcher_compare_versions(@"0.4.0-dev",@"0.4.0")==0);
+    assert(launcher_compare_versions(@"1.2",@"1.10")<0);
+    NSDate *now=[NSDate dateWithTimeIntervalSince1970:2000000000];
+    Prefs *prefs=[Prefs new];prefs.values=[NSMutableDictionary dictionary];
+    assert(launcher_update_due(prefs,now));
+    prefs.values[@"LastUpdateCheck"]=[now dateByAddingTimeInterval:-23*3600];assert(!launcher_update_due(prefs,now));
+    prefs.values[@"LastUpdateCheck"]=[now dateByAddingTimeInterval:-25*3600];assert(launcher_update_due(prefs,now));
+    prefs.values[@"LastUpdateCheck"]=[now dateByAddingTimeInterval:3600];assert(launcher_update_due(prefs,now));
+    NSString *page=@"https://github.com/007hacky007/nfs-most-wanted-macos-arm64/releases/tag/v0.4.0";
+    NSString *dmg=@"https://github.com/007hacky007/nfs-most-wanted-macos-arm64/releases/download/v0.4.0/NFSMW-Builder.dmg";
+    NSData *good=release(@"v0.4.0",page,@"NFSMW-Builder.dmg",dmg);
+    assert([launcher_update_offer(good,@"0.3.6",nil) isEqualToDictionary:(@{@"version":@"0.4.0",@"notes":page,@"download":dmg})]);
+    assert(launcher_update_offer(release(@"0.4.0",page,@"NFSMW-Builder.dmg",dmg),@"0.3.6",nil));
+    assert(!launcher_update_offer(good,@"0.4.0",nil));assert(!launcher_update_offer(good,@"0.5.0",nil));
+    assert(!launcher_update_offer(good,@"0.3.6",@"0.4.0"));assert(launcher_update_offer(good,@"0.3.6",@"0.3.9"));
+    assert(!launcher_update_offer(good,nil,nil));assert(!launcher_update_offer(nil,@"0.3.6",nil));
+    assert(!launcher_update_offer([@"not json" dataUsingEncoding:NSUTF8StringEncoding],@"0.3.6",nil));
+    assert(!launcher_update_offer(release(@"v0.4.0",page,@"Other.dmg",dmg),@"0.3.6",nil));
+    assert(!launcher_update_offer(release(@"v0.4.0",page,@"NFSMW-Builder.dmg",@"http://github.com/x.dmg"),@"0.3.6",nil));
+    assert(!launcher_update_offer(release(@"v0.4.0",page,@"NFSMW-Builder.dmg",@"https://example.com/x.dmg"),@"0.3.6",nil));
+    assert(!launcher_update_offer(release(@"v0.4.0",@"https://example.com/",@"NFSMW-Builder.dmg",dmg),@"0.3.6",nil));
+    assert(!launcher_update_offer(release(@"vnext",page,@"NFSMW-Builder.dmg",dmg),@"0.3.6",nil));
+    __block NSMutableArray *requests=[NSMutableArray array];__block NSData *reply=good;
+    launcher_update_fetch=^(NSURLRequest *request,void (^done)(NSData *)){[requests addObject:request];done(reply);};
+    prefs.values=[@{@"CheckForUpdates":@NO} mutableCopy];
+    assert(!launcher_check_for_updates(prefs,@"0.3.6",now,^(NSDictionary *o){(void)o;assert(0);}));
+    prefs.values=[NSMutableDictionary dictionary];
+    assert(!launcher_check_for_updates(prefs,nil,now,^(NSDictionary *o){(void)o;assert(0);}));
+    assert(requests.count==0&&!prefs.values[@"LastUpdateCheck"]);
+    __block NSDictionary *offered=nil;
+    assert(launcher_check_for_updates(prefs,@"0.3.6",now,^(NSDictionary *o){assert(NSThread.isMainThread);offered=o;}));
+    NSDate *limit=[NSDate dateWithTimeIntervalSinceNow:5];
+    while(!offered&&[limit timeIntervalSinceNow]>0)[NSRunLoop.mainRunLoop runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:.05]];
+    assert([offered[@"version"] isEqualToString:@"0.4.0"]);
+    NSURLRequest *request=requests[0];
+    assert([request.URL.absoluteString isEqualToString:@"https://api.github.com/repos/007hacky007/nfs-most-wanted-macos-arm64/releases/latest"]);
+    assert([request.HTTPMethod isEqualToString:@"GET"]&&request.timeoutInterval==5&&!request.HTTPShouldHandleCookies&&!request.HTTPBody);
+    assert([[request.allHTTPHeaderFields.allKeys sortedArrayUsingSelector:@selector(compare:)] isEqualToArray:(@[@"Accept",@"Accept-Language",@"User-Agent"])]);
+    assert([[request valueForHTTPHeaderField:@"User-Agent"] isEqualToString:@"NFSMW-Launcher"]);
+    assert([prefs.values[@"LastUpdateCheck"] isEqual:now]);
+    assert(!launcher_check_for_updates(prefs,@"0.3.6",[now dateByAddingTimeInterval:3600],^(NSDictionary *o){(void)o;assert(0);}));
+    assert(requests.count==1);
+    reply=nil;prefs.values=[NSMutableDictionary dictionary];
+    assert(launcher_check_for_updates(prefs,@"0.3.6",now,^(NSDictionary *o){(void)o;assert(0);}));
+    [NSRunLoop.mainRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:.2]];
+    assert(requests.count==2);
+    puts("update check ok");
+}return 0;}
+''')
+            binary=root/'probe'
+            subprocess.run(['clang','-fobjc-arc',str(source),'runtime/launcher.m','-framework','Cocoa','-o',str(binary)],
+                           check=True,capture_output=True)
+            result=subprocess.run([str(binary)],capture_output=True,text=True,timeout=30)
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertIn('update check ok',result.stdout)
+
     def test_launcher_has_no_folder_chooser_or_saved_game_path(self):
         source=Path('runtime/launcher.m').read_text()
         for gone in ('NSOpenPanel','chooseFolder','Choose...','setObject:self.folder'):
@@ -52,7 +135,10 @@ int main(int argc,char **argv){@autoreleasepool{
                 (folder / 'd3dx9_26.dll').write_bytes(b'test')
             (game / 'install-manifest.json').write_text(json.dumps({'variants': {'visuals': {'ready': True}, 'full': {'ready': True}}}))
             binary = root / 'probe'
-            subprocess.run(['clang', '-fobjc-arc', '-DNFS_HQ_MODULES=1', 'tests/launcher_gui.m', 'runtime/launcher.m', '-framework', 'Cocoa', '-o', str(binary)], check=True, capture_output=True)
+            info = root / 'Info.plist'
+            info.write_bytes(plistlib.dumps({'CFBundleIdentifier': 'local.nfsmw.launcher-test', 'NFSBuilderVersion': '0.3.6'}))
+            subprocess.run(['clang', '-fobjc-arc', '-DNFS_HQ_MODULES=1', 'tests/launcher_gui.m', 'runtime/launcher.m', '-framework', 'Cocoa',
+                            '-sectcreate', '__TEXT', '__info_plist', str(info), '-o', str(binary)], check=True, capture_output=True)
             capture = Path('out/launcher.png').resolve()
             capture.parent.mkdir(exist_ok=True)
             subprocess.run([str(binary), 'bundled', str(capture)], check=True, timeout=30, capture_output=True)
