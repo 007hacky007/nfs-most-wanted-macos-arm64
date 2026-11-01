@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - "v*"
+  # A dry run from the Actions tab: tests and builds the Builder and its disk
+  # image, publishes nothing.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,6 +19,9 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      # Builder version: the tag without its "v"; dry runs build 0.0.0.
+      VERSION_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v0.0.0' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -55,22 +61,23 @@ jobs:
       - name: Build app
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION_TAG#v}"
           python tools/make_builder.py --version "$VERSION" --output dist --helpers helpers
 
       - name: Build disk image
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION_TAG#v}"
           dmgbuild -s builder/dmg/settings.py -D app="dist/NFSMW Builder.app" "NFSMW Builder $VERSION" dist/NFSMW-Builder.dmg
           (cd dist && shasum -a 256 NFSMW-Builder.dmg > NFSMW-Builder.dmg.sha256)
 
       - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION_TAG#v}"
           if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/NFSMW-Builder.dmg dist/NFSMW-Builder.dmg.sha256 --clobber
           else
