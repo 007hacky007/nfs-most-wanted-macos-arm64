@@ -1,13 +1,16 @@
 """Verify and stage the supported user's own game files without running them."""
 from contextlib import ExitStack
+import ctypes
 import hashlib
 import io
 import json
 import os
 from pathlib import Path, PurePosixPath
+import plistlib
 import re
 import shutil
 import stat
+import sys
 import tempfile
 import zipfile
 
@@ -17,6 +20,83 @@ except ImportError:
     from install_game import RawISO, disc_files, extract_cab_member, extract_zip
 
 CHECKSUMS = Path(__file__).with_name('game_checksums.json')
+# CFBundleIdentifier of NFSMW.app (tools/package_app.py).
+APP_BUNDLE_ID = 'local.nfsmw.native'
+APP_GAME = ('Contents', 'Resources', 'game')
+APP_GAME_UNUSABLE = ('The game inside {name} is missing or modified, so it cannot be reused. '
+                     'Choose your original game copy.')
+
+
+class AppGameError(ValueError):
+    """An NFSMW.app was chosen, but the game inside it cannot be used."""
+
+
+def app_game(path):
+    """The game folder inside an NFSMW.app built earlier, or None when `path` is not an app.
+
+    An app carries the installed tree: the original files (the seven the official patch
+    replaces already at 1.3) plus everything the build derived from them under .nfsmw,
+    scripts and install-manifest.json. Only the original files are checked and staged,
+    exactly as for an installed game folder; everything derived is built again from them
+    and the pinned downloads, so nothing produced by an older Builder is reused.
+    """
+    path = Path(path)
+    if path.suffix.casefold() != '.app' or path.is_symlink() or not path.is_dir():
+        return None
+    try:
+        info = plistlib.loads((path / 'Contents/Info.plist').read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        info = None
+    if not isinstance(info, dict) or info.get('CFBundleIdentifier') != APP_BUNDLE_ID:
+        raise ValueError(f'{path.name} is not an NFSMW.app built by NFSMW Builder')
+    game = path
+    for part in APP_GAME:
+        game = game / part
+        if game.is_symlink():
+            raise AppGameError(APP_GAME_UNUSABLE.format(name=path.name))
+    if not game.is_dir():
+        raise AppGameError(APP_GAME_UNUSABLE.format(name=path.name))
+    return game
+
+
+def _from_app(sources):
+    """Sources with a single chosen NFSMW.app replaced by the game folder inside it."""
+    if len(sources) == 1 and not sources[0].is_symlink():
+        game = app_game(sources[0])
+        if game is not None:
+            return [game], True
+    return sources, False
+
+
+def _load_clonefile():
+    if sys.platform != 'darwin':
+        return None
+    try:
+        function = ctypes.CDLL(None, use_errno=True).clonefile
+    except (OSError, AttributeError):
+        return None
+    function.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32)
+    function.restype = ctypes.c_int
+    return function
+
+
+_CLONEFILE = _load_clonefile()
+CLONE_NOFOLLOW = 0x0001
+
+
+def _clone(source, target):
+    """An APFS clone when both are on one APFS volume, else a plain copy.
+
+    A clone takes no extra space and shares nothing writable: later changes to the copy
+    never reach the source, so a chosen NFSMW.app is only ever read.
+    """
+    # Another volume or file system (EXDEV, ENOTSUP) falls back to copying; so does anything
+    # else, and copying reports a real problem itself.
+    if _CLONEFILE is not None and _CLONEFILE(os.fsencode(source), os.fsencode(target), CLONE_NOFOLLOW) == 0:
+        # A clone keeps the source's mode; the staged copy is an ordinary writable file, as a copy is.
+        os.chmod(target, 0o644)
+        return
+    shutil.copyfile(source, target)
 
 
 def _path(name):
@@ -424,12 +504,12 @@ def check_sources(sources, *, profile=None, limit=20):
     """Check a game copy like stage_game, without writing anywhere, and collect every problem.
 
     Returns a JSON-ready report: ok, kind (folder, discs or none), version, checked and
-    failed counts, the first `limit` problems in detail, the disc roles found and missing,
+    failed counts (kind app: the game inside a chosen NFSMW.app), the first `limit` problems in detail, the disc roles found and missing,
     and the plain message from describe().
     """
     profile, files, archives = _profile(profile)
     sources = [Path(source) for source in sources]
-    report = {'ok': False, 'kind': 'none', 'version': None, 'checked': 0, 'failed': 0, 'problems': [],
+    report = {'ok': False, 'kind': 'none', 'app': None, 'version': None, 'checked': 0, 'failed': 0, 'problems': [],
               'discs': None, 'invalid': [], 'wrong': [], 'message': ''}
 
     def add(path, found, row):
@@ -443,6 +523,10 @@ def check_sources(sources, *, profile=None, limit=20):
         for source in sources:
             if source.is_symlink():
                 raise ValueError(f'{source.name} is a symbolic link; choose the original file or folder')
+        report['app'] = sources[0].name if len(sources) == 1 and app_game(sources[0]) is not None else None
+        sources, _ = _from_app(sources)
+        if report['app'] and not any(path.name.casefold() == 'speed.exe' for path in sources[0].iterdir()):
+            raise AppGameError(APP_GAME_UNUSABLE.format(name=report['app']))
         kind, inputs = _layout(sources)
         report['kind'] = kind
         if kind == 'folder':
@@ -451,10 +535,15 @@ def check_sources(sources, *, profile=None, limit=20):
             _check_discs(inputs, profile, files, archives, report, add)
             if not report['invalid'] and not report['wrong'] and not report['discs']['missing']:
                 report['version'] = 'USA English Black Edition, 4 CDs'
+    except AppGameError as error:
+        report['app'] = report.get('app') or sources[0].name
+        report['invalid'].append(str(error))
     except (ValueError, OSError) as error:
         report['invalid'].append(str(error))
     missing = (report['discs'] or {}).get('missing')
     report['ok'] = report['kind'] != 'none' and not (report['failed'] or report['invalid'] or report['wrong'] or missing)
+    if report.get('app') and report['kind'] in ('folder', 'none'):
+        report['kind'] = 'app'
     report['message'] = describe(report)
     return report
 
@@ -467,6 +556,8 @@ def describe(report):
     """The plain sentence the Builder shows for a checked copy."""
     if report['ok']:
         return report['version'] or 'Supported game copy'
+    if report.get('app'):
+        return APP_GAME_UNUSABLE.format(name=report['app'])
     prefix = 'This is not the supported game copy. NFSMW Builder needs ' + REQUIRED_RELEASE + '. '
     discs = report.get('discs') or {}
     if report['kind'] == 'none' and not report['invalid']:
@@ -526,13 +617,14 @@ def stage_game(sources, destination, *, profile=None):
     sources = [Path(source) for source in sources]
     if not sources or any(source.is_symlink() for source in sources):
         raise ValueError('supply game sources without symlinks')
+    sources, from_app = _from_app(sources)
     folder = len(sources) == 1 and sources[0].is_dir()
     if folder:
         root = sources[0]
         if destination.resolve().is_relative_to(root.resolve()):
             raise ValueError('staging destination must be outside the source directory')
         images = [path for path in root.iterdir() if path.suffix.casefold() in ('.iso', '.bin', '.cue')]
-        if not any(path.name.casefold() == 'speed.exe' for path in root.iterdir()) and images:
+        if not any(path.name.casefold() == 'speed.exe' for path in root.iterdir()) and images and not from_app:
             sources = images
             folder = False
     manifest = {'schema_version': 1, 'profile': profile['profile'],
@@ -551,7 +643,7 @@ def stage_game(sources, destination, *, profile=None):
         for source, row in chosen:
             target = destination / row['path']
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, target)
+            _clone(source, target)
     else:
         manifest['archives'] = _extract_discs(_images(sources), destination, profile, files, archives)
     for row in files.values():

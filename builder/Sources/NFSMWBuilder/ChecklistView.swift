@@ -14,7 +14,7 @@ struct ChecklistView: View {
                 if id != CheckID.allCases.last { Divider() }
             }
             Button(action: model.build) {
-                Text("Build NFSMW.app")
+                Text(model.buildTitle)
                     .fontWeight(.semibold)
                     .frame(maxWidth: .infinity)
             }
@@ -74,11 +74,14 @@ struct ChecklistView: View {
 
     private func chooseGame() {
         let panel = NSOpenPanel()
-        panel.message = "Choose your game folder, a folder with the four disc images, or all four images together"
+        panel.message = "Choose your game folder, a folder with the four disc images, all four images together, "
+            + "or NFSMW.app to reuse the game inside it"
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
-        panel.allowedContentTypes = ["iso", "bin", "cue"].compactMap { UTType(filenameExtension: $0) } + [.folder]
+        panel.allowedContentTypes = ["iso", "bin", "cue"].compactMap { UTType(filenameExtension: $0) }
+            + [.folder, .applicationBundle]
+        panel.treatsFilePackagesAsDirectories = false
         if let current = model.gamePaths.first { panel.directoryURL = current.deletingLastPathComponent() }
         if panel.runModal() == .OK { model.setGame(panel.urls) }
     }

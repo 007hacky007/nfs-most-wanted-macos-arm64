@@ -25,6 +25,12 @@ final class BuilderModel: ObservableObject {
 
     // Game copy row.
     @Published var gameReport: GameReport?
+    /// An NFSMW.app found at start; while it is the game copy, the build updates it.
+    @Published private(set) var existingApp: URL?
+    /// Shown in an empty game row when the game inside the found app could not be reused.
+    @Published var gameNote: String?
+    /// The game copy the user chose last time, used when the found app's game cannot be reused.
+    var savedGamePaths: [URL] = []
     @Published var showingWhichCopy = false
     @Published var accepted: AcceptedCopies?
     @Published var acceptedFailed = false
@@ -89,8 +95,14 @@ final class BuilderModel: ObservableObject {
         initial[.downloads] = Self.downloadsPending(nil)
         states = initial
         let saved = UserDefaults.standard
-        gamePaths = (saved.stringArray(forKey: "gamePaths") ?? []).map { URL(fileURLWithPath: $0) }
-        destination = saved.string(forKey: "destination").map { URL(fileURLWithPath: $0) } ?? defaultDestination
+        let chosen = (saved.stringArray(forKey: "gamePaths") ?? []).map { URL(fileURLWithPath: $0) }
+        let target = saved.string(forKey: "destination").map { URL(fileURLWithPath: $0) } ?? defaultDestination
+        // Updating: the game inside the current NFSMW.app is the game copy unless it fails the check.
+        let found = findExistingApp(destination: target)
+        destination = target
+        existingApp = found
+        gamePaths = found.map { [$0] } ?? chosen
+        savedGamePaths = chosen
     }
 
     // MARK: - Checklist
@@ -187,11 +199,12 @@ final class BuilderModel: ObservableObject {
         let usable = urls.filter(Self.isGameCandidate)
         let skipped = urls.filter { !Self.isGameCandidate($0) }.map(\.lastPathComponent)
         if !skipped.isEmpty {
-            notice = "\(skipped.joined(separator: ", ")) \(skipped.count == 1 ? "is" : "are") not a folder or a disc image "
-                + "(.iso, .bin or .cue), so \(skipped.count == 1 ? "it was" : "they were") left out."
+            notice = "\(skipped.joined(separator: ", ")) \(skipped.count == 1 ? "is" : "are") not a folder, a disc image "
+                + "(.iso, .bin or .cue) or NFSMW.app, so \(skipped.count == 1 ? "it was" : "they were") left out."
         }
         guard !usable.isEmpty else { return }
         gamePaths = usable
+        gameNote = nil
         defaults.set(usable.map(\.path), forKey: "gamePaths")
         checkedGame = nil
         refreshGame()
@@ -200,16 +213,30 @@ final class BuilderModel: ObservableObject {
     /// The row title: the folder name, or how many images were chosen.
     var gameTitle: String {
         guard !gamePaths.isEmpty else { return "Game copy" }
+        if usesApp { return "Game copy: the game inside \(gamePaths[0].lastPathComponent)" }
         if gamePaths.count == 1 { return "Game copy: \(gamePaths[0].lastPathComponent)" }
         return "Game copy: \(gamePaths.count) disc images"
     }
 
-    var gameTooltip: String { gamePaths.map(\.lastPathComponent).joined(separator: "\n") }
+    var gameTooltip: String { gamePaths.map(usesApp ? \.path : \.lastPathComponent).joined(separator: "\n") }
+
+    /// The game copy is an NFSMW.app (found at start, chosen or dropped).
+    var usesApp: Bool { gamePaths.count == 1 && gamePaths[0].pathExtension.lowercased() == "app" }
+
+    /// The build replaces the app it reads the game from: an update.
+    var updating: Bool {
+        usesApp && gamePaths[0].standardizedFileURL.path == destination.appendingPathComponent("NFSMW.app").standardizedFileURL.path
+    }
+
+    var buildTitle: String {
+        buildButtonTitle(updating: updating, oldVersion: updating ? builderVersion(of: gamePaths[0]) : nil,
+                         newVersion: version)
+    }
 
     func refreshGame() {
         guard !gamePaths.isEmpty else {
             gameReport = nil
-            states[.gameCopy] = .blocked("Choose your game folder, or all four disc images together")
+            states[.gameCopy] = .blocked(gameNote ?? "Choose your game folder, or all four disc images together")
             return
         }
         guard toolsReady else {
@@ -229,11 +256,12 @@ final class BuilderModel: ObservableObject {
         let runner = PipelineRunner.checkGame(paths: paths, version: version, game: game)
         gameRunner = runner
         var detected: String?
+        var kind: String?
         var message: String?
         var report: GameReport?
         run(runner, onEvent: { event in
             switch event {
-            case let .game(version, _): detected = version
+            case let .game(version, found): (detected, kind) = (version, found)
             case let .gameRejected(text, rejected): (message, report) = (text, rejected)
             case let .error(text, _): message = text
             default: break
@@ -242,7 +270,15 @@ final class BuilderModel: ObservableObject {
             guard gameRunner === runner else { return }
             gameRunner = nil
             if status == 0, let detected = detected {
-                states[.gameCopy] = .ready(detected)
+                states[.gameCopy] = .ready(kind == "app" ? "Uses the game inside \(game[0].lastPathComponent): \(detected)"
+                                                          : detected)
+            } else if let app = existingApp, game == [app] {
+                // The app found at start cannot be reused: back to the copy chosen before, or an empty row.
+                existingApp = nil
+                gameNote = Self.plain(message ?? "The game inside NFSMW.app cannot be reused")
+                gamePaths = savedGamePaths
+                checkedGame = nil
+                refreshGame()
             } else {
                 gameReport = report
                 states[.gameCopy] = .blocked(Self.plain(message ?? "Could not check this game copy"))

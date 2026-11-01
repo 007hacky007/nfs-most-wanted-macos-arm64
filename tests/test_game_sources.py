@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import plistlib
 import stat
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ import zipfile
 from unittest.mock import patch
 
 from tests.test_install import raw_image, record
+from tools import game_sources
 from tools.game_sources import REQUIRED_RELEASE, accepted_copies, check_sources, describe, stage_game
 
 
@@ -442,6 +444,85 @@ class GameSourcesTests(unittest.TestCase):
         self.assertEqual([(e['kind'], e['size']) for e in accepted['folder']['executables']],
                          [('source', 7250800), ('official-1.3', 7254894)])
         self.assertIn('Most Wanted (2012)', accepted['not_supported'])
+
+    def app(self, name='NFSMW.app', bundle='local.nfsmw.native'):
+        """An NFSMW.app as the build leaves it: the installed tree, patched, with derived files."""
+        source = self.folder()
+        (source / 'speed.exe').write_bytes(b'patched')
+        for name_, data in (('.nfsmw/full/speed.exe', b'hq'), ('.nfsmw/runtime.exe', b'runtime'),
+                            ('install-manifest.json', b'{}')):
+            (source / name_).parent.mkdir(parents=True, exist_ok=True)
+            (source / name_).write_bytes(data)
+        app = self.root / name
+        (app / 'Contents/Resources').mkdir(parents=True)
+        (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': bundle,
+                                                                  'NFSBuilderVersion': '0.3.6'}))
+        source.rename(app / 'Contents/Resources/game')
+        return app
+
+    def read_only(self, root):
+        for path in sorted([root, *root.rglob('*')], reverse=True):
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        self.addCleanup(lambda: [p.chmod(0o755) for p in [root, *root.rglob('*')] if p.is_dir()])
+
+    def test_app_built_earlier_is_checked_and_staged_like_its_game_folder(self):
+        app = self.app()
+        self.read_only(app)
+        before = self.snapshot()
+        report = self.check([app])
+        self.assertTrue(report['ok'], report)
+        self.assertEqual((report['kind'], report['app'], report['checked']), ('app', 'NFSMW.app', 5))
+        self.assertEqual(report['version'], 'USA English Black Edition, updated to 1.3')
+        destination = self.destination()
+        manifest = stage_game([app], destination, profile=self.profile)
+        self.assertEqual(manifest['source_kind'], 'folder')
+        self.assertEqual((destination / 'speed.exe').read_bytes(), b'patched')
+        # Everything an older build derived is left behind and built again.
+        for derived in ('.nfsmw', 'scripts', 'install-manifest.json'):
+            self.assertFalse((destination / derived).exists())
+        (destination / 'GLOBAL/One.bin').write_bytes(b'changed in the new build')
+        self.assertEqual((app / 'Contents/Resources/game/global/one.bin').read_bytes(), b'one')
+        self.assertEqual([entry for entry in self.snapshot() if entry[0].startswith('NFSMW.app')],
+                         [entry for entry in before if entry[0].startswith('NFSMW.app')])
+
+    def test_modified_or_missing_game_in_app_asks_for_the_original_copy(self):
+        app = self.app()
+        (app / 'Contents/Resources/game/cars/two.bin').write_bytes(b'modded')
+        report = self.check([app])
+        self.assertFalse(report['ok'])
+        self.assertEqual(report['kind'], 'app')
+        self.assertEqual(report['message'], 'The game inside NFSMW.app is missing or modified, so it cannot be '
+                                            'reused. Choose your original game copy.')
+        self.assertEqual([problem['path'] for problem in report['problems']], ['CARS/Two.bin'])
+        with self.assertRaisesRegex(ValueError, 'CARS/Two.bin'):
+            stage_game([app], self.destination(), profile=self.profile)
+        shutil.rmtree(app / 'Contents/Resources/game')
+        report = self.check([app])
+        self.assertEqual((report['ok'], report['kind']), (False, 'app'))
+        self.assertIn('missing or modified', report['message'])
+        (app / 'Contents/Resources/game').mkdir()
+        self.assertIn('missing or modified', self.check([app])['message'])
+
+    def test_other_apps_are_not_game_copies(self):
+        app = self.app('Other.app', bundle='com.example.other')
+        report = self.check([app])
+        self.assertFalse(report['ok'])
+        self.assertIn('Other.app is not an NFSMW.app built by NFSMW Builder', report['message'])
+        with self.assertRaisesRegex(ValueError, 'not an NFSMW.app'):
+            stage_game([app], self.destination(), profile=self.profile)
+
+    def test_staged_copy_never_writes_through_to_the_source(self):
+        source = self.root / 'source.bin'
+        source.write_bytes(b'original')
+        for clone in (game_sources._CLONEFILE, None):
+            with self.subTest(clone=clone is not None), patch.object(game_sources, '_CLONEFILE', clone):
+                target = self.root / f'target-{clone is not None}.bin'
+                game_sources._clone(source, target)
+                self.assertEqual(target.read_bytes(), b'original')
+                with target.open('r+b') as stream:
+                    stream.write(b'CHANGED')
+                self.assertEqual(source.read_bytes(), b'original')
+        self.assertIsNotNone(game_sources._CLONEFILE if sys.platform == 'darwin' else True)
 
     @unittest.skipUnless(os.environ.get('NFSMW_GAME_SOURCE_TEST'), 'set NFSMW_GAME_SOURCE_TEST for full source checks')
     def test_actual_supported_source_check(self):
