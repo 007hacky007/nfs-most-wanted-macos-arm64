@@ -84,7 +84,8 @@ automatically during the build, and red rows need you.
   it is checked and copied, and your file is not changed. If the download
   keeps failing, **Open the download page** opens it in your browser.
 - **Game copy**: click **Choose...** or drag your game folder, a folder with
-  the disc images, or all four images at once onto the window. The check takes
+  the disc images, all four images at once, or an NFSMW.app built earlier
+  onto the window. The check takes
   a few seconds to a minute. If your copy is rejected, the row says what is
   wrong; **Which copy works?** lists the accepted discs and files with their
   sizes and checksums, and **Copy details** copies the findings for a bug
@@ -128,6 +129,28 @@ preparation can still take tens of seconds, depending on mode and shader cache.
 Saves live under `~/Library/Application Support/NFSMW/Saves`. HQ visuals and
 Full HQ use separate `HQVisuals` and `HQFull` save folders. The latest app log
 is `~/Library/Logs/NFSMW/last-run.log`.
+
+### Updating
+
+New features come with a new NFSMW Builder. With **Check for updates** on
+(the default), the launcher asks GitHub once a day whether a newer Builder is
+out and, if so, shows **What's new**, **Download** and **Not now**. Download
+opens the disk image in your browser; the launcher never downloads or runs
+anything itself. Turn the setting off and the launcher makes no network
+request at all. An app built from Terminal has no Builder version, so it
+checks nothing; build it again to update.
+
+Open the new Builder and it finds your NFSMW.app (in the destination you used,
+otherwise in Applications) and uses the game inside it, so you do not need
+your discs again. The game row says so and the button reads
+**Update NFSMW.app (old -> new)**. The app keeps your original game files
+next to everything the build made from them; the Builder checks those
+original files exactly like a game folder and makes the rest again from them
+and the pinned downloads, so nothing from the older version is carried over.
+The old app is only read and stays in place until the new one is complete; on
+the same disk the files are cloned, not copied. If the game inside it is
+missing or modified, the row asks for your original game copy instead. Quit
+NFSMW before you click Update. Saves and settings are kept.
 
 ## Which game copy works
 
