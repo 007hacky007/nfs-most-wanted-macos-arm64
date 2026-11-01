@@ -42,7 +42,7 @@ MACOS_BUNDLES = ('.app', '.appex', '.framework', '.bundle', '.plugin', '.kext', 
                  '.component', '.systemextension')
 MACOS_FILES = ('.command', '.tool', '.sh', '.bash', '.zsh', '.csh', '.ksh', '.fish', '.py', '.pl', '.rb', '.php',
                '.scpt', '.applescript', '.terminal', '.dylib', '.so', '.jar', '.pkg', '.mpkg')
-MACH_O = {bytes.fromhex(magic) for magic in ('feedface', 'cefaedfe', 'feedfacf', 'cffaedfe', 'cafebabe', 'bebafeca')}
+MACH_O = {bytes.fromhex(magic) for magic in ('feedface', 'cefaedfe', 'feedfacf', 'cffaedfe', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca')}
 QUARANTINE = b'com.apple.quarantine'
 XATTR_NOFOLLOW = 0x0001
 
