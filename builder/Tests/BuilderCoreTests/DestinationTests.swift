@@ -46,6 +46,33 @@ final class DestinationTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: dest.appendingPathComponent(".NFSMW.app.installing").path))
     }
 
+    private func hasQuarantine(_ url: URL) -> Bool {
+        getxattr(url.path, "com.apple.quarantine", nil, 0, 0, XATTR_NOFOLLOW) >= 0
+    }
+
+    /// Only what the build made loses quarantine; the game data from the player's copy keeps it,
+    /// whether the build is moved (same volume) or copied.
+    func testInstallKeepsQuarantineOnTheGameData() throws {
+        for copied in [false, true] {
+            let dest = root.appendingPathComponent("dest-\(copied)")
+            try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+            let built = root.appendingPathComponent("built-\(copied)/NFSMW.app")
+            try makeApp(at: built, marker: "new")
+            let game = built.appendingPathComponent("Contents/Resources/game/GLOBAL")
+            try fm.createDirectory(at: game, withIntermediateDirectories: true)
+            let data = game.appendingPathComponent("GLOBALA.BUN")
+            try "data".write(to: data, atomically: true, encoding: .utf8)
+            for file in [data, built.appendingPathComponent("Contents/marker"), built] {
+                XCTAssertEqual(setxattr(file.path, "com.apple.quarantine", "0081;00000000;Test;", 19, 0, XATTR_NOFOLLOW), 0)
+            }
+            let result = try installApp(built, into: dest, isRunning: { false },
+                                        progress: copied ? { _, _ in } : nil)
+            XCTAssertTrue(hasQuarantine(result.appendingPathComponent("Contents/Resources/game/GLOBAL/GLOBALA.BUN")))
+            XCTAssertFalse(hasQuarantine(result.appendingPathComponent("Contents/marker")))
+            XCTAssertFalse(hasQuarantine(result))
+        }
+    }
+
     func testFreshInstallAndStaleStagingCleaned() throws {
         let dest = try dest()
         try makeApp(at: dest.appendingPathComponent(".NFSMW.app.installing"), marker: "stale")

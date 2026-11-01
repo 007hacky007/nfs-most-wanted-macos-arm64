@@ -103,7 +103,7 @@ public func installApp(_ built: URL, into directory: URL, isRunning: () -> Bool,
         } else {
             try copyWithProgress(built, to: staging, progress: progress)
         }
-        try removeQuarantine(at: staging)
+        try removeQuarantine(fromBuiltApp: staging)
         guard bundleIdentifier(of: staging) == gameBundleID else {
             throw InstallError(message: "The built app is incomplete. Build again.")
         }
