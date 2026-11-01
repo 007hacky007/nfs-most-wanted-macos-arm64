@@ -111,9 +111,10 @@ class BuildEventTests(unittest.TestCase):
                 patch('helpers.load', return_value={'innoextract': 'x', 'rtpatch-decode': 'd'}), \
                 patch('install_game.install', side_effect=install), \
                 patch('prepare_public_hq.prepare_build', side_effect=prepare), \
-                patch('package_app.package_app', side_effect=lambda binary, game, app: app), \
+                patch('package_app.package_app', side_effect=lambda binary, game, app, builder_version: app) as packaged, \
                 redirect_stdout(output):
-            self.build_app.build([self.root / 'game'], self.root / 'cache', self.root / 'helpers')
+            self.build_app.build([self.root / 'game'], self.root / 'cache', self.root / 'helpers', '0.4.0')
+        self.assertEqual(packaged.call_args.kwargs, {'builder_version': '0.4.0'})
         self.assertEqual([call.args[0] for call in fetched.call_args_list], ['official-1.3', 'widescreen', 'mw-hq'])
         found = events(output.getvalue())
         steps = [e['step'] for e in found if 'step' in e]
@@ -132,6 +133,14 @@ class BuildEventTests(unittest.TestCase):
                 redirect_stderr(stderr):
             self.assertEqual(self.build_app.main(['--progress', 'game']), 2)
         return events(output.getvalue())[-1], stderr.getvalue()
+
+    def test_builder_version_reaches_the_build(self):
+        for argv, expected in ((['--builder-version', '0.4.0', '--', 'game'], '0.4.0'), (['game'], None)):
+            with self.subTest(argv), patch.object(self.build_app, 'resolve_sources', return_value=[self.root]), \
+                    patch.object(self.build_app, 'prerequisites'), patch.object(self.build_app, 'environment'), \
+                    patch.object(self.build_app, 'build') as build, patch.object(self.build_app.os, 'chdir'):
+                self.assertEqual(self.build_app.main(argv), 0)
+                self.assertEqual(build.call_args.args[3], expected)
 
     def test_error_event_carries_log_path_with_spaces(self):
         import progress

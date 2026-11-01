@@ -2,6 +2,7 @@
 import argparse
 from pathlib import Path
 import plistlib
+import re
 import shutil
 import struct
 import subprocess
@@ -66,10 +67,16 @@ def write_app_icon(icon,destination):
 
 # The launcher refuses an app whose Contents/Resources/game lacks these (runtime/launcher.m).
 REQUIRED_GAME_FILES=('speed.exe','d3dx9_26.dll')
+# Info.plist key with the NFSMW Builder version that built the app; the launcher compares it
+# with the latest release. A Terminal build has none.
+BUILDER_VERSION_KEY='NFSBuilderVersion'
+VERSION=re.compile(r'[0-9]+(\.[0-9]+){0,3}(-[A-Za-z0-9.]+)?')
 
 
-def package_app(binary,game,output=Path('out/NFSMW.app')):
+def package_app(binary,game,output=Path('out/NFSMW.app'),builder_version=None):
     binary,output=Path(binary),Path(output)
+    if builder_version is not None and not VERSION.fullmatch(builder_version):
+        raise ValueError('builder version must look like 1.2.3')
     if binary.is_symlink() or not binary.is_file():raise ValueError('native executable must be a regular file, not a symlink')
     with binary.open('rb')as stream:header=stream.read(8)
     if header!=struct.pack('<II',0xfeedfacf,0x0100000c):raise ValueError('expected a native ARM64 Mach-O executable')
@@ -105,6 +112,7 @@ def package_app(binary,game,output=Path('out/NFSMW.app')):
               'NSPrincipalClass':'NSApplication','NSQuitAlwaysKeepsWindows':False}
         write_app_icon(icon,resources/'NFSMW.icns')
         info['CFBundleIconFile']='NFSMW.icns'
+        if builder_version is not None:info[BUILDER_VERSION_KEY]=builder_version
         (contents/'Info.plist').write_bytes(plistlib.dumps(info))
         subprocess.run(['codesign','--force','--sign','-',str(staged)],check=True,capture_output=True)
         subprocess.run(['codesign','--verify','--deep','--strict',str(staged)],check=True,capture_output=True)

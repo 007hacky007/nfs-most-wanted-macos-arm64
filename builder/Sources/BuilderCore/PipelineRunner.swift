@@ -103,8 +103,10 @@ public final class PipelineRunner {
                               "--cache-dir", cacheDirectory(paths).path])
     }
 
+    /// The Builder's version is stamped into the app, so its launcher can tell when a newer Builder is out.
     public static func build(paths: BuilderPaths, version: String, game: [URL]) -> PipelineRunner {
-        var arguments = ["tools/build_app.py", "--progress", "--cache-dir", cacheDirectory(paths).path]
+        var arguments = ["tools/build_app.py", "--progress", "--cache-dir", cacheDirectory(paths).path,
+                         "--builder-version", version]
         if hasHelpers(paths, version) { arguments += ["--helpers", paths.helpers(version: version).path] }
         return venv(paths, version, arguments + ["--"] + game.map(\.path))
     }

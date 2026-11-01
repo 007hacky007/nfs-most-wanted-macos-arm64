@@ -37,6 +37,7 @@ class PackageAppTests(unittest.TestCase):
             self.assertEqual(info['CFBundleExecutable'],'NFSMW')
             self.assertEqual(info['CFBundleName'],'NFSMW')
             self.assertEqual(info['CFBundleDisplayName'],'NFSMW')
+            self.assertNotIn('NFSBuilderVersion',info)
             icon=output/'Contents/Resources'/info['CFBundleIconFile']
             self.assertEqual(icon.read_bytes()[:4],b'icns')
             subprocess.run(['codesign','--verify','--deep','--strict',str(output)],check=True,capture_output=True)
@@ -62,6 +63,19 @@ class PackageAppTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'symlink'):package_app(binary,game,output)
             self.assertEqual(sentinel.read_bytes(),b'owned test payload')
             self.assertFalse(list(root.glob('.nfsmw-app-*')))
+
+    def test_builder_version_is_stamped_for_the_update_check(self):
+        from tools.package_app import package_app
+        with tempfile.TemporaryDirectory()as temporary:
+            binary,game,output=self.fixture(Path(temporary))
+            package_app(binary,game,output,builder_version='0.4.0')
+            info=plistlib.loads((output/'Contents/Info.plist').read_bytes())
+            self.assertEqual(info['NFSBuilderVersion'],'0.4.0')
+            subprocess.run(['codesign','--verify','--deep','--strict',str(output)],check=True,capture_output=True)
+            for bad in ('','v1.0','1.0;rm','../1'):
+                with self.subTest(bad),self.assertRaisesRegex(ValueError,'builder version'):
+                    package_app(binary,game,output,builder_version=bad)
+            self.assertEqual(plistlib.loads((output/'Contents/Info.plist').read_bytes())['NFSBuilderVersion'],'0.4.0')
 
     def test_app_without_game_data_is_refused(self):
         from tools.package_app import package_app

@@ -127,7 +127,7 @@ def fetch_all(keys, cache):
     return paths
 
 
-def build(sources, cache=None, helper_dir=None):
+def build(sources, cache=None, helper_dir=None, builder_version=None):
     import fcntl
     from game_sources import check_sources
     from install_game import install
@@ -165,7 +165,8 @@ def build(sources, cache=None, helper_dir=None):
             preparation = output / ('app-preparation-' + str(time.time_ns()))
             prepare_build(game, preparation)
             progress.step('package', 'Packaging and signing NFSMW.app with your game files')
-            app = package_app(output / 'nfsmw_boot', game, output / 'NFSMW.app')
+            # The Builder stamps its version so the launcher can tell when a newer one is out.
+            app = package_app(output / 'nfsmw_boot', game, output / 'NFSMW.app', builder_version=builder_version)
         print('Built ' + str(app) + '\nOpen it to choose resolution and game mode.', flush=True)
         if progress.enabled():
             progress.emit({'done': str(app.resolve())})
@@ -193,11 +194,12 @@ def main(argv=None):
     if '--progress' in argv:
         os.environ['NFSMW_PROGRESS'] = '1'
     parser = Parser(description=__doc__)
-    parser.add_argument('source', nargs='*', help='extracted game folder, image folder, or all ISO / BIN/CUE discs')
+    parser.add_argument('source', nargs='*', help='extracted game folder, image folder, all ISO / BIN/CUE discs, or an NFSMW.app built earlier')
     parser.add_argument('--progress', action='store_true', help='print NFSMW-EVENT JSON progress lines')
     parser.add_argument('--setup-only', action='store_true', help='only check the Mac and set up Python packages')
     parser.add_argument('--cache-dir', help='download cache (default NFSMW_CACHE_DIR, else out/downloads)')
     parser.add_argument('--helpers', type=Path, help='folder with prebuilt helpers and helpers.json')
+    parser.add_argument('--builder-version', help='NFSMW Builder version to record in the app (set by the Builder)')
     args = parser.parse_args(argv)
     try:
         if args.setup_only:
@@ -213,7 +215,7 @@ def main(argv=None):
         prerequisites(helpers=helper_dir is not None)
         environment()
         os.chdir(ROOT)
-        build(sources, cache, helper_dir)
+        build(sources, cache, helper_dir, args.builder_version)
     except GameCopyError as error:
         print('Build failed: ' + str(error), file=sys.stderr, flush=True)
         progress.error(str(error), report=error.report)

@@ -287,7 +287,8 @@ final class PipelineRunnerTests: XCTestCase {
             (.importDownload(paths: paths, version: "1.2.0", file: file), venv,
              ["tools/builder_cli.py", "downloads", "import", "mw-hq", file.path, "--cache-dir", cache]),
             (.build(paths: paths, version: "1.2.0", game: game), venv,
-             ["tools/build_app.py", "--progress", "--cache-dir", cache, "--"] + game.map(\.path)),
+             ["tools/build_app.py", "--progress", "--cache-dir", cache, "--builder-version", "1.2.0", "--"]
+                + game.map(\.path)),
         ]
         for (runner, executable, arguments) in expected {
             XCTAssertEqual(runner.executable, executable)
@@ -316,7 +317,8 @@ final class PipelineRunnerTests: XCTestCase {
         try "{}".write(to: helpers.appendingPathComponent("helpers.json"), atomically: true, encoding: .utf8)
         let arguments = PipelineRunner.build(paths: paths, version: "1", game: [URL(fileURLWithPath: "/g")]).arguments
         let cache = PipelineRunner.cacheDirectory(paths).path
-        XCTAssertEqual(arguments, ["tools/build_app.py", "--progress", "--cache-dir", cache, "--helpers", helpers.path, "--", "/g"])
+        XCTAssertEqual(arguments, ["tools/build_app.py", "--progress", "--cache-dir", cache, "--builder-version", "1",
+                                   "--helpers", helpers.path, "--", "/g"])
         XCTAssertEqual(PipelineRunner.downloadsStatus(paths: paths, version: "1").arguments.suffix(3),
                        ["--cache-dir", cache, "--helpers"])
     }
